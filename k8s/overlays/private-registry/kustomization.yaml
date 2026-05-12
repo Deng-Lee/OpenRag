@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: openrag
+
+resources:
+  - ../../00-namespace.yaml
+  - ../../02-configmap-nginx.yaml
+  - ../../03-postgres.yaml
+  - ../../05-milvus-etcd.yaml
+  - ../../06-milvus-minio.yaml
+  - ../../07-milvus.yaml
+  - ../../08-elasticsearch.yaml
+  - ../../13-configmap-openrag-llm.yaml
+  - ../../14-configmap-openrag-web-runtime.yaml
+  - ../../09-api.yaml
+  - ../../10-task-worker.yaml
+  - ../../11-web.yaml
+  - ../../12-ingress.yaml
+
+# 将 YOUR_REGISTRY 替换为内网 Harbor，例如 harbor.corp.example/library
+images:
+  - name: openrag/api
+    newName: YOUR_REGISTRY/openrag/api
+    newTag: "1.0.0"
+  - name: openrag/task-worker
+    newName: YOUR_REGISTRY/openrag/task-worker
+    newTag: "1.0.0-deepdoc"
+  - name: openrag/web
+    newName: YOUR_REGISTRY/openrag/web
+    newTag: "1.0.0"

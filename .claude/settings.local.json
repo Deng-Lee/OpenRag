@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_service_tokens_admin.py -v)",
+      "Bash(timeout 300)",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)"
+    ]
+  }
+}

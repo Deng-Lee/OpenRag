@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: openrag
+  labels:
+    app: openrag-web
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http
+  selector:
+    app: openrag-web
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openrag-web
+  namespace: openrag
+  labels:
+    app: openrag-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openrag-web
+  template:
+    metadata:
+      labels:
+        app: openrag-web
+    spec:
+      initContainers:
+        - name: wait-for-api
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z api 8000; do echo waiting api; sleep 2; done
+      containers:
+        - name: web
+          image: openrag/web:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: web-runtime-config
+              mountPath: /usr/share/nginx/html/app-config.js
+              subPath: app-config.js
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: web-runtime-config
+          configMap:
+            name: openrag-web-runtime-config
+            items:
+              - key: app-config.js
+                path: app-config.js

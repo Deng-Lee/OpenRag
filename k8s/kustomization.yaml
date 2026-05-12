@@ -1,0 +1,24 @@
+# 使用方式：
+#   1) 先自行 kubectl apply -f k8s/01-secret.yaml（从 01-secret.example.yaml 复制）
+#   2) kubectl apply -k k8s/
+#
+# 覆盖业务镜像见 overlays/private-registry/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: openrag
+
+resources:
+  - 00-namespace.yaml
+  - 02-configmap-nginx.yaml
+  - 03-postgres.yaml
+  - 05-milvus-etcd.yaml
+  - 06-milvus-minio.yaml
+  - 07-milvus.yaml
+  - 08-elasticsearch.yaml
+  - 13-configmap-openrag-llm.yaml
+  - 14-configmap-openrag-web-runtime.yaml
+  - 09-api.yaml
+  - 10-task-worker.yaml
+  - 11-web.yaml
+  - 12-ingress.yaml

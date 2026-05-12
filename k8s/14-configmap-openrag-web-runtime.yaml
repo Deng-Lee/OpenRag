@@ -1,0 +1,13 @@
+# 运行时前端配置：挂载为 /usr/share/nginx/html/app-config.js
+# 修改后仅需 kubectl apply + rollout restart web，无需重打 web 镜像。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openrag-web-runtime-config
+  namespace: openrag
+data:
+  app-config.js: |
+    window.__OPENRAG_CONFIG__ = {
+      // 推荐同源 /api，由 nginx.conf 反代到 http://api:8000/
+      apiBaseUrl: "/api"
+    };

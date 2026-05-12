@@ -1,0 +1,57 @@
+.file-preview-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+}
+
+.file-preview-markdown th,
+.file-preview-markdown td {
+  border: 1px solid #d9d9d9;
+  padding: 6px 8px;
+}
+
+.file-preview-office-html table,
+.file-preview-html table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+}
+
+.file-preview-office-html td,
+.file-preview-office-html th,
+.file-preview-html td,
+.file-preview-html th {
+  border: 1px solid #d9d9d9;
+  padding: 4px 8px;
+}
+
+.file-preview-docx-table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+}
+
+.file-preview-docx-table td {
+  border: 1px solid #d9d9d9;
+  padding: 4px 8px;
+}
+
+.chunk-text-highlight,
+.chunk-html-highlight-wrap {
+  background: rgba(255, 235, 59, 0.35);
+  border-left: 3px solid #ff9800;
+  scroll-margin-top: 72px;
+}
+
+.chunk-highlight-pulse {
+  animation: chunk-highlight-pulse 1.2s ease-out 1;
+}
+
+@keyframes chunk-highlight-pulse {
+  0% {
+    outline: 2px solid #ff9800;
+  }
+  100% {
+    outline: 2px solid transparent;
+  }
+}

@@ -1,0 +1,36 @@
+services:
+  # Task Worker - pulls tasks from broker and processes documents
+  # For development: run API locally and connect via localhost
+  # For production: use docker-compose.prod.yml which includes task-worker
+  task-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: openrag-task-worker
+    restart: unless-stopped
+    environment:
+      # Change to http://localhost:8001 for local dev (API running on host)
+      - WORKER_API_URL=${WORKER_API_URL:-http://api:8000}
+      - WORKER_NUM=${WORKER_NUM:-4}
+      - WORKER_PREFIX=worker
+      - WORKER_BATCH_SIZE=5
+      - WORKER_POLL_INTERVAL=5
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_USER=${POSTGRES_USER:-openrag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE:-openrag}
+      - MILVUS_HOST=${MILVUS_HOST:-milvus}
+      - MILVUS_PORT=${MILVUS_PORT:-19530}
+      - ELASTICSEARCH__ENABLED=${ELASTICSEARCH__ENABLED:-false}
+      - ELASTICSEARCH__HOSTS=${ELASTICSEARCH__HOSTS:-http://elasticsearch:9200}
+      - ELASTICSEARCH__VERIFY_CERTS=${ELASTICSEARCH__VERIFY_CERTS:-false}
+      - OPENRAG_PDF_BACKEND=${OPENRAG_PDF_BACKEND:-ragflow}
+      - OPENRAG_MIN_CHUNK_TOKENS=${OPENRAG_MIN_CHUNK_TOKENS:-32}
+    networks:
+      - openrag-network
+
+networks:
+  openrag-network:
+    name: openrag-network
+    external: true

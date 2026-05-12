@@ -1,0 +1,60 @@
+# Multi-stage Production Dockerfile for OpenRag API
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY OpenRag/requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Production stage
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 将 builder 的依赖合并到全局 site-packages。
+# 若仅 COPY 到 /root/.local：root 执行 pip install -e . 会认为依赖已满足而跳过安装，
+# 且非 root 用户无法遍历 /root（700），导致运行时报 ModuleNotFoundError（如 dotenv）。
+COPY --from=builder /root/.local /root/.local
+RUN cp -a /root/.local/lib/python3.11/site-packages/. /usr/local/lib/python3.11/site-packages/ \
+    && rm -rf /root/.local
+
+# Copy application code
+COPY OpenRag/src/ ./src/
+COPY OpenRag/run_api.py .
+COPY OpenRag/setup.py .
+
+# Install the package
+RUN pip install --no-cache-dir -e .
+
+# 构建期加载应用（与 run_api → uvicorn 一致），缺依赖在此失败，避免推到集群才发现
+RUN python -c "import openrag.api.main; print('openrag.api.main import OK')"
+
+# Create non-root user
+RUN useradd -m -u 1000 openrag && \
+    mkdir -p /app/uploads && \
+    chown -R openrag:openrag /app
+
+# Switch to non-root user
+USER openrag
+
+# Expose API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the application
+CMD ["python", "run_api.py"]

@@ -1,0 +1,22 @@
+# 需要集群已安装 Ingress Controller（如 ingress-nginx）。无控制器可删除本文件，改用 kubectl port-forward svc/web 8080:80
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openrag
+  namespace: openrag
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: openrag.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80

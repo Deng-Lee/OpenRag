@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openrag-task-worker
+  namespace: openrag
+  labels:
+    app: openrag-task-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openrag-task-worker
+  template:
+    metadata:
+      labels:
+        app: openrag-task-worker
+    spec:
+      initContainers:
+        - name: wait-for-api
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z api 8000; do echo waiting api; sleep 2; done
+              until nc -z elasticsearch 9200; do echo waiting elasticsearch; sleep 2; done
+              echo ready
+      containers:
+        - name: worker
+          image: openrag/task-worker:1.0.0
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - "openrag.worker.task_worker"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          env:
+            - name: WORKER_API_URL
+              value: http://api:8000
+            - name: WORKER_NUM
+              value: "2"
+            - name: WORKER_PREFIX
+              value: worker
+            - name: WORKER_BATCH_SIZE
+              value: "5"
+            - name: WORKER_POLL_INTERVAL
+              value: "5"
+            - name: POSTGRES_HOST
+              value: postgres
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: openrag
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openrag-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DATABASE
+              value: openrag
+            - name: STORAGE_TYPE
+              value: minio
+            - name: STORAGE_ENDPOINT
+              value: milvus-minio:9000
+            - name: STORAGE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openrag-secrets
+                  key: MINIO_ROOT_USER
+            - name: STORAGE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openrag-secrets
+                  key: MINIO_ROOT_PASSWORD
+            - name: MILVUS_HOST
+              value: milvus
+            - name: MILVUS_PORT
+              value: "19530"
+            - name: ELASTICSEARCH__ENABLED
+              value: "true"
+            - name: ELASTICSEARCH__HOSTS
+              value: http://elasticsearch:9200
+            - name: ELASTICSEARCH__VERIFY_CERTS
+              value: "false"
+            - name: OPENRAG_PDF_BACKEND
+              value: ragflow
+            - name: OPENRAG_DISABLE_HF_DOWNLOAD
+              value: "true"
+            - name: OPENRAG_MIN_CHUNK_TOKENS
+              value: "32"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openrag-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: OPENAI_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: OPENAI_BASE_URL
+            - name: EMBEDDING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: EMBEDDING_MODEL
+            - name: L1_NAV_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: L1_NAV_MODEL
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "4Gi"
+              cpu: "4"

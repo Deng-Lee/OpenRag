@@ -1,0 +1,79 @@
+# Dockerfile for OpenRag Task Worker
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY OpenRag/requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    libreoffice-writer \
+    libreoffice-impress \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /root/.local /root/.local
+RUN cp -a /root/.local/lib/python3.11/site-packages/. /usr/local/lib/python3.11/site-packages/ \
+    && rm -rf /root/.local \
+    && apt-get update && apt-get install -y tini && rm -rf /var/lib/apt/lists/*
+
+COPY OpenRag/src/ ./src/
+COPY OpenRag/rag/res/deepdoc/ ./src/rag/res/deepdoc/
+COPY OpenRag/run_api.py .
+COPY OpenRag/setup.py .
+COPY OpenRag/scripts/verify_worker_ragflow_bundle.py ./scripts/
+COPY OpenRag/scripts/prepare_ragflow_models.py ./scripts/
+
+RUN pip install --no-cache-dir -e .
+
+# Fail fast at build time if offline model bundle is incomplete.
+RUN python - <<'PY'
+from pathlib import Path
+required = [
+    "det.onnx",
+    "rec.onnx",
+    "ocr.res",
+    "layout.onnx",
+    "tsr.onnx",
+    "updown_concat_xgb.model",
+]
+base = Path("/app/src/rag/res/deepdoc")
+missing = [name for name in required if not (base / name).exists()]
+if missing:
+    raise SystemExit(
+        "Missing offline ragflow model files under /app/src/rag/res/deepdoc: "
+        + ", ".join(missing)
+        + ". Run: python OpenRag/scripts/prepare_ragflow_models.py"
+    )
+print("offline ragflow model bundle OK")
+PY
+
+# 与生产 ragflow 模式一致：强制加载 RAGFlowPdfParser 全链（曾仅用 lazy_image 单测仍漏 ensure_pil_image 等）。
+RUN python scripts/verify_worker_ragflow_bundle.py \
+    && python -c "import openrag.worker.task_worker; print('task_worker OK')"
+
+RUN useradd -m -u 1000 openrag && chown -R openrag:openrag /app
+USER openrag
+
+ENV WORKER_NUM=4
+ENV WORKER_PREFIX=worker
+ENV WORKER_API_URL=http://api:8000
+ENV WORKER_BATCH_SIZE=5
+ENV WORKER_POLL_INTERVAL=5
+
+ENTRYPOINT ["tini", "--"]
+CMD ["python", "-m", "openrag.worker.task_worker"]

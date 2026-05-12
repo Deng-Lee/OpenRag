@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: milvus-etcd-data
+  namespace: openrag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-etcd
+  namespace: openrag
+  labels:
+    app: milvus-etcd
+spec:
+  type: ClusterIP
+  ports:
+    - port: 2379
+      targetPort: 2379
+      name: client
+  selector:
+    app: milvus-etcd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-etcd
+  namespace: openrag
+  labels:
+    app: milvus-etcd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus-etcd
+  template:
+    metadata:
+      labels:
+        app: milvus-etcd
+    spec:
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.5
+          command:
+            - etcd
+            - -advertise-client-urls=http://127.0.0.1:2379
+            - -listen-client-urls=http://0.0.0.0:2379
+            - --data-dir=/etcd
+          env:
+            - name: ETCD_AUTO_COMPACTION_MODE
+              value: revision
+            - name: ETCD_AUTO_COMPACTION_RETENTION
+              value: "1000"
+            - name: ETCD_QUOTA_BACKEND_BYTES
+              value: "4294967296"
+            - name: ETCD_SNAPSHOT_COUNT
+              value: "50000"
+          ports:
+            - containerPort: 2379
+              name: client
+          volumeMounts:
+            - name: data
+              mountPath: /etcd
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command:
+                - etcdctl
+                - endpoint
+                - health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: milvus-etcd-data
