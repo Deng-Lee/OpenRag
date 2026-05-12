@@ -12,36 +12,36 @@
 
 ## File Structure Map
 
-- Create: `OpenRag/src/openrag/ragflow_core/__init__.py` (core entry exports)
-- Create: `OpenRag/src/openrag/ragflow_core/router.py` (extension/type to parser strategy routing)
-- Create: `OpenRag/src/openrag/ragflow_core/types.py` (internal parser result models)
-- Create: `OpenRag/src/openrag/ragflow_core/compat.py` (core -> `DocumentBlock` mapping helpers)
-- Create: `OpenRag/src/openrag/chunking/ragflow_core/__init__.py` (core chunk entry exports)
-- Create: `OpenRag/src/openrag/chunking/ragflow_core/semantic.py` (naive/docx-like/children chunk semantics)
-- Create: `OpenRag/src/openrag/chunking/ragflow_core/metadata.py` (token/position metadata generation)
-- Modify: `OpenRag/src/openrag/parsers/factory.py` (route through ragflow core wrappers)
-- Modify: `OpenRag/src/openrag/parsers/adapters/pdf_adapter.py` (delegate to ragflow core policy surface)
-- Modify: `OpenRag/src/openrag/parsers/adapters/docx_adapter.py` (align doc/docx strategy and fallback chain)
-- Modify: `OpenRag/src/openrag/parsers/adapters/excel_adapter.py` (align strategy dispatch and output normalization)
-- Modify: `OpenRag/src/openrag/parsers/adapters/txt_adapter.py` (enable ragflow text-family extensions)
-- Modify: `OpenRag/src/openrag/parsers/adapters/markdown_adapter.py` (align md/markdown/mdx behavior)
-- Modify: `OpenRag/src/openrag/parsers/adapters/json_adapter.py` (align json/jsonl/ldjson handling)
-- Modify: `OpenRag/src/openrag/chunking/chunk_engine.py` (delegate semantic behavior to core)
-- Modify: `OpenRag/src/openrag/processors/document_processor.py` (remove parser-specific decision leakage)
-- Create: `OpenRag/tests/parity/test_parser_routing_parity.py` (routing parity tests)
-- Create: `OpenRag/tests/parity/test_parser_output_parity.py` (block-level parity tests)
-- Create: `OpenRag/tests/parity/test_chunk_semantic_parity.py` (chunking parity tests)
-- Create: `OpenRag/tests/parity/test_chunk_metadata_parity.py` (metadata parity tests)
-- Create: `OpenRag/tests/parity/fixtures/README.md` (fixture requirements and coverage matrix)
+- Create: `openrag/src/openrag/ragflow_core/__init__.py` (core entry exports)
+- Create: `openrag/src/openrag/ragflow_core/router.py` (extension/type to parser strategy routing)
+- Create: `openrag/src/openrag/ragflow_core/types.py` (internal parser result models)
+- Create: `openrag/src/openrag/ragflow_core/compat.py` (core -> `DocumentBlock` mapping helpers)
+- Create: `openrag/src/openrag/chunking/ragflow_core/__init__.py` (core chunk entry exports)
+- Create: `openrag/src/openrag/chunking/ragflow_core/semantic.py` (naive/docx-like/children chunk semantics)
+- Create: `openrag/src/openrag/chunking/ragflow_core/metadata.py` (token/position metadata generation)
+- Modify: `openrag/src/openrag/parsers/factory.py` (route through ragflow core wrappers)
+- Modify: `openrag/src/openrag/parsers/adapters/pdf_adapter.py` (delegate to ragflow core policy surface)
+- Modify: `openrag/src/openrag/parsers/adapters/docx_adapter.py` (align doc/docx strategy and fallback chain)
+- Modify: `openrag/src/openrag/parsers/adapters/excel_adapter.py` (align strategy dispatch and output normalization)
+- Modify: `openrag/src/openrag/parsers/adapters/txt_adapter.py` (enable ragflow text-family extensions)
+- Modify: `openrag/src/openrag/parsers/adapters/markdown_adapter.py` (align md/markdown/mdx behavior)
+- Modify: `openrag/src/openrag/parsers/adapters/json_adapter.py` (align json/jsonl/ldjson handling)
+- Modify: `openrag/src/openrag/chunking/chunk_engine.py` (delegate semantic behavior to core)
+- Modify: `openrag/src/openrag/processors/document_processor.py` (remove parser-specific decision leakage)
+- Create: `openrag/tests/parity/test_parser_routing_parity.py` (routing parity tests)
+- Create: `openrag/tests/parity/test_parser_output_parity.py` (block-level parity tests)
+- Create: `openrag/tests/parity/test_chunk_semantic_parity.py` (chunking parity tests)
+- Create: `openrag/tests/parity/test_chunk_metadata_parity.py` (metadata parity tests)
+- Create: `openrag/tests/parity/fixtures/README.md` (fixture requirements and coverage matrix)
 - Modify: `LOCAL_DEV_GUIDE.md` (new env toggles and parity test commands)
 
 ### Task 1: Build parser core skeleton
 
 **Files:**
-- Create: `OpenRag/src/openrag/ragflow_core/__init__.py`
-- Create: `OpenRag/src/openrag/ragflow_core/types.py`
-- Create: `OpenRag/src/openrag/ragflow_core/router.py`
-- Test: `OpenRag/tests/parity/test_parser_routing_parity.py`
+- Create: `openrag/src/openrag/ragflow_core/__init__.py`
+- Create: `openrag/src/openrag/ragflow_core/types.py`
+- Create: `openrag/src/openrag/ragflow_core/router.py`
+- Test: `openrag/tests/parity/test_parser_routing_parity.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -58,13 +58,13 @@ def test_resolve_parser_strategy_supports_ragflow_matrix():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_parser_routing_parity.py::test_resolve_parser_strategy_supports_ragflow_matrix -v`  
+Run: `pytest openrag/tests/parity/test_parser_routing_parity.py::test_resolve_parser_strategy_supports_ragflow_matrix -v`  
 Expected: FAIL with `ModuleNotFoundError` or missing function.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# OpenRag/src/openrag/ragflow_core/router.py
+# openrag/src/openrag/ragflow_core/router.py
 from pathlib import Path
 
 _MAP = {
@@ -87,22 +87,22 @@ def resolve_parser_strategy(file_path: str) -> str:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_parser_routing_parity.py::test_resolve_parser_strategy_supports_ragflow_matrix -v`  
+Run: `pytest openrag/tests/parity/test_parser_routing_parity.py::test_resolve_parser_strategy_supports_ragflow_matrix -v`  
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/ragflow_core OpenRag/tests/parity/test_parser_routing_parity.py
+git add openrag/src/openrag/ragflow_core openrag/tests/parity/test_parser_routing_parity.py
 git commit -m "feat(parser): add ragflow-core parser routing skeleton"
 ```
 
 ### Task 2: Route ParserFactory through ragflow core strategies
 
 **Files:**
-- Modify: `OpenRag/src/openrag/parsers/factory.py`
-- Modify: `OpenRag/src/openrag/parsers/parser_registry.py`
-- Test: `OpenRag/tests/parity/test_parser_routing_parity.py`
+- Modify: `openrag/src/openrag/parsers/factory.py`
+- Modify: `openrag/src/openrag/parsers/parser_registry.py`
+- Test: `openrag/tests/parity/test_parser_routing_parity.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -118,7 +118,7 @@ def test_factory_auto_accepts_mdx_and_jsonl():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_parser_routing_parity.py::test_factory_auto_accepts_mdx_and_jsonl -v`  
+Run: `pytest openrag/tests/parity/test_parser_routing_parity.py::test_factory_auto_accepts_mdx_and_jsonl -v`  
 Expected: FAIL with unsupported format.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -136,23 +136,23 @@ self._parser_classes.update({
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_parser_routing_parity.py -v`  
+Run: `pytest openrag/tests/parity/test_parser_routing_parity.py -v`  
 Expected: PASS for new extension routing cases.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/parsers/factory.py OpenRag/src/openrag/parsers/parser_registry.py OpenRag/tests/parity/test_parser_routing_parity.py
+git add openrag/src/openrag/parsers/factory.py openrag/src/openrag/parsers/parser_registry.py openrag/tests/parity/test_parser_routing_parity.py
 git commit -m "feat(parser): align parser factory extension routing with ragflow"
 ```
 
 ### Task 3: Implement parser compat mapping layer
 
 **Files:**
-- Create: `OpenRag/src/openrag/ragflow_core/compat.py`
-- Modify: `OpenRag/src/openrag/parsers/adapters/pdf_adapter.py`
-- Modify: `OpenRag/src/openrag/parsers/adapters/docx_adapter.py`
-- Test: `OpenRag/tests/parity/test_parser_output_parity.py`
+- Create: `openrag/src/openrag/ragflow_core/compat.py`
+- Modify: `openrag/src/openrag/parsers/adapters/pdf_adapter.py`
+- Modify: `openrag/src/openrag/parsers/adapters/docx_adapter.py`
+- Test: `openrag/tests/parity/test_parser_output_parity.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -169,13 +169,13 @@ def test_to_document_blocks_preserves_bbox_and_page():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_parser_output_parity.py::test_to_document_blocks_preserves_bbox_and_page -v`  
+Run: `pytest openrag/tests/parity/test_parser_output_parity.py::test_to_document_blocks_preserves_bbox_and_page -v`  
 Expected: FAIL with import error or missing mapper.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# OpenRag/src/openrag/ragflow_core/compat.py
+# openrag/src/openrag/ragflow_core/compat.py
 from openrag.parsers.base import DocumentBlock
 
 
@@ -196,23 +196,23 @@ def to_document_blocks(raw_blocks, source: str):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_parser_output_parity.py -v`  
+Run: `pytest openrag/tests/parity/test_parser_output_parity.py -v`  
 Expected: PASS for mapper invariants.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/ragflow_core/compat.py OpenRag/src/openrag/parsers/adapters/pdf_adapter.py OpenRag/src/openrag/parsers/adapters/docx_adapter.py OpenRag/tests/parity/test_parser_output_parity.py
+git add openrag/src/openrag/ragflow_core/compat.py openrag/src/openrag/parsers/adapters/pdf_adapter.py openrag/src/openrag/parsers/adapters/docx_adapter.py openrag/tests/parity/test_parser_output_parity.py
 git commit -m "feat(parser): add ragflow-core compatibility block mapping"
 ```
 
 ### Task 4: Refactor semantic chunking into ragflow core module
 
 **Files:**
-- Create: `OpenRag/src/openrag/chunking/ragflow_core/semantic.py`
-- Create: `OpenRag/src/openrag/chunking/ragflow_core/metadata.py`
-- Modify: `OpenRag/src/openrag/chunking/chunk_engine.py`
-- Test: `OpenRag/tests/parity/test_chunk_semantic_parity.py`
+- Create: `openrag/src/openrag/chunking/ragflow_core/semantic.py`
+- Create: `openrag/src/openrag/chunking/ragflow_core/metadata.py`
+- Modify: `openrag/src/openrag/chunking/chunk_engine.py`
+- Test: `openrag/tests/parity/test_chunk_semantic_parity.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -229,7 +229,7 @@ def test_ragflow_semantic_chunk_respects_children_delimiter():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_chunk_semantic_parity.py::test_ragflow_semantic_chunk_respects_children_delimiter -v`  
+Run: `pytest openrag/tests/parity/test_chunk_semantic_parity.py::test_ragflow_semantic_chunk_respects_children_delimiter -v`  
 Expected: FAIL with missing module/function.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -245,22 +245,22 @@ def ragflow_semantic_chunk(texts, chunk_token_num, delimiter, children_delimiter
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_chunk_semantic_parity.py -v`  
+Run: `pytest openrag/tests/parity/test_chunk_semantic_parity.py -v`  
 Expected: PASS for initial delegation contract.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/chunking/ragflow_core OpenRag/src/openrag/chunking/chunk_engine.py OpenRag/tests/parity/test_chunk_semantic_parity.py
+git add openrag/src/openrag/chunking/ragflow_core openrag/src/openrag/chunking/chunk_engine.py openrag/tests/parity/test_chunk_semantic_parity.py
 git commit -m "refactor(chunking): delegate semantic chunk core to ragflow module"
 ```
 
 ### Task 5: Align metadata generation with ragflow-compatible fields
 
 **Files:**
-- Modify: `OpenRag/src/openrag/chunking/ragflow_core/metadata.py`
-- Modify: `OpenRag/src/openrag/chunking/chunk_engine.py`
-- Test: `OpenRag/tests/parity/test_chunk_metadata_parity.py`
+- Modify: `openrag/src/openrag/chunking/ragflow_core/metadata.py`
+- Modify: `openrag/src/openrag/chunking/chunk_engine.py`
+- Test: `openrag/tests/parity/test_chunk_metadata_parity.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -278,7 +278,7 @@ def test_build_chunk_metadata_contains_ragflow_fields():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_chunk_metadata_parity.py::test_build_chunk_metadata_contains_ragflow_fields -v`  
+Run: `pytest openrag/tests/parity/test_chunk_metadata_parity.py::test_build_chunk_metadata_contains_ragflow_fields -v`  
 Expected: FAIL with missing keys.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -299,22 +299,22 @@ def build_chunk_metadata(text: str, ck_type: str, positions):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_chunk_metadata_parity.py -v`  
+Run: `pytest openrag/tests/parity/test_chunk_metadata_parity.py -v`  
 Expected: PASS for required metadata contract.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/chunking/ragflow_core/metadata.py OpenRag/src/openrag/chunking/chunk_engine.py OpenRag/tests/parity/test_chunk_metadata_parity.py
+git add openrag/src/openrag/chunking/ragflow_core/metadata.py openrag/src/openrag/chunking/chunk_engine.py openrag/tests/parity/test_chunk_metadata_parity.py
 git commit -m "feat(chunking): align ragflow-compatible chunk metadata fields"
 ```
 
 ### Task 6: Remove parser/chunk strategy leakage from orchestration layer
 
 **Files:**
-- Modify: `OpenRag/src/openrag/processors/document_processor.py`
-- Test: `OpenRag/tests/parity/test_parser_output_parity.py`
-- Test: `OpenRag/tests/parity/test_chunk_semantic_parity.py`
+- Modify: `openrag/src/openrag/processors/document_processor.py`
+- Test: `openrag/tests/parity/test_parser_output_parity.py`
+- Test: `openrag/tests/parity/test_chunk_semantic_parity.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -327,7 +327,7 @@ def test_document_processor_uses_registry_and_chunk_engine_contracts_only(mocker
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_parser_output_parity.py -v`  
+Run: `pytest openrag/tests/parity/test_parser_output_parity.py -v`  
 Expected: FAIL after adding assertions around orchestration behavior.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -342,20 +342,20 @@ chunks = self.chunk_engine.chunk(text_blocks, chunk_size=chunk_size, chunk_overl
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_parser_output_parity.py OpenRag/tests/parity/test_chunk_semantic_parity.py -v`  
+Run: `pytest openrag/tests/parity/test_parser_output_parity.py openrag/tests/parity/test_chunk_semantic_parity.py -v`  
 Expected: PASS with stable pipeline behavior.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/processors/document_processor.py OpenRag/tests/parity/test_parser_output_parity.py OpenRag/tests/parity/test_chunk_semantic_parity.py
+git add openrag/src/openrag/processors/document_processor.py openrag/tests/parity/test_parser_output_parity.py openrag/tests/parity/test_chunk_semantic_parity.py
 git commit -m "refactor(processor): isolate orchestration from parser and chunk strategy details"
 ```
 
 ### Task 7: Add parity fixture matrix and developer commands
 
 **Files:**
-- Create: `OpenRag/tests/parity/fixtures/README.md`
+- Create: `openrag/tests/parity/fixtures/README.md`
 - Modify: `LOCAL_DEV_GUIDE.md`
 
 - [ ] **Step 1: Write the failing test**
@@ -365,12 +365,12 @@ from pathlib import Path
 
 
 def test_parity_fixture_readme_exists():
-    assert Path("OpenRag/tests/parity/fixtures/README.md").exists()
+    assert Path("openrag/tests/parity/fixtures/README.md").exists()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/parity/test_parser_routing_parity.py::test_parity_fixture_readme_exists -v`  
+Run: `pytest openrag/tests/parity/test_parser_routing_parity.py::test_parity_fixture_readme_exists -v`  
 Expected: FAIL when README is absent.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -385,23 +385,23 @@ Expected: FAIL when README is absent.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/parity/test_parser_routing_parity.py::test_parity_fixture_readme_exists -v`  
+Run: `pytest openrag/tests/parity/test_parser_routing_parity.py::test_parity_fixture_readme_exists -v`  
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/tests/parity/fixtures/README.md LOCAL_DEV_GUIDE.md
+git add openrag/tests/parity/fixtures/README.md LOCAL_DEV_GUIDE.md
 git commit -m "docs: add parity fixture matrix and local parity test workflow"
 ```
 
 ### Task 8: Run full parity test suite and finalize
 
 **Files:**
-- Modify: `OpenRag/tests/parity/test_parser_routing_parity.py`
-- Modify: `OpenRag/tests/parity/test_parser_output_parity.py`
-- Modify: `OpenRag/tests/parity/test_chunk_semantic_parity.py`
-- Modify: `OpenRag/tests/parity/test_chunk_metadata_parity.py`
+- Modify: `openrag/tests/parity/test_parser_routing_parity.py`
+- Modify: `openrag/tests/parity/test_parser_output_parity.py`
+- Modify: `openrag/tests/parity/test_chunk_semantic_parity.py`
+- Modify: `openrag/tests/parity/test_chunk_metadata_parity.py`
 
 - [ ] **Step 1: Write/complete failing edge-case tests**
 
@@ -418,7 +418,7 @@ def test_children_delimiter_sets_mom_with_weight():
 
 - [ ] **Step 2: Run test to verify failures are meaningful**
 
-Run: `pytest OpenRag/tests/parity -v`  
+Run: `pytest openrag/tests/parity -v`  
 Expected: FAIL only on unimplemented/misaligned behavior, no flaky infra errors.
 
 - [ ] **Step 3: Implement minimal fixes for failing assertions**
@@ -430,16 +430,16 @@ Expected: FAIL only on unimplemented/misaligned behavior, no flaky infra errors.
 
 - [ ] **Step 4: Run full verification**
 
-Run: `pytest OpenRag/tests/parity -v`  
+Run: `pytest openrag/tests/parity -v`  
 Expected: PASS.
 
-Run: `pytest OpenRag/tests/test_chunk_engine.py OpenRag/tests/test_pdf_parser_resilience.py -v`  
+Run: `pytest openrag/tests/test_chunk_engine.py openrag/tests/test_pdf_parser_resilience.py -v`  
 Expected: PASS (no regressions in existing focused tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/tests/parity OpenRag/src/openrag/parsers OpenRag/src/openrag/chunking OpenRag/src/openrag/processors/document_processor.py
+git add openrag/tests/parity openrag/src/openrag/parsers openrag/src/openrag/chunking openrag/src/openrag/processors/document_processor.py
 git commit -m "test: enforce ragflow parity for parser and chunking pipeline"
 ```
 

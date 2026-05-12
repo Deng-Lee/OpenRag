@@ -1,0 +1,350 @@
+"""Machine-to-machine API (service token only; no JWT on these routes)."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, List, Optional
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from openrag.api.deps import get_db, get_service_token_context
+from openrag.api.search_api import (
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
+    _execute_search,
+)
+from openrag.models.file import File as DbFile
+from openrag.models.workspace import Workspace
+from openrag.services.file_ingest import ingest_new_file, replace_file_content, validate_path
+from openrag.services.service_token_service import (
+    ServiceTokenContext,
+    assert_token_workspace_permission,
+    require_workspace_for_name,
+)
+from openrag.services.workspace_file_tree import (
+    build_nested_tree,
+    get_file_document_by_path,
+    list_entries_by_prefix,
+    list_direct_children,
+    search_documents_by_name,
+)
+
+router = APIRouter(prefix="/service/v1", tags=["service"])
+
+logger = logging.getLogger(__name__)
+
+
+@router.get("/workspaces")
+async def service_list_workspaces(
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return the workspace(s) accessible to the authenticated service token."""
+    items = []
+    for binding in ctx.bindings:
+        ws = db.query(Workspace).filter(Workspace.id == binding.workspace_id).first()
+        if ws is not None:
+            items.append({
+                "name": ws.name,
+                "slug": ws.slug,
+                "permission": binding.permission,
+            })
+    return {"workspaces": items}
+
+
+class ServiceSearchRequest(BaseModel):
+    """Semantic search body for service token API (workspace comes from URL only)."""
+
+    query: str = Field(..., min_length=1)
+    path_prefix: Optional[str] = Field(
+        None,
+        description="If set, only hits whose file uri is under this logical path prefix",
+    )
+    top_k: int = Field(10, gt=0, le=100)
+    use_rerank: bool = True
+    use_contextual_retrieval: bool = False
+    contextual_l0_top_n: int = Field(40, ge=5, le=200)
+    contextual_l1_top_n: int = Field(30, ge=5, le=200)
+    contextual_chunk_fetch_multiplier: int = Field(4, ge=1, le=20)
+    retrieval_strategy: str = "auto"
+    use_l1_llm_navigation: bool = False
+
+
+def _apply_path_prefix_filter(resp: SearchResponse, path_prefix: Optional[str]) -> SearchResponse:
+    if path_prefix is None or not str(path_prefix).strip() or str(path_prefix).strip() == "/":
+        return resp
+    prefix = validate_path(path_prefix).rstrip("/")
+    kept: list[SearchResult] = []
+    for hit in resp.results:
+        uri = (hit.uri or "").rstrip("/")
+        if not uri:
+            continue
+        if uri == prefix or uri.startswith(prefix + "/"):
+            kept.append(hit)
+    return SearchResponse(
+        results=kept,
+        total=len(kept),
+        query_time_ms=resp.query_time_ms,
+    )
+
+
+def _file_summary(f: DbFile) -> dict[str, Any]:
+    return {
+        "id": f.id,
+        "path": f.uri,
+        "name": f.name,
+        "kind": "dir" if f.is_directory else "file",
+        "size": f.size,
+        "mime_type": f.mime_type,
+        "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+    }
+
+
+def _document_summary(f: DbFile) -> dict[str, Any]:
+    return {
+        "id": f.id,
+        "path": f.uri,
+        "name": f.name,
+        "size": f.size,
+        "mime_type": f.mime_type,
+        "processing_status": f.processing_status.value if f.processing_status else None,
+        "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+    }
+
+
+def _upload_response_dict(file_record: DbFile, task_id: int | None) -> dict[str, Any]:
+    return {
+        "id": file_record.id,
+        "path": file_record.uri,
+        "name": file_record.name,
+        "owner_id": file_record.owner_id,
+        "parent_id": file_record.parent_id,
+        "is_directory": file_record.is_directory,
+        "size": file_record.size,
+        "mime_type": file_record.mime_type,
+        "created_at": file_record.created_at.isoformat() if file_record.created_at else None,
+        "updated_at": file_record.updated_at.isoformat() if file_record.updated_at else None,
+        "task_id": task_id,
+    }
+
+
+def _resolve_url_prefix(url_prefix: Optional[str], path_prefix: Optional[str]) -> str:
+    """Resolve compatible prefix params and return normalized logical path."""
+    if url_prefix is None and path_prefix is None:
+        return "/"
+    if url_prefix is not None and path_prefix is not None:
+        normalized_url_prefix = validate_path(url_prefix)
+        normalized_path_prefix = validate_path(path_prefix)
+        if normalized_url_prefix != normalized_path_prefix:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="url_prefix and path_prefix must be the same when both provided",
+            )
+        return normalized_url_prefix
+    return validate_path(url_prefix if url_prefix is not None else path_prefix or "/")
+
+
+@router.post(
+    "/workspaces/{workspace_name}/documents",
+    status_code=status.HTTP_201_CREATED,
+)
+async def service_upload_document(
+    workspace_name: str,
+    path: str = Form(..., description="Parent directory logical path"),
+    file: UploadFile = File(...),
+    parser_type: str = Form(default="auto"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    body = await file.read()
+    file_record, task_record = ingest_new_file(
+        db,
+        ws,
+        ws.owner_id,
+        parent_logical_path=path,
+        upload_filename=file.filename or "unnamed",
+        file_content=body,
+        content_type=file.content_type,
+        parser_type=parser_type,
+        require_parent_dir=True,
+        duplicate_status_code=status.HTTP_409_CONFLICT,
+    )
+    return _upload_response_dict(file_record, task_record.id if task_record else None)
+
+
+@router.put("/workspaces/{workspace_name}/documents/by-path")
+async def service_replace_document(
+    workspace_name: str,
+    path: str = Query(..., description="Full file logical path"),
+    file: UploadFile = File(...),
+    parser_type: str = Form(default="auto"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    p = validate_path(path)
+    row = (
+        db.query(DbFile)
+        .filter(DbFile.workspace_id == ws.id, DbFile.uri == p, DbFile.is_directory.is_(False))
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    body = await file.read()
+    task = replace_file_content(
+        db,
+        ws,
+        ws.owner_id,
+        row,
+        new_content=body,
+        content_type=file.content_type,
+        parser_type=parser_type,
+    )
+    db.refresh(row)
+    return _upload_response_dict(row, task.id if task else None)
+
+
+@router.post("/workspaces/{workspace_name}/search", response_model=SearchResponse)
+async def service_semantic_search(
+    workspace_name: str,
+    body: ServiceSearchRequest,
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> SearchResponse:
+    """
+    Semantic search scoped to the workspace from the URL path.
+    Uses the same retrieval pipeline as ``POST /search`` with ``user_id=workspace.owner_id``.
+    """
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+
+    search_req = SearchRequest(
+        query=body.query,
+        top_k=body.top_k,
+        workspace_id=ws.id,
+        use_rerank=body.use_rerank,
+        use_contextual_retrieval=body.use_contextual_retrieval,
+        contextual_l0_top_n=body.contextual_l0_top_n,
+        contextual_l1_top_n=body.contextual_l1_top_n,
+        contextual_chunk_fetch_multiplier=body.contextual_chunk_fetch_multiplier,
+        retrieval_strategy=body.retrieval_strategy,
+        use_l1_llm_navigation=body.use_l1_llm_navigation,
+    )
+    try:
+        resp = _execute_search(
+            db,
+            ws.owner_id,
+            search_req,
+            endpoint="service_semantic",
+            rerank_hierarchical_boost=None,
+        )
+        return _apply_path_prefix_filter(resp, body.path_prefix)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Service search failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get("/workspaces/{workspace_name}/tree")
+async def service_workspace_tree(
+    workspace_name: str,
+    path_prefix: str = Query(default="/", description="Logical path prefix"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    return build_nested_tree(db, ws.id, path_prefix)
+
+
+@router.get("/workspaces/{workspace_name}/children")
+async def service_workspace_children(
+    workspace_name: str,
+    path: str = Query(..., description="Directory logical path"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> List[dict[str, Any]]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    rows = list_direct_children(db, ws.id, path)
+    return [_file_summary(f) for f in rows]
+
+
+@router.get("/workspaces/{workspace_name}/entries/by-prefix")
+async def service_workspace_entries_by_prefix(
+    workspace_name: str,
+    url_prefix: Optional[str] = Query(
+        default=None,
+        description="URL/逻辑路径前缀，返回该前缀下（含自身）的所有目录和文件",
+    ),
+    path_prefix: Optional[str] = Query(
+        default=None,
+        description="兼容参数，与 url_prefix 等价",
+    ),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    prefix = _resolve_url_prefix(url_prefix, path_prefix)
+    rows = list_entries_by_prefix(db, ws.id, prefix)
+    return {
+        "url_prefix": prefix,
+        "total": len(rows),
+        "items": [_file_summary(f) for f in rows],
+    }
+
+
+@router.get("/workspaces/{workspace_name}/documents/by-path")
+async def service_document_by_path(
+    workspace_name: str,
+    path: str = Query(..., description="File logical path"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    f = get_file_document_by_path(db, ws.id, path)
+    return {
+        "id": f.id,
+        "path": f.uri,
+        "name": f.name,
+        "size": f.size,
+        "mime_type": f.mime_type,
+        "owner_id": f.owner_id,
+        "processing_status": f.processing_status.value if f.processing_status else None,
+        "parser_type": f.parser_type,
+        "created_at": f.created_at.isoformat() if f.created_at else None,
+        "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+    }
+
+
+@router.get("/workspaces/{workspace_name}/documents/search-by-name")
+async def service_search_documents_by_name(
+    workspace_name: str,
+    filename: str = Query(default="", description="Filename substring (case-insensitive); empty returns all files"),
+    path_prefix: str = Query(default="/", description="Limit search scope to this path prefix"),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    rows, total = search_documents_by_name(db, ws.id, filename, path_prefix, skip, limit)
+    return {
+        "items": [_document_summary(f) for f in rows],
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+    }

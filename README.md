@@ -16,4 +16,4 @@
 
 Kubernetes 基线清单：`k8s/README.md` 与 `k8s/*.yaml`（部署前复制并编辑 `k8s/01-secret.example.yaml` → `k8s/01-secret.yaml`）。
 
-仓库目录：`OpenRag/`（后端）、`web/`（前端）、`docker/`（镜像与编排）、`k8s/`（K8s 清单）。
+仓库目录：`openrag/`（后端）、`web/`（前端）、`docker/`（镜像与编排）、`k8s/`（K8s 清单）。

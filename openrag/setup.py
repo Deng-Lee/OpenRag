@@ -1,0 +1,53 @@
+"""Setup configuration for OpenRag"""
+
+from setuptools import find_packages, setup
+
+setup(
+    name="openrag",
+    version="0.1.0",
+    description="OpenRag - RAG system with permission management",
+    author="OpenRag Team",
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
+    python_requires=">=3.9",
+    install_requires=[
+        "fastapi>=0.109.0",
+        "uvicorn>=0.27.0",
+        "pydantic>=2.5.3",
+        "pydantic-settings>=2.1.0",
+        "email-validator>=2.0.0",
+        "sqlalchemy>=2.0.25",
+        "alembic>=1.13.1",
+        "psycopg[binary]>=3.2.0",
+        "cryptography>=42.0.0",
+        "celery>=5.3.6",
+        "openviking>=0.3.3",
+        "python-multipart>=0.0.6",
+        "aiofiles>=23.2.1",
+        "python-docx>=1.1.0",
+        "openpyxl>=3.1.2",
+        "markdown>=3.6",
+        "python-jose[cryptography]>=3.3.0",
+        "passlib[bcrypt]>=1.7.4",
+        "httpx>=0.26.0",
+        "aiohttp>=3.9.1",
+        "python-dotenv>=1.0.0",
+        "loguru>=0.7.2",
+        "tenacity>=8.2.3",
+        "pyyaml>=6.0",
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.4.0",
+            "pytest-cov>=4.1.0",
+            "black>=24.1.0",
+            "flake8>=7.0.0",
+            "mypy>=1.8.0",
+            "isort>=5.13.0",
+            "alembic>=1.13.0",
+            "aiohttp>=3.9.0",
+            "loguru>=0.7.0",
+            "tenacity>=8.2.0",
+        ],
+    },
+)

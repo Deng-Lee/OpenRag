@@ -1,0 +1,465 @@
+"""Integration tests for /service/v1 routes (service token auth)."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+import openrag.models  # noqa: F401 — register all mappers on Base.metadata
+from openrag.api.deps import get_db
+from openrag.api.main import app
+from openrag.api.search_api import SearchResponse, SearchResult
+from openrag.models import Base, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
+from openrag.security import hash_password
+from openrag.storage.minio_storage import MinioStorage
+
+TEST_DATABASE_URL = "sqlite:///:memory:"
+
+engine = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture(scope="function")
+def db() -> Session:
+    Base.metadata.create_all(bind=engine)
+    session = TestingSessionLocal()
+    yield session
+    session.close()
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def owner(db: Session) -> User:
+    u = User(
+        username="svc_owner",
+        email="svc_owner@example.com",
+        password_hash=hash_password("pw"),
+        full_name="S",
+        is_active=True,
+    )
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+@pytest.fixture
+def workspace(db: Session, owner: User) -> Workspace:
+    ws = Workspace(name="SvcApiWS", slug="svc-api-ws", owner_id=owner.id)
+    db.add(ws)
+    db.commit()
+    db.refresh(ws)
+    return ws
+
+
+@pytest.fixture
+def service_token_headers(db: Session, owner: User, workspace: Workspace) -> dict[str, str]:
+    tok = ServiceToken(
+        secret="sk-integration-test",
+        name="t",
+        created_by_user_id=owner.id,
+    )
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=workspace.id, permission="read"))
+    db.commit()
+    return {"X-OpenRag-Token": "sk-integration-test"}
+
+
+@pytest.fixture
+def service_token_write_headers(db: Session, owner: User, workspace: Workspace) -> dict[str, str]:
+    tok = ServiceToken(
+        secret="sk-write-test",
+        name="w",
+        created_by_user_id=owner.id,
+    )
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=workspace.id, permission="write"))
+    db.commit()
+    return {"X-OpenRag-Token": "sk-write-test"}
+
+
+@pytest.fixture
+def client(db: Session):
+    def override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    prev = app.dependency_overrides.get(get_db)
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as c:
+        yield c
+    if prev is not None:
+        app.dependency_overrides[get_db] = prev
+    else:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def _root(db: Session, ws: Workspace, owner: User) -> None:
+    db.add(
+        File(
+            uri="/",
+            name="root",
+            owner_id=owner.id,
+            workspace_id=ws.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.commit()
+
+
+def test_service_list_workspaces_requires_token(client: TestClient, workspace: Workspace) -> None:
+    r = client.get("/service/v1/workspaces")
+    assert r.status_code == 401
+
+
+def test_service_list_workspaces_ok(
+    client: TestClient, workspace: Workspace, service_token_headers
+) -> None:
+    r = client.get("/service/v1/workspaces", headers=service_token_headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["id"] == workspace.id
+    assert item["name"] == workspace.name
+    assert item["slug"] == workspace.slug
+    assert item["description"] == workspace.description
+    assert item["permission"] == "read"
+
+
+def test_service_list_workspaces_write_token(
+    client: TestClient, workspace: Workspace, service_token_write_headers
+) -> None:
+    r = client.get("/service/v1/workspaces", headers=service_token_write_headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["permission"] == "write"
+
+
+def test_service_tree_requires_token(client: TestClient, workspace: Workspace) -> None:
+    r = client.get(f"/service/v1/workspaces/{workspace.name}/tree")
+    assert r.status_code == 401
+
+
+def test_service_tree_ok(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/docs",
+            name="docs",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.commit()
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/tree",
+        params={"path_prefix": "/"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["path"] == "/"
+    assert body["kind"] == "dir"
+
+
+def test_service_children_ok(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/docs",
+            name="docs",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.add(
+        File(
+            uri="/docs/a.txt",
+            name="a.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=3,
+            mime_type="text/plain",
+        )
+    )
+    db.commit()
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/children",
+        params={"path": "/docs"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    items = r.json()
+    assert len(items) == 1
+    assert items[0]["path"] == "/docs/a.txt"
+
+
+def test_service_entries_by_prefix_ok(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/docs",
+            name="docs",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.add(
+        File(
+            uri="/docs/a.txt",
+            name="a.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=3,
+            mime_type="text/plain",
+        )
+    )
+    db.add(
+        File(
+            uri="/images",
+            name="images",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.commit()
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/entries/by-prefix",
+        params={"url_prefix": "/docs"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["url_prefix"] == "/docs"
+    assert body["total"] == 2
+    assert body["items"][0]["path"] == "/docs"
+    assert body["items"][1]["path"] == "/docs/a.txt"
+
+
+def test_service_document_by_path_ok(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/readme.md",
+            name="readme.md",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=5,
+            mime_type="text/markdown",
+        )
+    )
+    db.commit()
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-path",
+        params={"path": "/readme.md"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["path"] == "/readme.md"
+    assert r.json()["name"] == "readme.md"
+
+
+def test_service_wrong_workspace_name_404(
+    client: TestClient, service_token_headers
+) -> None:
+    r = client.get(
+        "/service/v1/workspaces/DoesNotExistWS/tree",
+        params={"path_prefix": "/"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 404
+
+
+def test_service_search_requires_token(client: TestClient, workspace: Workspace) -> None:
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/search",
+        json={"query": "hello"},
+    )
+    assert r.status_code == 401
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_search_path_prefix_filter(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    mock_search.return_value = SearchResponse(
+        results=[
+            SearchResult(text="a", score=1.0, file_id=1, uri="/docs/a.txt"),
+            SearchResult(text="b", score=0.9, file_id=2, uri="/other/b.txt"),
+        ],
+        total=2,
+        query_time_ms=1.0,
+    )
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/search",
+        json={"query": "hello", "path_prefix": "/docs"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 1
+    assert data["results"][0]["uri"] == "/docs/a.txt"
+    mock_search.assert_called_once()
+    call_kw = mock_search.call_args
+    assert call_kw[0][2].workspace_id == workspace.id
+
+
+def test_service_upload_document_201(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/in",
+            name="in",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.commit()
+
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("n.txt", b"hello", "text/plain")}
+        data = {"path": "/in", "parser_type": "auto"}
+        r = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["path"] == "/in/n.txt"
+    assert body["mime_type"] == "text/plain"
+    assert body.get("task_id") is not None
+
+
+def test_service_upload_duplicate_409(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/in",
+            name="in",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    db.add(
+        File(
+            uri="/in/dup.txt",
+            name="dup.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=1,
+            mime_type="text/plain",
+        )
+    )
+    db.commit()
+
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("dup.txt", b"x", "text/plain")}
+        data = {"path": "/in"}
+        r = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+    assert r.status_code == 409
+
+
+def test_service_replace_document_200(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/rep.txt",
+            name="rep.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=1,
+            mime_type="text/plain",
+        )
+    )
+    db.commit()
+
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        with patch(
+            "openrag.api.files_api.cleanup_file_processing_data",
+            lambda *args, **kwargs: None,
+        ):
+            files = {"file": ("rep.txt", b"new-content-here", "text/plain")}
+            data = {"parser_type": "auto"}
+            r = client.put(
+                f"/service/v1/workspaces/{workspace.name}/documents/by-path",
+                params={"path": "/rep.txt"},
+                files=files,
+                data=data,
+                headers=service_token_write_headers,
+            )
+    assert r.status_code == 200
+    assert r.json()["path"] == "/rep.txt"
+    assert r.json().get("task_id") is not None

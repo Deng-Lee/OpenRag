@@ -13,7 +13,7 @@
 ### Task 1: 新增服务函数 `search_documents_by_name`
 
 **Files:**
-- Modify: `OpenRag/src/openrag/services/workspace_file_tree.py` (追加函数)
+- Modify: `openrag/src/openrag/services/workspace_file_tree.py` (追加函数)
 
 - [ ] **Step 1: 添加 `_escape_ilike` 辅助函数**
 
@@ -65,7 +65,7 @@ def search_documents_by_name(
 - [ ] **Step 3: Commit**
 
 ```bash
-git add OpenRag/src/openrag/services/workspace_file_tree.py
+git add openrag/src/openrag/services/workspace_file_tree.py
 git commit -m "feat: add search_documents_by_name service function"
 ```
 
@@ -74,7 +74,7 @@ git commit -m "feat: add search_documents_by_name service function"
 ### Task 2: 新增 service API 端点
 
 **Files:**
-- Modify: `OpenRag/src/openrag/api/service_api.py` (追加路由 + 辅助函数 + import)
+- Modify: `openrag/src/openrag/api/service_api.py` (追加路由 + 辅助函数 + import)
 
 - [ ] **Step 1: 添加 import**
 
@@ -136,7 +136,7 @@ async def service_search_documents_by_name(
 - [ ] **Step 4: Commit**
 
 ```bash
-git add OpenRag/src/openrag/api/service_api.py
+git add openrag/src/openrag/api/service_api.py
 git commit -m "feat: add GET documents/search-by-name endpoint to service API"
 ```
 
@@ -248,7 +248,7 @@ git commit -m "docs: update Service Token guide with search-by-name endpoint"
 - [ ] **Step 1: 启动 API 服务**
 
 ```bash
-cd OpenRag/src && python -m uvicorn openrag.api.main:app --reload
+cd openrag/src && python -m uvicorn openrag.api.main:app --reload
 ```
 
 - [ ] **Step 2: 访问 `/docs` 确认新端点出现在 service 标签下**

@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-COPY OpenRag/requirements.txt .
+COPY openrag/requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 FROM python:3.11-slim
@@ -31,12 +31,12 @@ RUN cp -a /root/.local/lib/python3.11/site-packages/. /usr/local/lib/python3.11/
     && rm -rf /root/.local \
     && apt-get update && apt-get install -y tini && rm -rf /var/lib/apt/lists/*
 
-COPY OpenRag/src/ ./src/
-COPY OpenRag/rag/res/deepdoc/ ./src/rag/res/deepdoc/
-COPY OpenRag/run_api.py .
-COPY OpenRag/setup.py .
-COPY OpenRag/scripts/verify_worker_ragflow_bundle.py ./scripts/
-COPY OpenRag/scripts/prepare_ragflow_models.py ./scripts/
+COPY openrag/src/ ./src/
+COPY openrag/rag/res/deepdoc/ ./src/rag/res/deepdoc/
+COPY openrag/run_api.py .
+COPY openrag/setup.py .
+COPY openrag/scripts/verify_worker_ragflow_bundle.py ./scripts/
+COPY openrag/scripts/prepare_ragflow_models.py ./scripts/
 
 RUN pip install --no-cache-dir -e .
 
@@ -57,7 +57,7 @@ if missing:
     raise SystemExit(
         "Missing offline ragflow model files under /app/src/rag/res/deepdoc: "
         + ", ".join(missing)
-        + ". Run: python OpenRag/scripts/prepare_ragflow_models.py"
+        + ". Run: python openrag/scripts/prepare_ragflow_models.py"
     )
 print("offline ragflow model bundle OK")
 PY

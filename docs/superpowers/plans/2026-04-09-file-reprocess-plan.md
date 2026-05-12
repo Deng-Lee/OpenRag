@@ -14,7 +14,7 @@
 
 | File | Purpose |
 |------|---------|
-| `OpenRag/src/openrag/api/files_api.py` | 新增 reprocess API 端点 |
+| `openrag/src/openrag/api/files_api.py` | 新增 reprocess API 端点 |
 | `web/src/services/api.ts` | 新增 filesAPI.reprocess 方法 |
 | `web/src/components/FileList.tsx` | 添加重新处理按钮和对话框 |
 | `web/src/i18n/locales/zh-CN.json` | 添加中文翻译 |
@@ -25,8 +25,8 @@
 ## Task 1: 后端 API - Reprocess 端点
 
 **Files:**
-- Modify: `OpenRag/src/openrag/api/files_api.py:99-111` (在 SUPPORTED_PARSER_TYPES 附近)
-- Modify: `OpenRag/src/openrag/api/files_api.py:646-650` (文件末尾)
+- Modify: `openrag/src/openrag/api/files_api.py:99-111` (在 SUPPORTED_PARSER_TYPES 附近)
+- Modify: `openrag/src/openrag/api/files_api.py:646-650` (文件末尾)
 
 ### Step 1: 添加 ReprocessRequest 数据模型
 
@@ -209,7 +209,7 @@ async def reprocess_file(
 运行后端服务并测试 API：
 
 ```bash
-cd e:/project/OpenRag/OpenRag
+cd e:/project/openrag/OpenRag
 python -m uvicorn openrag.api.main:app --reload --port 8001
 ```
 
@@ -227,7 +227,7 @@ Expected: 如果文件存在且有权限，返回包含 task_id 的 JSON
 ### Step 5: Commit 后端变更
 
 ```bash
-git add OpenRag/src/openrag/api/files_api.py
+git add openrag/src/openrag/api/files_api.py
 git commit -m "feat(api): add file reprocess endpoint
 
 - Add POST /files/{id}/reprocess endpoint

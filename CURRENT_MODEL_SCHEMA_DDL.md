@@ -1,7 +1,7 @@
 # OpenRag 当前模型 DDL 快照（PostgreSQL）
 
 **更新时间**: 2026-04-17  
-**来源**: `OpenRag/src/openrag/models/*.py`  
+**来源**: `openrag/src/openrag/models/*.py`  
 **用途**: 与当前 ORM 对齐的 **PostgreSQL** 参考 DDL；生产环境以 **SQLAlchemy / Alembic 生成结果** 为准，勿直接复制执行若与迁移历史冲突。
 
 **说明**:
@@ -316,8 +316,8 @@ CREATE INDEX idx_task_heartbeat ON tasks (status, heartbeat_at);
 
 模型、约束或索引变更后，请同步：
 
-1. `OpenRag/src/openrag/models/*.py`  
-2. Alembic / `OpenRag/scripts/sql/` 等正式迁移  
+1. `openrag/src/openrag/models/*.py`  
+2. Alembic / `openrag/scripts/sql/` 等正式迁移  
 3. 本文档（若仍作为人工审阅参考）
 
 **可选**：若希望避免 PostgreSQL 原生 `ENUM` 与后续枚举扩值迁移成本，可在 ORM 中将对应列改为 `String` + `CHECK`；本文档按当前模型使用 `ENUM` 类型编写。

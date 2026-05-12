@@ -849,5 +849,5 @@ print(r.json())
 
 ### 2.12 相关脚本与设计
 
-- 数据库迁移脚本：`OpenRag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`
+- 数据库迁移脚本：`openrag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`
 - 设计背景：`docs/superpowers/specs/2026-05-06-service-token-multi-workspace-design.md`

@@ -1,0 +1,61 @@
+"""Base classes for document parsers."""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class TextBlock:
+    """Represents a text block with position information.
+
+    Attributes:
+        text: The text content of the block
+        page: Page number (1-indexed)
+        offset: Character offset within the page
+        bbox: Bounding box coordinates (x1, y1, x2, y2) if available
+        block_type: Type of block (text, title, table, image, etc.)
+        level: Heading level (0 for normal text, 1-6 for headings)
+    """
+    text: str
+    page: int
+    offset: int
+    bbox: Optional[tuple[float, float, float, float]] = None
+    block_type: str = "text"
+    level: int = 0
+
+
+class DocumentParser(ABC):
+    """Base class for document parsers.
+
+    All document parsers should inherit from this class and implement
+    the parse() and supports() methods.
+    """
+
+    @abstractmethod
+    def parse(self, file_path: str) -> list[TextBlock]:
+        """Parse document and return text blocks with position info.
+
+        Args:
+            file_path: Path to the document file
+
+        Returns:
+            List of TextBlock objects containing parsed content
+
+        Raises:
+            NotImplementedError: If parser is not yet implemented
+            ValueError: If file cannot be parsed
+        """
+        pass
+
+    @abstractmethod
+    def supports(self, file_path: str) -> bool:
+        """Check if parser supports this file type.
+
+        Args:
+            file_path: Path to the document file
+
+        Returns:
+            True if this parser can handle the file type, False otherwise
+        """
+        pass

@@ -11,26 +11,26 @@
 ---
 
 ## File Structure
-- `OpenRag/src/openrag/models/role.py`: (New) Define `Role`, `RoleWorkspacePermission`, `UserRole`
-- `OpenRag/src/openrag/models/__init__.py`: (Modify) Export new models
-- `OpenRag/tests/models/test_role.py`: (New) Test role model relationships
-- `OpenRag/src/openrag/services/workspace_service.py`: (Modify) Update `check_permission` and `get_user_workspaces` logic
-- `OpenRag/tests/services/test_workspace_service.py`: (Modify) Add tests for role-based permission inheritance and overrides
-- `OpenRag/src/openrag/api/permissions_api.py`: (Modify) Add endpoint to fetch aggregated permission details
-- `OpenRag/tests/api/test_permissions_api.py`: (Modify) Add tests for the new aggregated endpoint
+- `openrag/src/openrag/models/role.py`: (New) Define `Role`, `RoleWorkspacePermission`, `UserRole`
+- `openrag/src/openrag/models/__init__.py`: (Modify) Export new models
+- `openrag/tests/models/test_role.py`: (New) Test role model relationships
+- `openrag/src/openrag/services/workspace_service.py`: (Modify) Update `check_permission` and `get_user_workspaces` logic
+- `openrag/tests/services/test_workspace_service.py`: (Modify) Add tests for role-based permission inheritance and overrides
+- `openrag/src/openrag/api/permissions_api.py`: (Modify) Add endpoint to fetch aggregated permission details
+- `openrag/tests/api/test_permissions_api.py`: (Modify) Add tests for the new aggregated endpoint
 
 ---
 
 ### Task 1: Create Role Data Models
 
 **Files:**
-- Create: `OpenRag/src/openrag/models/role.py`
-- Modify: `OpenRag/src/openrag/models/__init__.py`
-- Test: `OpenRag/tests/models/test_role.py`
+- Create: `openrag/src/openrag/models/role.py`
+- Modify: `openrag/src/openrag/models/__init__.py`
+- Test: `openrag/tests/models/test_role.py`
 
 - [ ] **Step 1: Write the failing test**
 
-Create `OpenRag/tests/models/test_role.py`:
+Create `openrag/tests/models/test_role.py`:
 ```python
 import pytest
 from sqlalchemy import select
@@ -82,12 +82,12 @@ def test_user_role_assignment(db_session):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/models/test_role.py -v`
+Run: `pytest openrag/tests/models/test_role.py -v`
 Expected: FAIL with "ModuleNotFoundError: No module named 'openrag.models.role'"
 
 - [ ] **Step 3: Write minimal implementation**
 
-Create `OpenRag/src/openrag/models/role.py`:
+Create `openrag/src/openrag/models/role.py`:
 ```python
 from sqlalchemy import Boolean, ForeignKey, Integer, String, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -141,7 +141,7 @@ class UserRole(Base, TimestampMixin):
     )
 ```
 
-Modify `OpenRag/src/openrag/models/user.py` to add the roles relationship:
+Modify `openrag/src/openrag/models/user.py` to add the roles relationship:
 ```python
 # Add to the Relationships section:
     roles: Mapped[List["Role"]] = relationship(
@@ -151,7 +151,7 @@ Modify `OpenRag/src/openrag/models/user.py` to add the roles relationship:
     )
 ```
 
-Modify `OpenRag/src/openrag/models/__init__.py`:
+Modify `openrag/src/openrag/models/__init__.py`:
 ```python
 # Add:
 from .role import Role, RoleWorkspacePermission, UserRole
@@ -164,25 +164,25 @@ cd OpenRag && alembic revision --autogenerate -m "Add role models"
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/models/test_role.py -v`
+Run: `pytest openrag/tests/models/test_role.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/models/role.py OpenRag/src/openrag/models/__init__.py OpenRag/src/openrag/models/user.py OpenRag/tests/models/test_role.py OpenRag/alembic/versions/
+git add openrag/src/openrag/models/role.py openrag/src/openrag/models/__init__.py openrag/src/openrag/models/user.py openrag/tests/models/test_role.py openrag/alembic/versions/
 git commit -m "feat(models): add Role, RoleWorkspacePermission, and UserRole models"
 ```
 
 ### Task 2: Implement Effective Permission Calculation
 
 **Files:**
-- Modify: `OpenRag/src/openrag/services/workspace_service.py`
-- Modify: `OpenRag/tests/services/test_workspace_service.py`
+- Modify: `openrag/src/openrag/services/workspace_service.py`
+- Modify: `openrag/tests/services/test_workspace_service.py`
 
 - [ ] **Step 1: Write the failing test**
 
-Modify `OpenRag/tests/services/test_workspace_service.py` (add these tests):
+Modify `openrag/tests/services/test_workspace_service.py` (add these tests):
 ```python
 from openrag.models.role import Role, RoleWorkspacePermission, UserRole
 from openrag.services.workspace_service import check_workspace_permission
@@ -233,12 +233,12 @@ def test_check_permission_inactive_role(db_session, test_user, test_workspace):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/services/test_workspace_service.py -k test_check_permission -v`
+Run: `pytest openrag/tests/services/test_workspace_service.py -k test_check_permission -v`
 Expected: FAIL for role-based permission tests because `check_workspace_permission` currently only checks `WorkspaceMember`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Modify `OpenRag/src/openrag/services/workspace_service.py` to update the permission check:
+Modify `openrag/src/openrag/services/workspace_service.py` to update the permission check:
 
 ```python
 from sqlalchemy import select, or_
@@ -293,25 +293,25 @@ def check_workspace_permission(db, user_id: int, workspace_id: int) -> str | Non
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/services/test_workspace_service.py -k test_check_permission -v`
+Run: `pytest openrag/tests/services/test_workspace_service.py -k test_check_permission -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/services/workspace_service.py OpenRag/tests/services/test_workspace_service.py
+git add openrag/src/openrag/services/workspace_service.py openrag/tests/services/test_workspace_service.py
 git commit -m "feat(services): compute workspace permissions by unioning direct and role grants"
 ```
 
 ### Task 3: Expose Aggregated Permission API
 
 **Files:**
-- Modify: `OpenRag/src/openrag/api/permissions_api.py`
-- Modify: `OpenRag/tests/api/test_permissions_api.py`
+- Modify: `openrag/src/openrag/api/permissions_api.py`
+- Modify: `openrag/tests/api/test_permissions_api.py`
 
 - [ ] **Step 1: Write the failing test**
 
-Modify `OpenRag/tests/api/test_permissions_api.py`:
+Modify `openrag/tests/api/test_permissions_api.py`:
 ```python
 def test_get_user_permission_details(client, auth_headers, db_session, test_user, test_workspace):
     # Setup data
@@ -348,12 +348,12 @@ def test_get_user_permission_details(client, auth_headers, db_session, test_user
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest OpenRag/tests/api/test_permissions_api.py -k test_get_user_permission_details -v`
+Run: `pytest openrag/tests/api/test_permissions_api.py -k test_get_user_permission_details -v`
 Expected: FAIL with 404 Not Found
 
 - [ ] **Step 3: Write minimal implementation**
 
-Modify `OpenRag/src/openrag/api/permissions_api.py`:
+Modify `openrag/src/openrag/api/permissions_api.py`:
 ```python
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -432,12 +432,12 @@ def get_user_permission_details(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest OpenRag/tests/api/test_permissions_api.py -k test_get_user_permission_details -v`
+Run: `pytest openrag/tests/api/test_permissions_api.py -k test_get_user_permission_details -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/api/permissions_api.py OpenRag/tests/api/test_permissions_api.py
+git add openrag/src/openrag/api/permissions_api.py openrag/tests/api/test_permissions_api.py
 git commit -m "feat(api): add endpoint to fetch detailed aggregated permissions for UI"
 ```

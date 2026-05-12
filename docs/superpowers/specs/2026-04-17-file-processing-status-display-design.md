@@ -71,7 +71,7 @@ GET /files/ , GET /files/{id} , ...
 | `processing_error` | `TEXT` | Yes | 最近一次处理失败的错误信息；成功/重置时清空 |
 
 - 使用 Alembic 迁移（新增 autogenerate 迁移，向上加列、向下删列）。
-- SQLAlchemy 模型 `OpenRag/src/openrag/models/file.py` 相应增加 `Mapped[Optional[str]]`。
+- SQLAlchemy 模型 `openrag/src/openrag/models/file.py` 相应增加 `Mapped[Optional[str]]`。
 - 不做长度约束（PostgreSQL `TEXT`），但写入时应用层截断为 4096 字符，防止异常栈过长撑爆行。
 
 ### `ProcessingStatus` 枚举：保持不变
@@ -95,7 +95,7 @@ GET /files/ , GET /files/{id} , ...
 
 ### 1. Worker 失败标记
 
-文件：`OpenRag/src/openrag/worker/task_worker.py`
+文件：`openrag/src/openrag/worker/task_worker.py`
 
 - 新增私有方法：
 
@@ -126,7 +126,7 @@ GET /files/ , GET /files/{id} , ...
 
 ### 2. 重处理入口清理错误信息
 
-文件：`OpenRag/src/openrag/api/files_api.py::cleanup_file_processing_data`
+文件：`openrag/src/openrag/api/files_api.py::cleanup_file_processing_data`
 
 在已有的重置逻辑后追加：
 
@@ -138,7 +138,7 @@ file.processing_error = None
 
 ### 3. `FileResponse` schema 扩展
 
-文件：`OpenRag/src/openrag/api/files_api.py`
+文件：`openrag/src/openrag/api/files_api.py`
 
 ```python
 SIMPLE_STATUS_MAP: dict[str, str] = {

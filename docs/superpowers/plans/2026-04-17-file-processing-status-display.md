@@ -14,16 +14,16 @@
 
 | 文件 | 职责 |
 |---|---|
-| `OpenRag/src/openrag/models/file.py` | 新增 `processing_error` 列；`validates` 纳入 NUL 剥离 |
-| `OpenRag/src/openrag/api/files_api.py` | `SIMPLE_STATUS_MAP`、`_file_to_response` / `_file_to_upload_response`、替换所有手写 `FileResponse`/`FileUploadResponse` 构造 |
-| `OpenRag/src/openrag/services/file_ingest.py` | 若创建 `File` 时需显式设 `processing_error=None`（通常可省略，默认 NULL） |
-| `OpenRag/src/openrag/processors/document_processor.py` | 成功落库 `completed` 时 `processing_error = None` |
-| `OpenRag/src/openrag/worker/task_worker.py` | `_mark_file_failed` + `_execute_task` except 分支调用 |
+| `openrag/src/openrag/models/file.py` | 新增 `processing_error` 列；`validates` 纳入 NUL 剥离 |
+| `openrag/src/openrag/api/files_api.py` | `SIMPLE_STATUS_MAP`、`_file_to_response` / `_file_to_upload_response`、替换所有手写 `FileResponse`/`FileUploadResponse` 构造 |
+| `openrag/src/openrag/services/file_ingest.py` | 若创建 `File` 时需显式设 `processing_error=None`（通常可省略，默认 NULL） |
+| `openrag/src/openrag/processors/document_processor.py` | 成功落库 `completed` 时 `processing_error = None` |
+| `openrag/src/openrag/worker/task_worker.py` | `_mark_file_failed` + `_execute_task` except 分支调用 |
 | `CURRENT_MODEL_SCHEMA_DDL.md` | `files` 表增加 `processing_error` 说明与示例 DDL |
 | `web/src/types/index.ts` | `File` 接口扩展三个可选字段 |
 | `web/src/components/FileList.tsx` | 状态列 + Tag + Popover + 复用 `handleReprocess` |
 | `web/src/i18n/locales/zh.json` / `en.json` | 列标题与四态 + `failed_title` / `no_error` |
-| `OpenRag/tests/test_files_api.py` | 列表/详情断言新字段；目录行为 |
+| `openrag/tests/test_files_api.py` | 列表/详情断言新字段；目录行为 |
 | `web/src/components/FileList.test.tsx` | 四态与失败 Popover、目录 `-` |
 
 **数据库迁移说明：** 当前仓库根目录**未发现** `alembic.ini`。生产 PostgreSQL 需执行：
@@ -39,12 +39,12 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS processing_error TEXT;
 ### Task 1: 模型 + DDL 文档
 
 **Files:**
-- Modify: `OpenRag/src/openrag/models/file.py`
+- Modify: `openrag/src/openrag/models/file.py`
 - Modify: `CURRENT_MODEL_SCHEMA_DDL.md`（`files` 表片段与 §2 脚本）
 
 - [ ] **Step 1: 在 `File` 模型增加 `processing_error`**
 
-在 `OpenRag/src/openrag/models/file.py` 中：
+在 `openrag/src/openrag/models/file.py` 中：
 
 1. 增加 import：`from sqlalchemy import ... Text`（若尚无 `Text`）。
 2. 在 `processing_status` 字段**之后**增加：
@@ -80,7 +80,7 @@ ALTER TABLE files ADD COLUMN IF NOT EXISTS processing_error TEXT;
 - [ ] **Step 4: Commit**
 
 ```bash
-git add OpenRag/src/openrag/models/file.py CURRENT_MODEL_SCHEMA_DDL.md
+git add openrag/src/openrag/models/file.py CURRENT_MODEL_SCHEMA_DDL.md
 git commit -m "feat(models): add files.processing_error for pipeline failures"
 ```
 
@@ -89,7 +89,7 @@ git commit -m "feat(models): add files.processing_error for pipeline failures"
 ### Task 2: API 响应层 — 映射与统一构造
 
 **Files:**
-- Modify: `OpenRag/src/openrag/api/files_api.py`（约 126–316、394–409、570–581、852–863、948–959、1044–1056）
+- Modify: `openrag/src/openrag/api/files_api.py`（约 126–316、394–409、570–581、852–863、948–959、1044–1056）
 
 - [ ] **Step 1: 在 `FileResponse` 增加字段**
 
@@ -183,7 +183,7 @@ def _file_to_upload_response(file: FileModel, task_id: Optional[int]) -> FileUpl
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/api/files_api.py
+git add openrag/src/openrag/api/files_api.py
 git commit -m "feat(api): expose processing status and simple_status on file responses"
 ```
 
@@ -192,7 +192,7 @@ git commit -m "feat(api): expose processing status and simple_status on file res
 ### Task 3: DocumentProcessor 成功时清空 `processing_error`
 
 **Files:**
-- Modify: `OpenRag/src/openrag/processors/document_processor.py`（Step 7 更新元数据处，约 294–300）
+- Modify: `openrag/src/openrag/processors/document_processor.py`（Step 7 更新元数据处，约 294–300）
 
 - [ ] **Step 1: 在 `completed` 分支清空**
 
@@ -205,7 +205,7 @@ git commit -m "feat(api): expose processing status and simple_status on file res
 - [ ] **Step 2: Commit**
 
 ```bash
-git add OpenRag/src/openrag/processors/document_processor.py
+git add openrag/src/openrag/processors/document_processor.py
 git commit -m "fix(pipeline): clear processing_error on successful completion"
 ```
 
@@ -214,7 +214,7 @@ git commit -m "fix(pipeline): clear processing_error on successful completion"
 ### Task 4: Worker — `_mark_file_failed`
 
 **Files:**
-- Modify: `OpenRag/src/openrag/worker/task_worker.py`（`TaskWorker` 类内，`_execute_task`）
+- Modify: `openrag/src/openrag/worker/task_worker.py`（`TaskWorker` 类内，`_execute_task`）
 
 - [ ] **Step 1: 增加模块常量与私有方法**
 
@@ -276,7 +276,7 @@ git commit -m "fix(pipeline): clear processing_error on successful completion"
 - [ ] **Step 3: Commit**
 
 ```bash
-git add OpenRag/src/openrag/worker/task_worker.py
+git add openrag/src/openrag/worker/task_worker.py
 git commit -m "feat(worker): mark file failed and store processing_error on task failure"
 ```
 
@@ -285,7 +285,7 @@ git commit -m "feat(worker): mark file failed and store processing_error on task
 ### Task 5: 后端测试 `test_files_api.py`
 
 **Files:**
-- Modify: `OpenRag/tests/test_files_api.py`
+- Modify: `openrag/tests/test_files_api.py`
 
 - [ ] **Step 1: 扩展 fixture / 新用例**
 
@@ -346,7 +346,7 @@ cd OpenRag && pytest tests/test_files_api.py -v
 - [ ] **Step 4: Commit**
 
 ```bash
-git add OpenRag/tests/test_files_api.py
+git add openrag/tests/test_files_api.py
 git commit -m "test(api): cover file simple_status and failed error_message"
 ```
 

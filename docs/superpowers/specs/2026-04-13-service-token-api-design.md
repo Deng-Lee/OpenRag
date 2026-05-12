@@ -71,7 +71,7 @@
 | `created_at` / `revoked_at` | 吊销用软删除时间点 |
 | `last_used_at` | 可选，v1 可不实现 |
 
-**迁移**：若库中曾存在 `service_token_workspaces` 联结表，在业务库执行 `OpenRag/scripts/sql/2026-04-14-service-token-one-workspace-migrate.sql`（按联结表最小 id 取一条回填）；全新库使用 `2026-04-13-service-token.sql` 即可。
+**迁移**：若库中曾存在 `service_token_workspaces` 联结表，在业务库执行 `openrag/scripts/sql/2026-04-14-service-token-one-workspace-migrate.sql`（按联结表最小 id 取一条回填）；全新库使用 `2026-04-13-service-token.sql` 即可。
 
 ## Service API（`/service/v1`）
 
@@ -146,9 +146,9 @@
 
 ## Testing
 
-- 后端：`OpenRag/pytest.ini` 通过 `python_files` 仅收集当前子集维护的契约用例（`test_service_*.py`、`test_service_api.py`、`test_service_tokens_admin.py`、`test_workspace_file_tree.py`、`test_files_api.py`）。运行：`cd OpenRag && python -m pytest tests/ -q`。
+- 后端：`openrag/pytest.ini` 通过 `python_files` 仅收集当前子集维护的契约用例（`test_service_*.py`、`test_service_api.py`、`test_service_tokens_admin.py`、`test_workspace_file_tree.py`、`test_files_api.py`）。运行：`cd OpenRag && python -m pytest tests/ -q`。
 - 若浏览器请求 `GET /workspaces/{id}/service-tokens` 返回 **404**：说明运行中的 API 进程/容器仍是**未包含** `service_tokens_admin` 的旧代码；请在仓库根执行 **`docker compose -f docker/docker-compose.prod.yml build api`**（或等价）后重启 API，或在本机 **`cd OpenRag && pip install -e .`** 再启动 `run_api.py` / `uvicorn`。
-- 若返回 **500** 且 JSON 为 `{"detail":"Database error occurred"}`：多为 **MySQL 尚未执行**建表脚本。全新部署执行 `OpenRag/scripts/sql/2026-04-13-service-token.sql`；由旧版联结表升级执行 `2026-04-14-service-token-one-workspace-migrate.sql`。排障：将环境变量 **`DEBUG=true`** 重启 API，同一错误响应中会附带简短 SQL 异常信息；API 日志中也会打印完整堆栈。
+- 若返回 **500** 且 JSON 为 `{"detail":"Database error occurred"}`：多为 **MySQL 尚未执行**建表脚本。全新部署执行 `openrag/scripts/sql/2026-04-13-service-token.sql`；由旧版联结表升级执行 `2026-04-14-service-token-one-workspace-migrate.sql`。排障：将环境变量 **`DEBUG=true`** 重启 API，同一错误响应中会附带简短 SQL 异常信息；API 日志中也会打印完整堆栈。
 - 鉴权：`401` / `403` / 有效路径组合矩阵。
 - 五类服务接口各至少一条契约测试；上传/更新断言解析任务入队（可 mock）。
 - 管理端：无 JWT 拒绝；无写权限拒绝创建；列表响应不含无意泄露的 secret；`secret` 接口仅在授权下返回明文；令牌仅出现在其绑定工作区的列表中。

@@ -40,11 +40,11 @@ OpenRag 依赖于多个外部服务。我们提供了 `docker-compose.dev.yml` �
 
 ## 🐍 第二步：启动 Python 后端 API
 
-后端 API 位于 `OpenRag/` 目录下，基于 FastAPI 构建。
+后端 API 位于 `openrag/` 目录下，基于 FastAPI 构建。
 
 1. 新开一个终端窗口，进入后端目录：
    ```bash
-   cd OpenRag
+   cd openrag
    ```
 2. 创建并激活 Python 虚拟环境：
    - **Windows (PowerShell)**:
@@ -65,7 +65,7 @@ OpenRag 依赖于多个外部服务。我们提供了 `docker-compose.dev.yml` �
    ```bash
    cp .env.example .env
    ```
-   在 **`OpenRag/.env`**（或你加载的环境变量）中配置 **PostgreSQL**，且必须与 **`docker/.env`** 里 Postgres 容器使用的账号一致，否则会出现 `password authentication failed for user "..."`：
+   在 **`openrag/.env`**（或你加载的环境变量）中配置 **PostgreSQL**，且必须与 **`docker/.env`** 里 Postgres 容器使用的账号一致，否则会出现 `password authentication failed for user "..."`：
    ```env
    POSTGRES_HOST=127.0.0.1
    POSTGRES_PORT=5432
@@ -132,7 +132,7 @@ docker-compose -f docker-compose.worker.yml down -v
 ### 本地运行（开发调试）
 
 ```bash
-cd OpenRag
+cd openrag
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # 启动 Task Worker（默认 4 个进程）
@@ -177,10 +177,10 @@ curl http://localhost:8001/broker/weights
 
 ### 运行后端测试
 
-仓库内 `OpenRag/pytest.ini` 通过 `python_files` **只收集部分契约用例**；默认在项目根执行 `pytest` 时，可能**不会**跑全部测试文件。开发时建议显式指定路径。
+仓库内 `openrag/pytest.ini` 通过 `python_files` **只收集部分契约用例**；默认在项目根执行 `pytest` 时，可能**不会**跑全部测试文件。开发时建议显式指定路径。
 
 ```bash
-cd OpenRag
+cd openrag
 
 # RAGFlow 同构 parity（推荐：解析路由、compat、语义切片、metadata、编排参数）
 python -m pytest tests/parity -v
@@ -192,4 +192,4 @@ python -m pytest tests/parity tests/test_chunk_engine.py -q
 python -m pytest tests/test_service_api.py -v
 ```
 
-Parity 用例依赖 `pytest` 的 `pythonpath`（已配置为仓库根目录与 `src/`），以便加载 `openrag` 与 `common`。可选黄金样本说明见 `OpenRag/tests/parity/fixtures/README.md`。
+Parity 用例依赖 `pytest` 的 `pythonpath`（已配置为仓库根目录与 `src/`），以便加载 `openrag` 与 `common`。可选黄金样本说明见 `openrag/tests/parity/fixtures/README.md`。

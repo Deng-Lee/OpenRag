@@ -45,7 +45,7 @@ class ExcelChunkingConfig:
 
 #### 1. 新增配置模型
 
-文件：`OpenRag/src/openrag/chunking/excel_config.py`
+文件：`openrag/src/openrag/chunking/excel_config.py`
 
 ```python
 @dataclass
@@ -58,7 +58,7 @@ class ExcelChunkingConfig:
 
 #### 2. 修改 Excel 适配器
 
-文件：`OpenRag/src/openrag/parsers/adapters/excel_adapter.py`
+文件：`openrag/src/openrag/parsers/adapters/excel_adapter.py`
 
 - 新增 `ExcelParserAdapter.__init__(self, config: ExcelChunkingConfig = None)`
 - 重写 `parse()` 方法实现智能切片逻辑
@@ -69,7 +69,7 @@ class ExcelChunkingConfig:
 
 #### 3. RAGFlow ExcelParser 增强（如有必要）
 
-文件：`OpenRag/src/openrag/parsers/ragflow/parser/excel_parser.py`
+文件：`openrag/src/openrag/parsers/ragflow/parser/excel_parser.py`
 
 - 确保 `html()` 方法支持 `chunk_rows` 参数
 - 确保可以获取单个 Sheet 的行数而不解析全部内容

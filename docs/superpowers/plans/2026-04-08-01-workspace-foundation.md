@@ -448,7 +448,7 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 1: 生成迁移脚本**
 
 ```bash
-cd e:/project/OpenRag/OpenRag
+cd e:/project/openrag/OpenRag
 alembic revision -m "add workspace and workspace_id to existing models"
 ```
 

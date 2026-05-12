@@ -8,7 +8,7 @@
 
 ### 步骤 1: 创建 Excel 切片配置类
 
-**文件**: `OpenRag/src/openrag/chunking/excel_config.py`
+**文件**: `openrag/src/openrag/chunking/excel_config.py`
 
 **动作**:
 - 创建 `ExcelChunkingConfig` 数据类
@@ -24,7 +24,7 @@
 
 ### 步骤 2: 增强 RAGFlow ExcelParser
 
-**文件**: `OpenRag/src/openrag/parsers/ragflow/parser/excel_parser.py`
+**文件**: `openrag/src/openrag/parsers/ragflow/parser/excel_parser.py`
 
 **动作**:
 - 确保 `html()` 方法支持 `chunk_rows` 参数
@@ -40,7 +40,7 @@
 
 ### 步骤 3: 重写 Excel 适配器
 
-**文件**: `OpenRag/src/openrag/parsers/adapters/excel_adapter.py`
+**文件**: `openrag/src/openrag/parsers/adapters/excel_adapter.py`
 
 **动作**:
 - 修改 `__init__` 接受 `ExcelChunkingConfig` 参数
@@ -61,7 +61,7 @@
 
 ### 步骤 4: 更新工厂类支持配置传递
 
-**文件**: `OpenRag/src/openrag/parsers/factory.py`
+**文件**: `openrag/src/openrag/parsers/factory.py`
 
 **动作**:
 - 修改 `get_parser()` 支持传递配置参数
@@ -75,7 +75,7 @@
 
 ### 步骤 5: 编写单元测试
 
-**文件**: `OpenRag/tests/test_excel_chunking.py`
+**文件**: `openrag/tests/test_excel_chunking.py`
 
 **动作**:
 - 测试配置类默认值和自定义值
@@ -94,7 +94,7 @@
 
 ### 步骤 6: 编写集成测试
 
-**文件**: `OpenRag/tests/test_excel_chunking_integration.py`
+**文件**: `openrag/tests/test_excel_chunking_integration.py`
 
 **动作**:
 - 使用真实 Excel 文件测试

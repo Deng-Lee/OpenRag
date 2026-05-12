@@ -41,7 +41,7 @@ date: 2026-04-08
 ### 2.1 目录结构
 
 ```
-OpenRag/src/openrag/parsers/
+openrag/src/openrag/parsers/
 ├── base.py                    # DocumentBlock 数据类 + DocumentParser 接口
 ├── parser_registry.py         # 解析器注册表
 ├── factory.py                 # 懒加载工厂（新增）
@@ -352,8 +352,8 @@ class ParserRegistry:
 
 **需要复制的目录：**
 
-1. `ragflow/deepdoc/parser/` → `OpenRag/src/openrag/parsers/ragflow/parser/`
-2. `ragflow/deepdoc/vision/` → `OpenRag/src/openrag/parsers/ragflow/vision/`
+1. `ragflow/deepdoc/parser/` → `openrag/src/openrag/parsers/ragflow/parser/`
+2. `ragflow/deepdoc/vision/` → `openrag/src/openrag/parsers/ragflow/vision/`
 
 **需要保留的文件：**
 

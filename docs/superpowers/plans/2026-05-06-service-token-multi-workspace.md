@@ -14,31 +14,31 @@
 
 | Action | Path | Responsibility |
 |--------|------|----------------|
-| Create | `OpenRag/src/openrag/models/service_token_workspace.py` | ServiceTokenWorkspace ORM 模型（关联表） |
-| Modify | `OpenRag/src/openrag/models/service_token.py` | 移除 `workspace_id`、`permission`、`workspace` relationship |
-| Modify | `OpenRag/src/openrag/models/__init__.py` | 导出 `ServiceTokenWorkspace` |
-| Modify | `OpenRag/src/openrag/services/service_token_service.py` | 新 `ServiceTokenContext` + `TokenWorkspaceBinding` + 更新 resolver/permission |
-| Modify | `OpenRag/src/openrag/api/service_tokens_admin.py` | 替换 workspace-nested 路径为 flat 路径 + 绑定管理 |
-| Modify | `OpenRag/src/openrag/api/service_api.py` | `service_list_workspaces` 返回绑定列表 |
-| Create | `OpenRag/scripts/sql/2026-05-06-service-token-multi-workspace.sql` | 迁移 SQL |
+| Create | `openrag/src/openrag/models/service_token_workspace.py` | ServiceTokenWorkspace ORM 模型（关联表） |
+| Modify | `openrag/src/openrag/models/service_token.py` | 移除 `workspace_id`、`permission`、`workspace` relationship |
+| Modify | `openrag/src/openrag/models/__init__.py` | 导出 `ServiceTokenWorkspace` |
+| Modify | `openrag/src/openrag/services/service_token_service.py` | 新 `ServiceTokenContext` + `TokenWorkspaceBinding` + 更新 resolver/permission |
+| Modify | `openrag/src/openrag/api/service_tokens_admin.py` | 替换 workspace-nested 路径为 flat 路径 + 绑定管理 |
+| Modify | `openrag/src/openrag/api/service_api.py` | `service_list_workspaces` 返回绑定列表 |
+| Create | `openrag/scripts/sql/2026-05-06-service-token-multi-workspace.sql` | 迁移 SQL |
 | Modify | `web/src/types/index.ts` | 更新 ServiceToken 相关类型 |
 | Modify | `web/src/services/api.ts` | 更新 serviceTokensAPI |
 | Modify | `web/src/pages/ServiceTokens.tsx` | 多 workspace 绑定 UI |
 | Modify | `web/src/i18n/locales/en.json` | 新增/修改 service token i18n |
 | Modify | `web/src/i18n/locales/zh.json` | 新增/修改 service token i18n |
-| Modify | `OpenRag/tests/test_service_token_models.py` | 更新模型测试 |
-| Modify | `OpenRag/tests/test_service_token_deps.py` | 更新 resolver 测试 |
-| Modify | `OpenRag/tests/test_service_token_workspace.py` | 更新权限检查测试 |
-| Modify | `OpenRag/tests/test_service_tokens_admin.py` | 重写管理 API 测试 |
+| Modify | `openrag/tests/test_service_token_models.py` | 更新模型测试 |
+| Modify | `openrag/tests/test_service_token_deps.py` | 更新 resolver 测试 |
+| Modify | `openrag/tests/test_service_token_workspace.py` | 更新权限检查测试 |
+| Modify | `openrag/tests/test_service_tokens_admin.py` | 重写管理 API 测试 |
 
 ---
 
 ### Task 1: ServiceTokenWorkspace ORM 模型
 
 **Files:**
-- Create: `OpenRag/src/openrag/models/service_token_workspace.py`
-- Modify: `OpenRag/src/openrag/models/__init__.py`
-- Test: `OpenRag/tests/test_service_token_models.py`
+- Create: `openrag/src/openrag/models/service_token_workspace.py`
+- Modify: `openrag/src/openrag/models/__init__.py`
+- Test: `openrag/tests/test_service_token_models.py`
 
 - [ ] **Step 1: 写 ServiceTokenWorkspace 模型的失败测试**
 
@@ -127,7 +127,7 @@ Expected: FAIL — `ImportError: cannot import name 'ServiceTokenWorkspace'`
 
 - [ ] **Step 3: 创建 ServiceTokenWorkspace ORM 模型**
 
-创建 `OpenRag/src/openrag/models/service_token_workspace.py`：
+创建 `openrag/src/openrag/models/service_token_workspace.py`：
 
 ```python
 """Service token → workspace binding model (multi-workspace authorization)."""
@@ -168,7 +168,7 @@ class ServiceTokenWorkspace(Base, TimestampMixin):
 
 - [ ] **Step 4: 更新 __init__.py 导出**
 
-在 `OpenRag/src/openrag/models/__init__.py` 中：
+在 `openrag/src/openrag/models/__init__.py` 中：
 - 添加 import: `from openrag.models.service_token_workspace import ServiceTokenWorkspace`
 - 添加到 `__all__`: `"ServiceTokenWorkspace"`
 
@@ -180,7 +180,7 @@ Expected: PASS（新旧测试全部通过）
 - [ ] **Step 6: Commit**
 
 ```bash
-git add OpenRag/src/openrag/models/service_token_workspace.py OpenRag/src/openrag/models/__init__.py OpenRag/tests/test_service_token_models.py
+git add openrag/src/openrag/models/service_token_workspace.py openrag/src/openrag/models/__init__.py openrag/tests/test_service_token_models.py
 git commit -m "feat(models): add ServiceTokenWorkspace junction table model"
 ```
 
@@ -189,9 +189,9 @@ git commit -m "feat(models): add ServiceTokenWorkspace junction table model"
 ### Task 2: 更新 ServiceTokenContext 和服务层
 
 **Files:**
-- Modify: `OpenRag/src/openrag/services/service_token_service.py`
-- Test: `OpenRag/tests/test_service_token_deps.py`
-- Test: `OpenRag/tests/test_service_token_workspace.py`
+- Modify: `openrag/src/openrag/services/service_token_service.py`
+- Test: `openrag/tests/test_service_token_deps.py`
+- Test: `openrag/tests/test_service_token_workspace.py`
 
 - [ ] **Step 1: 写 ServiceTokenContext 绑定列表的失败测试**
 
@@ -359,7 +359,7 @@ Expected: FAIL — `ImportError: cannot import name 'TokenWorkspaceBinding'` 及
 
 - [ ] **Step 4: 更新 service_token_service.py**
 
-完整替换 `OpenRag/src/openrag/services/service_token_service.py`：
+完整替换 `openrag/src/openrag/services/service_token_service.py`：
 
 ```python
 """Resolve machine credentials from the X-OpenRag-Token header."""
@@ -487,7 +487,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add OpenRag/src/openrag/services/service_token_service.py OpenRag/tests/test_service_token_deps.py OpenRag/tests/test_service_token_workspace.py
+git add openrag/src/openrag/services/service_token_service.py openrag/tests/test_service_token_deps.py openrag/tests/test_service_token_workspace.py
 git commit -m "feat(service): update ServiceTokenContext to binding list model"
 ```
 
@@ -498,8 +498,8 @@ git commit -m "feat(service): update ServiceTokenContext to binding list model"
 此任务必须在 Task 1（关联表模型已创建）和 Task 2（服务层已切换到绑定列表）完成后执行。
 
 **Files:**
-- Modify: `OpenRag/src/openrag/models/service_token.py`
-- Modify: `OpenRag/tests/test_service_token_models.py`
+- Modify: `openrag/src/openrag/models/service_token.py`
+- Modify: `openrag/tests/test_service_token_models.py`
 
 - [ ] **Step 1: 更新 test_service_token_models.py 删除旧字段测试**
 
@@ -536,7 +536,7 @@ def test_service_token_secret_unique(db_session: Session, owner: User) -> None:
 
 - [ ] **Step 2: 更新 ServiceToken ORM 模型**
 
-修改 `OpenRag/src/openrag/models/service_token.py` — 移除 `workspace_id`、`permission`、`workspace` relationship 和相关 index：
+修改 `openrag/src/openrag/models/service_token.py` — 移除 `workspace_id`、`permission`、`workspace` relationship 和相关 index：
 
 ```python
 """Service token models for machine-to-machine API access"""
@@ -610,7 +610,7 @@ from sqlalchemy import DateTime, ForeignKey, Index, Integer, String
 
 - [ ] **Step 3: 更新 Workspace 模型中的反向引用**
 
-检查 `OpenRag/src/openrag/models/workspace.py`，移除 `service_tokens` relationship（因为 ServiceToken 不再直接关联 workspace）。如果存在 `back_populates="service_tokens"` 或类似引用，将其移除。
+检查 `openrag/src/openrag/models/workspace.py`，移除 `service_tokens` relationship（因为 ServiceToken 不再直接关联 workspace）。如果存在 `back_populates="service_tokens"` 或类似引用，将其移除。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -620,7 +620,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/models/service_token.py OpenRag/src/openrag/models/workspace.py OpenRag/tests/test_service_token_models.py
+git add openrag/src/openrag/models/service_token.py openrag/src/openrag/models/workspace.py openrag/tests/test_service_token_models.py
 git commit -m "feat(models): remove workspace_id and permission from ServiceToken"
 ```
 
@@ -629,9 +629,9 @@ git commit -m "feat(models): remove workspace_id and permission from ServiceToke
 ### Task 4: 重写管理 API 路由
 
 **Files:**
-- Modify: `OpenRag/src/openrag/api/service_tokens_admin.py`
-- Modify: `OpenRag/src/openrag/api/deps.py`
-- Test: `OpenRag/tests/test_service_tokens_admin.py`
+- Modify: `openrag/src/openrag/api/service_tokens_admin.py`
+- Modify: `openrag/src/openrag/api/deps.py`
+- Test: `openrag/tests/test_service_tokens_admin.py`
 
 - [ ] **Step 1: 写新管理 API 的失败测试**
 
@@ -1081,7 +1081,7 @@ Expected: FAIL — 404 on `/service-tokens` (POST) route not found
 
 - [ ] **Step 3: 重写 service_tokens_admin.py**
 
-完整替换 `OpenRag/src/openrag/api/service_tokens_admin.py`：
+完整替换 `openrag/src/openrag/api/service_tokens_admin.py`：
 
 ```python
 """JWT-only admin API for machine service tokens (multi-workspace binding model)."""
@@ -1400,7 +1400,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/api/service_tokens_admin.py OpenRag/tests/test_service_tokens_admin.py
+git add openrag/src/openrag/api/service_tokens_admin.py openrag/tests/test_service_tokens_admin.py
 git commit -m "feat(api): rewrite service token admin routes for multi-workspace bindings"
 ```
 
@@ -1409,7 +1409,7 @@ git commit -m "feat(api): rewrite service token admin routes for multi-workspace
 ### Task 5: 更新 service_list_workspaces 端点
 
 **Files:**
-- Modify: `OpenRag/src/openrag/api/service_api.py`
+- Modify: `openrag/src/openrag/api/service_api.py`
 
 - [ ] **Step 1: 更新 service_list_workspaces 端点**
 
@@ -1444,7 +1444,7 @@ Expected: PASS
 - [ ] **Step 3: Commit**
 
 ```bash
-git add OpenRag/src/openrag/api/service_api.py
+git add openrag/src/openrag/api/service_api.py
 git commit -m "feat(api): update service_list_workspaces to return binding list"
 ```
 
@@ -1453,11 +1453,11 @@ git commit -m "feat(api): update service_list_workspaces to return binding list"
 ### Task 6: 迁移 SQL 脚本
 
 **Files:**
-- Create: `OpenRag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`
+- Create: `openrag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`
 
 - [ ] **Step 1: 创建迁移脚本**
 
-创建 `OpenRag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`：
+创建 `openrag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`：
 
 ```sql
 -- Step 1: Create the junction table
@@ -1496,7 +1496,7 @@ DROP INDEX IF EXISTS idx_service_tokens_workspace;
 - [ ] **Step 2: Commit**
 
 ```bash
-git add OpenRag/scripts/sql/2026-05-06-service-token-multi-workspace.sql
+git add openrag/scripts/sql/2026-05-06-service-token-multi-workspace.sql
 git commit -m "feat(migration): add multi-workspace service token migration SQL"
 ```
 

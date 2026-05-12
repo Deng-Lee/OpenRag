@@ -1,0 +1,23 @@
+# OpenViking 配置
+
+storage:
+  type: local
+  config:
+    base_path: /data/openviking
+
+vector_db:
+  type: milvus
+  config:
+    host: milvus
+    port: 19530
+
+embedding:
+  model: text-embedding-3-small
+  provider: openai
+  api_key: ${OPENAI_API_KEY}
+  dimension: 1536
+
+collections:
+  default:
+    dimension: 1536
+    metric: cosine

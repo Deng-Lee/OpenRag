@@ -8,7 +8,7 @@
 
 **Tech Stack:** FastAPI, SQLAlchemy 2.0, Pydantic v2, MySQL（生产）/ SQLite（测试），现有 `openrag.api.files_api.validate_path`、`build_file_uri`、`MinioStorage`、`TaskService`、`RetrievalService`。
 
-**Repo 根路径说明：** 下文 `OpenRag/` 指仓库内子目录 `OpenRag/`（含 `src/openrag` 与 `tests`），与顶层 `web/` 并列。
+**Repo 根路径说明：** 下文 `openrag/` 指仓库内子目录 `openrag/`（含 `src/openrag` 与 `tests`），与顶层 `web/` 并列。
 
 **Spec 对照：** `docs/superpowers/specs/2026-04-13-service-token-api-design.md`（已认可）。
 
@@ -18,22 +18,22 @@
 
 | 路径 | 职责 |
 |------|------|
-| `OpenRag/src/openrag/models/service_token.py` | `ServiceToken`、`ServiceTokenWorkspace` 模型 |
-| `OpenRag/src/openrag/models/__init__.py` | 导出新模型 |
-| `OpenRag/src/openrag/models/workspace.py` | `Workspace.name` 增加全局 `unique=True`（与 spec 一致） |
-| `OpenRag/scripts/sql/2026-04-13-service-token.sql` | 生产库 `CREATE TABLE` + `ALTER TABLE workspaces ADD UNIQUE`（若已有重复名需先数据清洗） |
-| `OpenRag/src/openrag/api/deps.py` | `get_service_token_context`、`ServiceTokenContext` dataclass |
-| `OpenRag/src/openrag/services/service_token_service.py` | 按 secret 解析 token、校验绑定与 read/write |
-| `OpenRag/src/openrag/services/workspace_file_tree.py` | 在同一 `workspace_id` 下基于 `File` 行构建 `children`/`tree`、路径规范化与上限 |
-| `OpenRag/src/openrag/services/file_ingest.py` | 从 `files_api.upload_file` 抽取「校验+MinIO+DB+任务」供 JWT 与 service 共用（可选但强烈推荐，避免重复） |
-| `OpenRag/src/openrag/api/service_api.py` | 五类服务接口路由 |
-| `OpenRag/src/openrag/api/service_tokens_admin.py` | JWT 下 token CRUD、绑定、吊销、`GET .../secret` |
-| `OpenRag/src/openrag/api/main.py` | `include_router(service_router)`、`include_router(service_tokens_admin_router)` |
-| `OpenRag/src/openrag/api/files_api.py` | 若抽取 `file_ingest`，改为调用该模块 |
+| `openrag/src/openrag/models/service_token.py` | `ServiceToken`、`ServiceTokenWorkspace` 模型 |
+| `openrag/src/openrag/models/__init__.py` | 导出新模型 |
+| `openrag/src/openrag/models/workspace.py` | `Workspace.name` 增加全局 `unique=True`（与 spec 一致） |
+| `openrag/scripts/sql/2026-04-13-service-token.sql` | 生产库 `CREATE TABLE` + `ALTER TABLE workspaces ADD UNIQUE`（若已有重复名需先数据清洗） |
+| `openrag/src/openrag/api/deps.py` | `get_service_token_context`、`ServiceTokenContext` dataclass |
+| `openrag/src/openrag/services/service_token_service.py` | 按 secret 解析 token、校验绑定与 read/write |
+| `openrag/src/openrag/services/workspace_file_tree.py` | 在同一 `workspace_id` 下基于 `File` 行构建 `children`/`tree`、路径规范化与上限 |
+| `openrag/src/openrag/services/file_ingest.py` | 从 `files_api.upload_file` 抽取「校验+MinIO+DB+任务」供 JWT 与 service 共用（可选但强烈推荐，避免重复） |
+| `openrag/src/openrag/api/service_api.py` | 五类服务接口路由 |
+| `openrag/src/openrag/api/service_tokens_admin.py` | JWT 下 token CRUD、绑定、吊销、`GET .../secret` |
+| `openrag/src/openrag/api/main.py` | `include_router(service_router)`、`include_router(service_tokens_admin_router)` |
+| `openrag/src/openrag/api/files_api.py` | 若抽取 `file_ingest`，改为调用该模块 |
 | `web/src/services/api.ts` | 管理端 API 方法 |
 | `web/src/pages/Permissions.tsx`（或新建 `ServiceTokens.tsx`） | 列表脱敏、创建弹窗、显示密钥按钮 |
-| `OpenRag/tests/test_service_token_deps.py` | `get_service_token_context` 行为 |
-| `OpenRag/tests/test_service_api.py` | 服务路由契约（TestClient + `dependency_overrides`） |
+| `openrag/tests/test_service_token_deps.py` | `get_service_token_context` 行为 |
+| `openrag/tests/test_service_api.py` | 服务路由契约（TestClient + `dependency_overrides`） |
 
 常量建议（在 `service_api.py` 或 `workspace_file_tree.py` 顶部）：`SERVICE_TOKEN_HEADER = "x-openrag-token"`，`TREE_MAX_NODES = 5000`，`TREE_MAX_DEPTH = 50`，`CHILDREN_LIMIT = 1000`。
 
@@ -43,15 +43,15 @@
 
 **Files:**
 
-- Create: `OpenRag/src/openrag/models/service_token.py`
-- Modify: `OpenRag/src/openrag/models/__init__.py`
-- Modify: `OpenRag/src/openrag/models/workspace.py`（`name` 列 `unique=True`）
-- Create: `OpenRag/scripts/sql/2026-04-13-service-token.sql`
-- Test: `OpenRag/tests/test_models.py`（追加最小导入/表创建测试，或新建 `test_service_token_models.py`）
+- Create: `openrag/src/openrag/models/service_token.py`
+- Modify: `openrag/src/openrag/models/__init__.py`
+- Modify: `openrag/src/openrag/models/workspace.py`（`name` 列 `unique=True`）
+- Create: `openrag/scripts/sql/2026-04-13-service-token.sql`
+- Test: `openrag/tests/test_models.py`（追加最小导入/表创建测试，或新建 `test_service_token_models.py`）
 
 - [ ] **Step 1: 编写模型代码**
 
-`OpenRag/src/openrag/models/service_token.py`：
+`openrag/src/openrag/models/service_token.py`：
 
 ```python
 """Service tokens for external API access (plaintext secret per product decision)."""
@@ -111,11 +111,11 @@ class ServiceTokenWorkspace(Base):
     workspace: Mapped["Workspace"] = relationship()
 ```
 
-在 `OpenRag/src/openrag/models/workspace.py` 中把 `name` 的 `mapped_column` 改为包含 `unique=True`（与 spec「全局唯一」一致）。
+在 `openrag/src/openrag/models/workspace.py` 中把 `name` 的 `mapped_column` 改为包含 `unique=True`（与 spec「全局唯一」一致）。
 
 - [ ] **Step 2: 更新 `__init__.py`**
 
-在 `OpenRag/src/openrag/models/__init__.py` 增加：
+在 `openrag/src/openrag/models/__init__.py` 增加：
 
 ```python
 from openrag.models.service_token import ServiceToken, ServiceTokenWorkspace, ServiceTokenPermission
@@ -125,7 +125,7 @@ from openrag.models.service_token import ServiceToken, ServiceTokenWorkspace, Se
 
 - [ ] **Step 3: 添加 SQL 迁移脚本（MySQL）**
 
-`OpenRag/scripts/sql/2026-04-13-service-token.sql` 示例（按实际引擎调整类型）：
+`openrag/scripts/sql/2026-04-13-service-token.sql` 示例（按实际引擎调整类型）：
 
 ```sql
 CREATE TABLE IF NOT EXISTS service_tokens (
@@ -170,7 +170,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/models/service_token.py OpenRag/src/openrag/models/__init__.py OpenRag/src/openrag/models/workspace.py OpenRag/scripts/sql/2026-04-13-service-token.sql OpenRag/tests/test_service_token_models.py
+git add openrag/src/openrag/models/service_token.py openrag/src/openrag/models/__init__.py openrag/src/openrag/models/workspace.py openrag/scripts/sql/2026-04-13-service-token.sql openrag/tests/test_service_token_models.py
 git commit -m "feat(db): add service token models and workspace name uniqueness"
 ```
 
@@ -180,12 +180,12 @@ git commit -m "feat(db): add service token models and workspace name uniqueness"
 
 **Files:**
 
-- Modify: `OpenRag/src/openrag/api/deps.py`
-- Create: `OpenRag/tests/test_service_token_deps.py`
+- Modify: `openrag/src/openrag/api/deps.py`
+- Create: `openrag/tests/test_service_token_deps.py`
 
 - [ ] **Step 1: 编写失败测试**
 
-`OpenRag/tests/test_service_token_deps.py`：
+`openrag/tests/test_service_token_deps.py`：
 
 ```python
 import pytest
@@ -244,7 +244,7 @@ Expected: FAIL（ImportError 或 not defined）
 
 - [ ] **Step 2: 实现依赖（最小可用）**
 
-在 `OpenRag/src/openrag/api/deps.py` 增加（示意，需与项目 import 风格一致）：
+在 `openrag/src/openrag/api/deps.py` 增加（示意，需与项目 import 风格一致）：
 
 ```python
 from dataclasses import dataclass
@@ -290,7 +290,7 @@ def get_service_token_context(
 
 为测试通过，在测试中 **不要**依赖 Header，直接调用 `get_service_token_context(x_openrag_token="sk-testsecret", db=db)` 需要把函数改成支持可选的 `db` 注入，或使用 `Request` 夹具；更简单做法：把解析逻辑放到 `openrag.services.service_token_service.resolve_context(db, raw_token)`，`deps` 里一行调用。
 
-调整 Step 2 为：实现 `OpenRag/src/openrag/services/service_token_service.py`：
+调整 Step 2 为：实现 `openrag/src/openrag/services/service_token_service.py`：
 
 ```python
 def resolve_service_token_context(db: Session, raw_token: str | None) -> ServiceTokenContext:
@@ -333,7 +333,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add OpenRag/src/openrag/api/deps.py OpenRag/src/openrag/services/service_token_service.py OpenRag/tests/test_service_token_deps.py
+git add openrag/src/openrag/api/deps.py openrag/src/openrag/services/service_token_service.py openrag/tests/test_service_token_deps.py
 git commit -m "feat(api): service token context resolution from X-OpenRag-Token"
 ```
 
@@ -343,7 +343,7 @@ git commit -m "feat(api): service token context resolution from X-OpenRag-Token"
 
 **Files:**
 
-- Create: `OpenRag/src/openrag/services/service_token_service.py`（继续扩展）或 `OpenRag/src/openrag/api/service_deps.py`
+- Create: `openrag/src/openrag/services/service_token_service.py`（继续扩展）或 `openrag/src/openrag/api/service_deps.py`
 
 在 `service_token_service.py` 增加：
 
@@ -379,8 +379,8 @@ def assert_token_workspace_permission(
 
 **Files:**
 
-- Create: `OpenRag/src/openrag/services/workspace_file_tree.py`
-- Test: `OpenRag/tests/test_workspace_file_tree.py`
+- Create: `openrag/src/openrag/services/workspace_file_tree.py`
+- Test: `openrag/tests/test_workspace_file_tree.py`
 
 实现要点：
 
@@ -399,9 +399,9 @@ def assert_token_workspace_permission(
 
 **Files:**
 
-- Create: `OpenRag/src/openrag/api/service_api.py`
-- Modify: `OpenRag/src/openrag/api/main.py`
-- Test: `OpenRag/tests/test_service_api.py`
+- Create: `openrag/src/openrag/api/service_api.py`
+- Modify: `openrag/src/openrag/api/main.py`
+- Test: `openrag/tests/test_service_api.py`
 
 ```python
 router = APIRouter(prefix="/service/v1", tags=["service"])
@@ -431,9 +431,9 @@ TestClient：`app.dependency_overrides[get_db]` 与内存 SQLite；插入数据�
 
 **Files:**
 
-- Create: `OpenRag/src/openrag/services/file_ingest.py`（从 `files_api.upload_file` 抽取）
-- Modify: `OpenRag/src/openrag/api/files_api.py`
-- Modify: `OpenRag/src/openrag/api/service_api.py`
+- Create: `openrag/src/openrag/services/file_ingest.py`（从 `files_api.upload_file` 抽取）
+- Modify: `openrag/src/openrag/api/files_api.py`
+- Modify: `openrag/src/openrag/api/service_api.py`
 
 `file_ingest.ingest_uploaded_bytes(...)` 参数至少包含：`db`, `workspace`, `logical_parent_path`, `filename`, `bytes`, `content_type`, `parser_type`, `owner_user_id`（JWT 用 `current_user.id`，service 用 `workspace.owner_id`），返回 `(file_record, task_record|None)`。保持与现网一致的 `ALLOWED_MIME_TYPES` 与 `TaskService.create_task` 分支。
 
@@ -451,8 +451,8 @@ TestClient：`app.dependency_overrides[get_db]` 与内存 SQLite；插入数据�
 
 **Files:**
 
-- Modify: `OpenRag/src/openrag/api/service_api.py`
-- 可选 Modify: `OpenRag/src/openrag/api/search_api.py`（若抽取公共函数 `run_search(db, user_id, request: SearchRequest) -> SearchResponse`）
+- Modify: `openrag/src/openrag/api/service_api.py`
+- 可选 Modify: `openrag/src/openrag/api/search_api.py`（若抽取公共函数 `run_search(db, user_id, request: SearchRequest) -> SearchResponse`）
 
 实现：在 `service_api` 内构造 `SearchRequest(query=..., workspace_id=ws.id, ...)`，调用与 `search_api` 相同的 `_execute_search`（需将 `_execute_search` 抽到 `openrag.api.search_common` 或在 `service_api` 中复制最小导入链——**优先抽取**避免重复）。
 
@@ -469,8 +469,8 @@ TestClient：`app.dependency_overrides[get_db]` 与内存 SQLite；插入数据�
 
 **Files:**
 
-- Create: `OpenRag/src/openrag/api/service_tokens_admin.py`
-- Modify: `OpenRag/src/openrag/api/main.py`
+- Create: `openrag/src/openrag/api/service_tokens_admin.py`
+- Modify: `openrag/src/openrag/api/main.py`
 
 建议路由（与现有风格对齐，可微调）：
 
@@ -509,7 +509,7 @@ secret = "sk-" + secrets.token_urlsafe(32)
 ### Task 10: 全量回归与文档
 
 - [ ] **运行** `cd OpenRag && pytest -q` 与 `cd web && npm test`（若项目已有 CI 命令则与之对齐）。
-- [ ] **更新** `OpenRag/README.md` 或 `docker/QUICKSTART.md` 中一节「服务 API」：`X-OpenRag-Token`、`/service/v1` 示例 curl（**curl 示例中不要用真实生产密钥**）。
+- [ ] **更新** `openrag/README.md` 或 `docker/QUICKSTART.md` 中一节「服务 API」：`X-OpenRag-Token`、`/service/v1` 示例 curl（**curl 示例中不要用真实生产密钥**）。
 - [ ] **Commit** `docs: document service token API usage`
 
 ---

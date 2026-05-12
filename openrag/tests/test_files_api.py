@@ -1,0 +1,596 @@
+"""Tests for File Management API"""
+
+import io
+import os
+import pytest
+from datetime import datetime
+from fastapi import status
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from openrag.api.main import app
+from openrag.api.deps import get_db, get_current_user
+from openrag.models.base import Base
+from openrag.models.user import User
+from openrag.models.file import File, ProcessingStatus
+from openrag.models.workspace import Workspace, WorkspaceMember
+from openrag.models.permission import FilePermission, EntityType, Permission
+from openrag.security import hash_password
+
+
+# Test database setup
+TEST_DATABASE_URL = "sqlite:///:memory:"
+
+engine = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def override_get_db():
+    """Override database dependency for testing"""
+    try:
+        db = TestingSessionLocal()
+        yield db
+    finally:
+        db.close()
+
+
+# Override dependencies
+app.dependency_overrides[get_db] = override_get_db
+
+
+@pytest.fixture(scope="function")
+def db():
+    """Create test database and tables"""
+    Base.metadata.create_all(bind=engine)
+    db = TestingSessionLocal()
+    yield db
+    db.close()
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def test_user(db):
+    """Create test user"""
+    user = User(
+        username="testuser",
+        email="test@example.com",
+        password_hash=hash_password("testpass123"),
+        full_name="Test User",
+        is_active=True
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@pytest.fixture
+def test_workspace(db, test_user):
+    """Workspace with write access for test_user."""
+    ws = Workspace(name="UploadWS", slug="upload-ws", owner_id=test_user.id)
+    db.add(ws)
+    db.commit()
+    db.refresh(ws)
+    db.add(
+        WorkspaceMember(workspace_id=ws.id, user_id=test_user.id, role="write")
+    )
+    db.commit()
+    return ws
+
+
+@pytest.fixture
+def test_user2(db):
+    """Create second test user"""
+    user = User(
+        username="testuser2",
+        email="test2@example.com",
+        password_hash=hash_password("testpass123"),
+        full_name="Test User 2",
+        is_active=True
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@pytest.fixture
+def test_file(db, test_user, test_workspace):
+    """Create test file"""
+    file = File(
+        uri="/test/file.txt",
+        name="file.txt",
+        owner_id=test_user.id,
+        workspace_id=test_workspace.id,
+        is_directory=False,
+        size=1024,
+        mime_type="text/plain"
+    )
+    db.add(file)
+    db.commit()
+    db.refresh(file)
+    return file
+
+
+@pytest.fixture
+def test_directory(db, test_user, test_workspace):
+    """Create test directory"""
+    directory = File(
+        uri="/test",
+        name="test",
+        owner_id=test_user.id,
+        workspace_id=test_workspace.id,
+        is_directory=True,
+        size=0,
+        mime_type=None
+    )
+    db.add(directory)
+    db.commit()
+    db.refresh(directory)
+    return directory
+
+
+def override_get_current_user_factory(user):
+    """Factory to create override function for current user"""
+    def override_get_current_user():
+        return user
+    return override_get_current_user
+
+
+@pytest.fixture
+def client():
+    """Create test client"""
+    return TestClient(app)
+
+
+class TestFileUpload:
+    """Test file upload endpoint"""
+
+    def test_upload_file_success(self, client, db, test_user, test_workspace):
+        """Test successful file upload"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        file_content = b"Test file content"
+        files = {"file": ("test.txt", io.BytesIO(file_content), "text/plain")}
+        data = {"path": "/uploads", "workspace_id": str(test_workspace.id)}
+
+        response = client.post("/files/upload", files=files, data=data)
+
+        assert response.status_code == status.HTTP_201_CREATED
+        result = response.json()
+        assert result["name"] == "test.txt"
+        assert result["size"] == len(file_content)
+        assert result["mime_type"] == "text/plain"
+        assert result["owner_id"] == test_user.id
+        assert "id" in result
+        assert "task_id" in result
+
+    def test_upload_file_no_auth(self, client, db):
+        """Test file upload without authentication"""
+        app.dependency_overrides.pop(get_current_user, None)
+
+        file_content = b"Test file content"
+        files = {"file": ("test.txt", io.BytesIO(file_content), "text/plain")}
+
+        response = client.post("/files/upload", files=files)
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_upload_file_invalid_path(self, client, db, test_user, test_workspace):
+        """Test file upload with invalid path (path traversal)"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        file_content = b"Test file content"
+        files = {"file": ("test.txt", io.BytesIO(file_content), "text/plain")}
+        data = {"path": "../../../etc", "workspace_id": str(test_workspace.id)}
+
+        response = client.post("/files/upload", files=files, data=data)
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "invalid path" in response.json()["detail"].lower()
+
+    def test_upload_file_large_file(self, client, db, test_user, test_workspace):
+        """Test file upload with large file (exceeds limit)"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        # Create 100MB file (assuming limit is 50MB)
+        file_content = b"x" * (100 * 1024 * 1024)
+        files = {"file": ("large.txt", io.BytesIO(file_content), "text/plain")}
+        data = {"workspace_id": str(test_workspace.id)}
+
+        response = client.post("/files/upload", files=files, data=data)
+
+        assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+
+class TestFileList:
+    """Test file listing endpoint"""
+
+    def test_list_files_owner(self, client, db, test_user, test_file):
+        """Test listing files as owner"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.get("/files/")
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert "items" in result
+        assert "total" in result
+        assert len(result["items"]) == 1
+        assert result["items"][0]["id"] == test_file.id
+
+    def test_list_files_with_shared(self, client, db, test_user, test_user2, test_file, test_workspace):
+        """Test listing files includes shared files (workspace read + file ACL)"""
+        db.add(
+            WorkspaceMember(
+                workspace_id=test_workspace.id,
+                user_id=test_user2.id,
+                role="read",
+            )
+        )
+        perm = FilePermission(
+            file_id=test_file.id,
+            entity_type=EntityType.USER,
+            entity_id=test_user2.id,
+            permission=Permission.READ
+        )
+        db.add(perm)
+        db.commit()
+
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        response = client.get("/files/")
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert len(result["items"]) == 1
+        assert result["items"][0]["id"] == test_file.id
+
+    def test_list_files_pagination(self, client, db, test_user, test_workspace):
+        """Test file listing with pagination"""
+        # Create multiple files (URI globally unique; scoped by workspace in path)
+        for i in range(15):
+            file = File(
+                uri=f"/pag-ws{test_workspace.id}/file{i}.txt",
+                name=f"file{i}.txt",
+                owner_id=test_user.id,
+                workspace_id=test_workspace.id,
+                is_directory=False,
+                size=1024,
+                mime_type="text/plain"
+            )
+            db.add(file)
+        db.commit()
+
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.get(
+            "/files/",
+            params={"skip": 0, "limit": 10, "workspace_id": test_workspace.id},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert len(result["items"]) == 10
+        assert result["total"] == 15
+
+    def test_list_files_no_auth(self, client, db):
+        """Test file listing without authentication"""
+        app.dependency_overrides.pop(get_current_user, None)
+
+        response = client.get("/files/")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_list_parent_path_direct_children(
+        self, client, db, test_user, test_workspace, test_directory, test_file
+    ):
+        """Lazy tree: parent_path=/ returns only /test; parent_path=/test returns file."""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        r = client.get(
+            "/files/",
+            params={"workspace_id": test_workspace.id, "parent_path": "/"},
+        )
+        assert r.status_code == status.HTTP_200_OK
+        items = r.json()["items"]
+        assert len(items) == 1
+        assert items[0]["uri"] == "/test"
+        assert items[0]["is_directory"] is True
+
+        r2 = client.get(
+            "/files/",
+            params={"workspace_id": test_workspace.id, "parent_path": "/test"},
+        )
+        assert r2.status_code == status.HTTP_200_OK
+        items2 = r2.json()["items"]
+        assert len(items2) == 1
+        assert items2[0]["uri"] == "/test/file.txt"
+
+    def test_list_under_path_subtree(
+        self, client, db, test_user, test_workspace, test_directory, test_file
+    ):
+        """under_path=/test includes directory row and nested file."""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        r = client.get(
+            "/files/",
+            params={"workspace_id": test_workspace.id, "under_path": "/test"},
+        )
+        assert r.status_code == status.HTTP_200_OK
+        uris = {x["uri"] for x in r.json()["items"]}
+        assert uris == {"/test", "/test/file.txt"}
+
+    def test_list_parent_and_under_mutually_exclusive(self, client, db, test_user, test_workspace):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        r = client.get(
+            "/files/",
+            params={"workspace_id": test_workspace.id, "parent_path": "/", "under_path": "/x"},
+        )
+        assert r.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_list_files_includes_simple_status_and_null_for_directory(
+        self, client, db, test_user, test_workspace, test_file, test_directory
+    ):
+        """processing_status / simple_status on files; directories omit both."""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+        test_file.processing_status = ProcessingStatus.embedding
+        db.add(test_file)
+        db.commit()
+
+        response = client.get(
+            "/files/",
+            params={"workspace_id": test_workspace.id},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        items = {row["id"]: row for row in response.json()["items"]}
+        assert items[test_file.id]["processing_status"] == "embedding"
+        assert items[test_file.id]["simple_status"] == "processing"
+        assert items[test_file.id].get("error_message") in (None, "")
+        assert items[test_directory.id]["processing_status"] is None
+        assert items[test_directory.id]["simple_status"] is None
+
+
+class TestFileGet:
+    """Test get file details endpoint"""
+
+    def test_get_file_as_owner(self, client, db, test_user, test_file):
+        """Test getting file details as owner"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.get(f"/files/{test_file.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert result["id"] == test_file.id
+        assert result["name"] == test_file.name
+        assert result["uri"] == test_file.uri
+
+    def test_get_file_with_permission(self, client, db, test_user, test_user2, test_file, test_workspace):
+        """Test getting file details with read permission"""
+        db.add(
+            WorkspaceMember(
+                workspace_id=test_workspace.id,
+                user_id=test_user2.id,
+                role="read",
+            )
+        )
+        perm = FilePermission(
+            file_id=test_file.id,
+            entity_type=EntityType.USER,
+            entity_id=test_user2.id,
+            permission=Permission.READ
+        )
+        db.add(perm)
+        db.commit()
+
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        response = client.get(f"/files/{test_file.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+
+    def test_get_file_no_permission(self, client, db, test_user, test_user2, test_file):
+        """Test getting file details without permission"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        response = client.get(f"/files/{test_file.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_get_file_not_found(self, client, db, test_user):
+        """Test getting non-existent file"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.get("/files/99999")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_get_file_failed_includes_error_message(
+        self, client, db, test_user, test_file
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+        test_file.processing_status = ProcessingStatus.failed
+        test_file.processing_error = "boom"
+        db.add(test_file)
+        db.commit()
+
+        response = client.get(f"/files/{test_file.id}")
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert body["simple_status"] == "failed"
+        assert body["error_message"] == "boom"
+
+
+class TestFileDelete:
+    """Test file deletion endpoint"""
+
+    def test_delete_file_as_owner(self, client, db, test_user, test_file):
+        """Test deleting file as owner"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.delete(f"/files/{test_file.id}", params={"background": "false"})
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["message"] == "File deleted successfully"
+
+        # Verify file is deleted
+        deleted_file = db.query(File).filter(File.id == test_file.id).first()
+        assert deleted_file is None
+
+    def test_delete_file_no_permission(self, client, db, test_user, test_user2, test_file):
+        """Test deleting file without permission"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        response = client.delete(f"/files/{test_file.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_delete_file_with_write_permission(self, client, db, test_user, test_user2, test_file):
+        """Test deleting file with write permission (should fail, needs admin)"""
+        # Grant write permission
+        perm = FilePermission(
+            file_id=test_file.id,
+            entity_type=EntityType.USER,
+            entity_id=test_user2.id,
+            permission=Permission.WRITE
+        )
+        db.add(perm)
+        db.commit()
+
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        response = client.delete(f"/files/{test_file.id}")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_delete_file_not_found(self, client, db, test_user):
+        """Test deleting non-existent file"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.delete("/files/99999")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+class TestFileMove:
+    """Test file move/rename endpoint"""
+
+    def test_move_file_as_owner(self, client, db, test_user, test_file):
+        """Test moving/renaming file as owner"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        new_path = "/test/renamed.txt"
+        response = client.put(f"/files/{test_file.id}/move", json={"new_path": new_path})
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert result["uri"] == new_path
+        assert result["name"] == "renamed.txt"
+
+    def test_move_file_with_write_permission(self, client, db, test_user, test_user2, test_file, test_workspace):
+        """Test moving file with write permission"""
+        db.add(
+            WorkspaceMember(
+                workspace_id=test_workspace.id,
+                user_id=test_user2.id,
+                role="write",
+            )
+        )
+        perm = FilePermission(
+            file_id=test_file.id,
+            entity_type=EntityType.USER,
+            entity_id=test_user2.id,
+            permission=Permission.WRITE
+        )
+        db.add(perm)
+        db.commit()
+
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        new_path = "/test/renamed.txt"
+        response = client.put(f"/files/{test_file.id}/move", json={"new_path": new_path})
+
+        assert response.status_code == status.HTTP_200_OK
+
+    def test_move_file_no_permission(self, client, db, test_user, test_user2, test_file):
+        """Test moving file without permission"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+
+        new_path = "/test/renamed.txt"
+        response = client.put(f"/files/{test_file.id}/move", json={"new_path": new_path})
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_move_file_invalid_path(self, client, db, test_user, test_file):
+        """Test moving file with invalid path"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        new_path = "../../../etc/passwd"
+        response = client.put(f"/files/{test_file.id}/move", json={"new_path": new_path})
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+class TestDirectoryCreate:
+    """Test directory creation endpoint"""
+
+    def test_create_directory_success(self, client, db, test_user, test_workspace):
+        """Test creating directory successfully"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.post(
+            "/files/directories",
+            data={"path": "/mydir", "workspace_id": str(test_workspace.id)},
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED
+        result = response.json()
+        assert result["name"] == "mydir"
+        assert result["is_directory"] is True
+        assert result["owner_id"] == test_user.id
+
+    def test_create_directory_duplicate(self, client, db, test_user, test_workspace, test_directory):
+        """Test creating directory that already exists"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.post(
+            "/files/directories",
+            data={"path": test_directory.uri, "workspace_id": str(test_workspace.id)},
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "already exists" in response.json()["detail"].lower()
+
+    def test_create_directory_invalid_path(self, client, db, test_user, test_workspace):
+        """Test creating directory with invalid path"""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        response = client.post(
+            "/files/directories",
+            data={"path": "../../../etc", "workspace_id": str(test_workspace.id)},
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_create_directory_no_auth(self, client, db, test_workspace):
+        """Test creating directory without authentication"""
+        app.dependency_overrides.pop(get_current_user, None)
+
+        response = client.post(
+            "/files/directories",
+            data={"path": "/mydir", "workspace_id": str(test_workspace.id)},
+        )
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED

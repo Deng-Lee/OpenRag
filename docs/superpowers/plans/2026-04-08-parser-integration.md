@@ -60,7 +60,7 @@ mkdir -p src/openrag/parsers/ragflow/vision
 - [ ] **Step 2: 复制 RAGFlow parser 模块**
 
 ```bash
-cp -r /e/project/OpenRag/ragflow/deepdoc/parser/*.py src/openrag/parsers/ragflow/parser/
+cp -r /e/project/openrag/ragflow/deepdoc/parser/*.py src/openrag/parsers/ragflow/parser/
 ```
 
 Expected: 复制 10 个文件（__init__.py, pdf_parser.py, docx_parser.py, excel_parser.py, ppt_parser.py, html_parser.py, markdown_parser.py, txt_parser.py, json_parser.py, epub_parser.py, utils.py）
@@ -68,7 +68,7 @@ Expected: 复制 10 个文件（__init__.py, pdf_parser.py, docx_parser.py, exce
 - [ ] **Step 3: 复制 RAGFlow vision 模块**
 
 ```bash
-cp -r /e/project/OpenRag/ragflow/deepdoc/vision/*.py src/openrag/parsers/ragflow/vision/
+cp -r /e/project/openrag/ragflow/deepdoc/vision/*.py src/openrag/parsers/ragflow/vision/
 ```
 
 Expected: 复制视觉识别相关文件

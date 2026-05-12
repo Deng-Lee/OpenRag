@@ -56,7 +56,7 @@ spec:
 - `docker/docker-compose.prod.yml` 中 `api`、`task-worker` 的 `environment` 列表
 - `docker/.env.example`
 
-**CORS**：当前 FastAPI 代码中开发白名单为固定 localhost 列表；生产若需严格按域名放行，应在应用层读取 `CORS_ORIGINS` 并合并到 `CORSMiddleware`（部署前请核对 `OpenRag/src/openrag/api/main.py` 是否与你的网关方案一致）。
+**CORS**：当前 FastAPI 代码中开发白名单为固定 localhost 列表；生产若需严格按域名放行，应在应用层读取 `CORS_ORIGINS` 并合并到 `CORSMiddleware`（部署前请核对 `openrag/src/openrag/api/main.py` 是否与你的网关方案一致）。
 
 ## 4. 有状态服务与存储
 
@@ -95,7 +95,7 @@ spec:
 
 **业务镜像**：在联网构建机执行 `docker build -f docker/Dockerfile.api ...` 等，与线上一致；**不要**依赖构建时访问公网 `pip` / `npm` 若无保障——应使用 **内网 PyPI/npm 镜像** 或 **多阶段构建且依赖层已缓存**。
 
-以下命令默认 **Linux / macOS + Bash**；仓库根目录指含 `docker/`、`OpenRag/` 的 OpenRag 工程根。请将示例中的 **`HARBOR`、`TAG`、`跳板机IP`、`内网kubectl主机`** 换成你的环境。
+以下命令默认 **Linux / macOS + Bash**；仓库根目录指含 `docker/`、`openrag/` 的 OpenRag 工程根。请将示例中的 **`HARBOR`、`TAG`、`跳板机IP`、`内网kubectl主机`** 换成你的环境。
 
 ### 6.3 联网跳板机：下载（docker pull）
 
@@ -344,7 +344,7 @@ kubectl -n "${NS}" rollout status deployment/openrag-api --timeout=300s
 kubectl -n "${NS}" get pods,svc,ingress
 ```
 
-> **说明**：当前仓库 `docker/Dockerfile.api` 生产镜像**未必**包含 `alembic.ini` 与迁移脚本目录时，上述 Alembic Job 可能失败。可任选其一：**(1)** 扩展镜像将 `OpenRag/alembic`（及 `alembic.ini`）拷入 `/app`；**(2)** 在能访问该 PostgreSQL 的 CI/堡垒机执行 `alembic upgrade head`；**(3)** 使用带源码的调试镜像跑迁移。`openrag-api-secret` 名称需与你在 `k8s/00-config-secret.yaml` 中定义的一致。
+> **说明**：当前仓库 `docker/Dockerfile.api` 生产镜像**未必**包含 `alembic.ini` 与迁移脚本目录时，上述 Alembic Job 可能失败。可任选其一：**(1)** 扩展镜像将 `openrag/alembic`（及 `alembic.ini`）拷入 `/app`；**(2)** 在能访问该 PostgreSQL 的 CI/堡垒机执行 `alembic upgrade head`；**(3)** 使用带源码的调试镜像跑迁移。`openrag-api-secret` 名称需与你在 `k8s/00-config-secret.yaml` 中定义的一致。
 
 **验证集群能否拉取业务镜像**（调试用）：
 

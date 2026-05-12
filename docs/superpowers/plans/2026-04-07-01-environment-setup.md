@@ -17,7 +17,7 @@
 ## 文件结构
 
 ```
-OpenRag/
+openrag/
 ├── docker/
 │   ├── docker-compose.yml          # Docker Compose 配置
 │   ├── mysql/
@@ -941,7 +941,7 @@ pytest
 ## 项目结构
 
 ```
-OpenRag/
+openrag/
 ├── docker/              # Docker 配置
 ├── src/openrag/         # 源代码
 ├── tests/               # 测试
