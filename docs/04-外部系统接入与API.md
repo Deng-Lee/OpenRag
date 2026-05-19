@@ -158,6 +158,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `POST` | `/workspaces/{workspace_name}/documents` | 上传新文件（multipart） | write |
 | `PUT` | `/workspaces/{workspace_name}/documents/by-path` | 覆盖已有文件 | write |
 | `POST` | `/workspaces/{workspace_name}/search` | 语义检索（JSON body） | read |
+| `POST` | `/workspaces/multi_space/search` | 多工作区语义检索（JSON body） | read |
 | `GET` | `/workspaces/{workspace_name}/documents/search-by-name` | 按文件名子串模糊搜索 | read |
 
 ### 2.5 管理端点详情
@@ -630,7 +631,134 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 ---
 
-#### 2.6.8 GET `/workspaces/{workspace_name}/documents/search-by-name` — 按文件名模糊搜索
+#### 2.6.8 POST `/workspaces/multi_space/search` — 多工作区语义检索
+
+**Content-Type：** `application/json`
+
+`multi_space` 是保留的虚拟工作区名，用于表示“本次请求由请求体中的 `workspace_names` 指定多个真实工作区”。它不会按真实 `Workspace.name` 查询。
+
+**请求体 `ServiceMultiWorkspaceSearchRequest`：**
+
+| 字段 | 类型 | 必填 | 默认 | 约束 | 说明 |
+|------|------|------|------|------|------|
+| `workspace_names` | array[string] | **是** | — | min_length=1, max_length=20 | 要检索的真实工作区名称列表；每个工作区均需当前 service token 具备 read 权限 |
+| `query` | string | **是** | — | min_length=1 | 检索语句 |
+| `path_prefix` | string/null | 否 | `null` | — | 非 `/` 时仅保留 `uri` 在该前缀下的命中；同一前缀应用于所有目标工作区 |
+| `top_k` | int | 否 | `10` | gt=0, le=100 | 全局返回结果数；多工作区结果合并后按分数截断 |
+| `use_rerank` | bool | 否 | `true` | — | 是否使用 cross-encoder 重排 |
+| `use_contextual_retrieval` | bool | 否 | `false` | — | 启用 L0→L1→L2 层级检索 |
+| `contextual_l0_top_n` | int | 否 | `40` | ge=5, le=200 | L0 候选文件数 |
+| `contextual_l1_top_n` | int | 否 | `30` | ge=5, le=200 | L1 检索深度 |
+| `contextual_chunk_fetch_multiplier` | int | 否 | `4` | ge=1, le=20 | chunk 获取倍率 |
+| `retrieval_strategy` | string | 否 | `"auto"` | — | 检索策略：auto/light/deep/precise/flat |
+| `use_l1_llm_navigation` | bool | 否 | `false` | — | 启用 LLM 辅助 chunk 选择（需 OPENAI_API_KEY） |
+
+**行为规则：**
+
+- `workspace_names` 为空或缺失 → **400**。
+- `workspace_names` 中任一工作区不存在 → **404**。
+- 当前 service token 对任一工作区无 read/write 权限 → **403**。
+- 只传 1 个工作区时，行为等价于单工作区 `/workspaces/{workspace_name}/search`。
+- 传多个工作区时，后端分别在这些工作区内检索，结果补充 `workspace_id` / `workspace_name` 后合并排序。
+- 为避免误用，真实工作区不应命名为 `multi_space`。
+
+**请求示例：**
+
+```json
+{
+  "workspace_names": ["MyWorkspace", "AnotherWS"],
+  "query": "合同金额",
+  "top_k": 5,
+  "path_prefix": "/法务",
+  "use_rerank": true,
+  "use_contextual_retrieval": false
+}
+```
+
+**响应示例：**
+
+```json
+{
+  "results": [
+    {
+      "workspace_id": 3,
+      "workspace_name": "MyWorkspace",
+      "text": "合同约定总金额为...",
+      "score": 0.95,
+      "file_id": 123,
+      "chunk_id": "abc-456",
+      "chunk_index": 0,
+      "page": 1,
+      "level": 0,
+      "block_type": "text",
+      "start_offset": 0,
+      "end_offset": 500,
+      "bbox_x0": null,
+      "bbox_y0": null,
+      "bbox_x1": null,
+      "bbox_y1": null,
+      "source_block_id": null,
+      "source_char_start": null,
+      "source_char_end": null,
+      "filename": "contract.pdf",
+      "uri": "/法务/contract.pdf",
+      "object_key": "...",
+      "object_url": "...",
+      "local_chunk_path": "...",
+      "text_preview": "...",
+      "retrieval_strategy": "auto",
+      "l1_llm_filtered": null
+    },
+    {
+      "workspace_id": 5,
+      "workspace_name": "AnotherWS",
+      "text": "补充协议中约定...",
+      "score": 0.88,
+      "file_id": 456,
+      "chunk_id": "def-789",
+      "chunk_index": 2,
+      "page": 3,
+      "level": 0,
+      "block_type": "text",
+      "start_offset": 120,
+      "end_offset": 420,
+      "bbox_x0": null,
+      "bbox_y0": null,
+      "bbox_x1": null,
+      "bbox_y1": null,
+      "source_block_id": null,
+      "source_char_start": null,
+      "source_char_end": null,
+      "filename": "agreement.pdf",
+      "uri": "/法务/agreement.pdf",
+      "object_key": "...",
+      "object_url": "...",
+      "local_chunk_path": "...",
+      "text_preview": "...",
+      "retrieval_strategy": "auto",
+      "l1_llm_filtered": null
+    }
+  ],
+  "total": 2,
+  "query_time_ms": 245.67,
+  "workspace_count": 2,
+  "l1_llm_applied": null,
+  "l1_llm_skip_reason": null
+}
+```
+
+**多工作区命中字段补充：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `workspace_id` | int | 命中所属工作区 ID |
+| `workspace_name` | string | 命中所属工作区名称 |
+
+其余命中字段与单工作区 `SearchResult` 一致。`total` 为多工作区合并、过滤、截断后的返回条数；`workspace_count` 为本次请求参与检索的工作区数量。
+
+---
+
+#### 2.6.9 GET `/workspaces/{workspace_name}/documents/search-by-name` — 按文件名模糊搜索
 
 **Query 参数：**
 
@@ -689,6 +817,15 @@ curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/sear
   -H "X-OpenRag-Token: sk-xxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"query":"合同金额","top_k":5,"path_prefix":"/法务"}'
+```
+
+**多工作区语义检索：**
+
+```bash
+curl -sS -X POST "https://api.example.com/service/v1/workspaces/multi_space/search" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"workspace_names":["MyWorkspace","AnotherWS"],"query":"合同金额","top_k":5,"path_prefix":"/法务"}'
 ```
 
 **上传文件：**
@@ -753,6 +890,21 @@ r = requests.post(
 r.raise_for_status()
 print(r.json())
 
+# 多工作区语义检索
+r = requests.post(
+    f"{BASE}/workspaces/multi_space/search",
+    json={
+        "workspace_names": ["MyWorkspace", "AnotherWS"],
+        "query": "合同金额",
+        "top_k": 5,
+        "path_prefix": "/法务",
+    },
+    headers=HEADERS,
+    timeout=60,
+)
+r.raise_for_status()
+print(r.json())
+
 # 上传文件
 r = requests.post(
     f"{WS_URL}/documents",
@@ -811,6 +963,7 @@ print(r.json())
 | **400** | `Cannot replace directory content` | 覆盖路径指向目录 |
 | **400** | `Cannot modify bindings on a revoked token` | 修改已吊销令牌的绑定 |
 | **400** | `File type ... is not supported for processing` | 覆盖时文件 MIME 不在支持列表 |
+| **400** | `workspace_names is required for multi_space search` | 多工作区检索缺少目标工作区数组 |
 | **401** | `Invalid or missing service token` | 缺头、密钥错、已吊销 |
 | **403** | `Token not authorized for this workspace` | 令牌未绑定该工作区 |
 | **403** | `Token permission insufficient` | 令牌对绑定的工作区权限不足 |

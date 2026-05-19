@@ -110,7 +110,10 @@ docker pull milvusdb/milvus:v2.4.17
 docker pull docker.elastic.co/elasticsearch/elasticsearch:8.12.2
 
 # 校验本地已存在（可选）
+# Linux / macOS：
 docker images | egrep 'postgres|etcd|minio|milvus|elasticsearch'
+# Windows PowerShell：
+docker images | Select-String "postgres|etcd|minio|milvus|elasticsearch"
 ```
 
 ### 6.4 联网跳板机：构建业务镜像并打标签
@@ -118,8 +121,16 @@ docker images | egrep 'postgres|etcd|minio|milvus|elasticsearch'
 在**仓库根目录**执行（`TAG` 自行递增，如 `1.0.0`）：
 
 ```bash
+# Linux / macOS
 export TAG=1.0.0
+```
 
+```powershell
+# Windows PowerShell
+$env:TAG="1.0.9"
+```
+
+```bash
 # API（上下文为仓库根，与 compose 一致）
 docker build -f docker/Dockerfile.api -t openrag/api:${TAG} .
 
@@ -130,14 +141,33 @@ docker build -f docker/Dockerfile.worker -t openrag/task-worker:${TAG} .
 docker build -f docker/Dockerfile.web -t openrag/web:${TAG} .
 ```
 
+> Windows PowerShell 执行同类命令时，将示例中的 `${TAG}` 替换为 `$env:TAG`。下文同理，不再重复整段命令。
+> 另外，Bash 示例中的行尾 `\` 是 Linux / macOS 的续行符；PowerShell 续行符是反引号 `` ` ``，也可以直接把命令写成一行执行。
+
+若 Web 镜像构建阶段访问 npm registry 超时，`docker/Dockerfile.web` 会自动尝试使用 Docker Desktop 代理
+`http://http.docker.internal:3128`；其他代理环境可显式传入：
+
+```bash
+docker build --build-arg NPM_PROXY=http://代理地址:端口 -f docker/Dockerfile.web -t openrag/web:${TAG} .
+```
+
 ### 6.5 联网跳板机：打包（docker save）与压缩、校验
 
 **单文件大包**（适合 U 盘一次拷贝；文件较大）：
 
 ```bash
+# Linux / macOS
 export TAG=1.0.0
 export OFFLINE_TAR=openrag-offline-${TAG}-images.tar
+```
 
+```powershell
+# Windows PowerShell
+$env:TAG="1.0.9"
+$env:OFFLINE_TAR="openrag-offline-$($env:TAG)-images.tar"
+```
+
+```bash
 docker save -o "${OFFLINE_TAR}" \
   postgres:16-alpine \
   quay.io/coreos/etcd:v3.5.5 \
@@ -156,11 +186,38 @@ sha256sum "${OFFLINE_TAR}.gz" > "${OFFLINE_TAR}.gz.sha256"
 cat "${OFFLINE_TAR}.gz.sha256"
 ```
 
+Windows PowerShell 指令如下：
+
+```powershell
+$env:TAG="1.0.9"
+$env:OFFLINE_TAR="openrag-offline-$($env:TAG)-images.tar"
+
+docker save -o $env:OFFLINE_TAR `
+  postgres:16-alpine `
+  quay.io/coreos/etcd:v3.5.5 `
+  minio/minio:RELEASE.2023-03-20T20-16-18Z `
+  milvusdb/milvus:v2.4.17 `
+  docker.elastic.co/elasticsearch/elasticsearch:8.12.2 `
+  openrag/api:$env:TAG `
+  openrag/task-worker:$env:TAG `
+  openrag/web:$env:TAG
+```
+
 **分包**（单文件超过介质限制时，按镜像拆开 `docker save` 多次；内网对每包分别 `docker load` 即可）：
 
 ```bash
+# Linux / macOS
 export TAG=1.0.0
 export OUT=./openrag-offline-${TAG}-split
+```
+
+```powershell
+# Windows PowerShell
+$env:TAG="1.0.9"
+$env:OUT="./openrag-offline-$($env:TAG)-split"
+```
+
+```bash
 mkdir -p "${OUT}"
 
 # 基础中间件（体积小，可一包）
@@ -187,17 +244,77 @@ for f in "${OUT}"/*.tar; do gzip -f "$f"; done
 cat "${OUT}/SHA256SUMS"
 ```
 
+Windows PowerShell 等价命令如下（不要使用 Bash 的 `${OUT}` / `${TAG}` 与行尾 `\`）：
+
+```powershell
+$env:TAG="1.0.9"
+$env:OUT="./openrag-offline-$($env:TAG)-split"
+
+New-Item -ItemType Directory -Force -Path $env:OUT
+
+# 基础中间件（体积小，可一包）
+docker save -o "$env:OUT/01-postgres.tar" postgres:16-alpine
+
+# Milvus 依赖
+docker save -o "$env:OUT/02-milvus-etcd-minio.tar" `
+  quay.io/coreos/etcd:v3.5.5 `
+  minio/minio:RELEASE.2023-03-20T20-16-18Z
+
+# Milvus 本体（单独一包，便于失败重传）
+docker save -o "$env:OUT/03-milvus.tar" milvusdb/milvus:v2.4.17
+
+# Elasticsearch（单独一包）
+docker save -o "$env:OUT/04-elasticsearch.tar" docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+
+# 业务三镜像（可再拆成三个 tar）
+docker save -o "$env:OUT/05-openrag-api.tar" "openrag/api:$env:TAG"
+docker save -o "$env:OUT/06-openrag-task-worker.tar" "openrag/task-worker:$env:TAG"
+docker save -o "$env:OUT/07-openrag-web.tar" "openrag/web:$env:TAG"
+
+# 逐包压缩与校验（可选）
+Get-ChildItem $env:OUT -Filter "*.tar" | ForEach-Object {
+  gzip -f $_.FullName
+}
+
+Get-ChildItem $env:OUT -Filter "*.tar.gz" | ForEach-Object {
+  $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+  "$hash  $($_.Name)"
+} | Set-Content "$env:OUT/SHA256SUMS" -Encoding ascii
+
+Get-Content "$env:OUT/SHA256SUMS"
+```
+
 内网加载示例：
 
 ```bash
+# Linux / macOS
 export OUT=./openrag-offline-1.0.0-split
 sha256sum -c "${OUT}/SHA256SUMS"   # 若已生成校验文件
 for f in "${OUT}"/*.tar.gz; do gunzip -c "$f" | docker load; done
 ```
 
+```powershell
+# Windows PowerShell
+$env:OUT="./openrag-offline-1.0.9-split"
+
+Get-ChildItem $env:OUT -Filter "*.tar.gz" | ForEach-Object {
+  gzip -dc $_.FullName | docker load
+}
+```
+
 ### 6.6 搬运至内网（下载到内网制品机）
 
 任选其一（示例）：
+
+```bash
+# Linux / macOS
+export TAG=1.0.0
+```
+
+```powershell
+# Windows PowerShell
+$env:TAG="1.0.9"
+```
 
 ```bash
 # 从跳板机推到内网制品服务器（替换用户与 IP）
@@ -206,6 +323,19 @@ scp openrag-offline-${TAG}-images.tar.gz openrag-offline-${TAG}-images.tar.gz.sh
 
 # 或使用 rsync 断点续传
 rsync -avP openrag-offline-${TAG}-images.tar.gz user@10.0.0.50:/data/openrag-artifacts/
+```
+
+Windows PowerShell 示例（替换 `用户名` 与 `内网服务器IP`；如果未压缩则将 `.tar.gz` 改为 `.tar`）：
+
+```powershell
+# 传单个大包与校验文件
+scp ".\openrag-offline-$($env:TAG)-images.tar" `
+  ".\openrag-offline-$($env:TAG)-images.tar.sha256" `
+  "用户名@内网服务器IP:/data/openrag-artifacts/"
+
+# 传七个分包目录
+scp -r ".\openrag-offline-$($env:TAG)-split" `
+  "用户名@内网服务器IP:/data/openrag-artifacts/"
 ```
 
 内网制品机收到文件后建议先校验再解压：
@@ -220,12 +350,46 @@ sha256sum -c openrag-offline-${TAG}-images.tar.gz.sha256
 在能 **docker login** 到内网 Harbor 的机器上执行：
 
 ```bash
+# Linux / macOS
 export TAG=1.0.0
 export HARBOR=harbor.internal.example   # 无协议、无路径
 export HARBOR_PROJECT=openrag            # Harbor 项目名，需已创建
+```
 
-# 1) 解压并导入（若 6.5 步未压缩则去掉 gunzip 管道）
-gunzip -c openrag-offline-${TAG}-images.tar.gz | docker load
+```powershell
+# Windows PowerShell
+$env:TAG="1.0.9"
+$env:HARBOR="harbor.internal.example"      # 无协议、无路径
+$env:HARBOR_PROJECT="openrag"              # Harbor 项目名，需已创建
+```
+
+> `harbor.internal.example` 只是占位符，不是本项目固定地址。真实 `HARBOR` 应使用内网镜像仓库地址，可在内网制品机 / K8s 节点上通过以下方式确认：
+>
+> ```bash
+> cat ~/.docker/config.json
+> kubectl get deploy,statefulset -A -o yaml | grep 'image:' | grep -E 'harbor|registry|dockerhub' | head -50
+> ```
+>
+> 例如某环境的 `~/.docker/config.json` 中存在 `"dockerhub.kubekey.local"`，且 `docker login dockerhub.kubekey.local` 显示 `Login Succeeded`，则该环境应设置：
+>
+> ```bash
+> export HARBOR=dockerhub.kubekey.local
+> ```
+>
+> PowerShell 写法：
+>
+> ```powershell
+> $env:HARBOR="dockerhub.kubekey.local"
+> ```
+
+```bash
+# 1) 导入镜像包
+# 若上传的是未压缩 .tar（当前示例）
+cd /root/lisiqi/docker_images/rag
+docker load -i openrag-offline-1.0.9-images.tar
+
+# 若上传的是压缩后的 .tar.gz，才使用 gunzip 管道
+# gunzip -c openrag-offline-${TAG}-images.tar.gz | docker load
 
 # 2) 登录 Harbor（交互输入密码；CI 可用 --password-stdin）
 docker login "${HARBOR}"
@@ -282,11 +446,22 @@ skopeo copy docker://docker.io/library/postgres:16-alpine docker-archive:postgre
 仓库未内置完整 Helm Chart 时，你仍可使用自维护的 `k8s/*.yaml`。以下为**通用 kubectl 流程**（文件名请按实际清单替换）：
 
 ```bash
+# Linux / macOS
 export NS=openrag
 export TAG=1.0.0
 export HARBOR=harbor.internal.example
 export HARBOR_PROJECT=openrag
+```
 
+```powershell
+# Windows PowerShell
+$env:NS="openrag"
+$env:TAG="1.0.9"
+$env:HARBOR="harbor.internal.example"
+$env:HARBOR_PROJECT="openrag"
+```
+
+```bash
 # 命名空间
 kubectl create namespace "${NS}" --dry-run=client -o yaml | kubectl apply -f -
 
