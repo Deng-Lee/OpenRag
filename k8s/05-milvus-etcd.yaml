@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: milvus-etcd-data
+  name: milvus-etcd-data-external-minio
   namespace: openrag
 spec:
   accessModes:
@@ -85,4 +85,4 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: milvus-etcd-data
+            claimName: milvus-etcd-data-external-minio

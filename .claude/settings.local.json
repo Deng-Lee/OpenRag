@@ -33,7 +33,8 @@
       "PowerShell(npm list -g --depth=0)",
       "PowerShell(Get-Command claude -ErrorAction SilentlyContinue)",
       "PowerShell(npm search @anthropic --json 2>$null | ConvertFrom-Json | Select-Object -First 10 name)",
-      "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\claude.cmd\" --version 2>&1)"
+      "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\claude.cmd\" --version 2>&1)",
+      "Bash(git -C \"e:\\\\project\\\\OpenRag\" log --oneline -10)"
     ]
   }
 }

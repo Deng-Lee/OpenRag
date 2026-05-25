@@ -8,11 +8,12 @@ resources:
   - ../../02-configmap-nginx.yaml
   - ../../03-postgres.yaml
   - ../../05-milvus-etcd.yaml
-  - ../../06-milvus-minio.yaml
+  - ../../07-milvus-config.yaml
   - ../../07-milvus.yaml
   - ../../08-elasticsearch.yaml
   - ../../13-configmap-openrag-llm.yaml
   - ../../14-configmap-openrag-web-runtime.yaml
+  - ../../15-configmap-openrag-service-conf.yaml
   - ../../09-api.yaml
   - ../../10-task-worker.yaml
   - ../../11-web.yaml

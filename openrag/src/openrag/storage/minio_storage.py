@@ -80,9 +80,34 @@ class MinioStorage:
             endpoint, access_key=access_key, secret_key=secret_key, secure=secure
         )
 
+    def _single_bucket_prefix(self) -> Optional[str]:
+        prefix = getattr(get_config().storage, "prefix", None)
+        if prefix is None:
+            return None
+        prefix = str(prefix).strip().strip("/")
+        return prefix or None
+
+    def _resolve_bucket_key(self, bucket_name: str, object_key: str) -> tuple[str, str]:
+        object_key = object_key.lstrip("/")
+        prefix = self._single_bucket_prefix()
+        if prefix is None:
+            return bucket_name, object_key
+
+        cfg_bucket = getattr(get_config().storage, "bucket", None)
+        physical_bucket = cfg_bucket or bucket_name
+        physical_key = f"{prefix}/{bucket_name.strip('/')}"
+        if object_key:
+            physical_key = f"{physical_key}/{object_key}"
+        return physical_bucket, physical_key
+
+    def _resolve_bucket(self, bucket_name: str) -> str:
+        if self._single_bucket_prefix() is None:
+            return bucket_name
+        return getattr(get_config().storage, "bucket", None) or bucket_name
+
     def path_style_http_url(self, bucket_name: str, object_key: str) -> str:
         """Path-style 对象 URL：{base}/{bucket}/{key}（与 MinIO path-style 一致）。"""
-        object_key = object_key.lstrip("/")
+        bucket_name, object_key = self._resolve_bucket_key(bucket_name, object_key)
         cfg = get_config().storage
         if cfg.public_url:
             base = cfg.public_url.rstrip("/")
@@ -100,6 +125,7 @@ class MinioStorage:
 
     def ensure_bucket(self, bucket_name: str):
         """Ensure the bucket exists for the given workspace"""
+        bucket_name = self._resolve_bucket(bucket_name)
         try:
             if not self.client.bucket_exists(bucket_name):
                 self.client.make_bucket(bucket_name)
@@ -116,7 +142,7 @@ class MinioStorage:
     ):
         """Upload file to minio bucket"""
         self.ensure_bucket(bucket_name)
-        object_name = object_name.lstrip("/")
+        bucket_name, object_name = self._resolve_bucket_key(bucket_name, object_name)
         self.client.put_object(
             bucket_name,
             object_name,
@@ -127,12 +153,12 @@ class MinioStorage:
 
     def get_file_to_path(self, bucket_name: str, object_name: str, file_path: str):
         """Download file from minio bucket to local file path"""
-        object_name = object_name.lstrip("/")
+        bucket_name, object_name = self._resolve_bucket_key(bucket_name, object_name)
         self.client.fget_object(bucket_name, object_name, file_path)
 
     def remove_file(self, bucket_name: str, object_name: str):
         """Remove file from minio bucket"""
-        object_name = object_name.lstrip("/")
+        bucket_name, object_name = self._resolve_bucket_key(bucket_name, object_name)
         self.client.remove_object(bucket_name, object_name)
 
     def remove_directory(self, bucket_name: str, prefix: str):
@@ -140,6 +166,7 @@ class MinioStorage:
         prefix = prefix.lstrip("/")
         if not prefix.endswith("/"):
             prefix += "/"
+        bucket_name, prefix = self._resolve_bucket_key(bucket_name, prefix)
         objects_to_delete = self.client.list_objects(
             bucket_name, prefix=prefix, recursive=True
         )
@@ -148,20 +175,24 @@ class MinioStorage:
 
     def move_file(self, bucket_name: str, old_object_name: str, new_object_name: str):
         """Move file in minio bucket"""
-        old_object_name = old_object_name.lstrip("/")
-        new_object_name = new_object_name.lstrip("/")
+        src_bucket, old_object_name = self._resolve_bucket_key(
+            bucket_name, old_object_name
+        )
+        dst_bucket, new_object_name = self._resolve_bucket_key(
+            bucket_name, new_object_name
+        )
         try:
             self.client.copy_object(
-                bucket_name, new_object_name, CopySource(bucket_name, old_object_name)
+                dst_bucket, new_object_name, CopySource(src_bucket, old_object_name)
             )
-            self.client.remove_object(bucket_name, old_object_name)
+            self.client.remove_object(src_bucket, old_object_name)
         except S3Error as e:
             if e.code != "NoSuchKey":
                 raise e
 
     def file_exists(self, bucket_name: str, object_name: str) -> bool:
         """Check if file exists in minio bucket"""
-        object_name = object_name.lstrip("/")
+        bucket_name, object_name = self._resolve_bucket_key(bucket_name, object_name)
         try:
             self.client.stat_object(bucket_name, object_name)
             return True
@@ -172,12 +203,12 @@ class MinioStorage:
 
     def open_object_stream(self, bucket_name: str, object_key: str):
         """返回 MinIO get_object 响应流，调用方负责 close/release_conn。"""
-        object_key = object_key.lstrip("/")
+        bucket_name, object_key = self._resolve_bucket_key(bucket_name, object_key)
         return self.client.get_object(bucket_name, object_key)
 
     def read_object_bytes(self, bucket_name: str, object_key: str) -> bytes:
         """读取完整对象字节。"""
-        object_key = object_key.lstrip("/")
+        bucket_name, object_key = self._resolve_bucket_key(bucket_name, object_key)
         resp = self.client.get_object(bucket_name, object_key)
         try:
             return resp.read()
@@ -187,7 +218,7 @@ class MinioStorage:
 
     def get_object_text(self, bucket_name: str, object_key: str) -> Optional[str]:
         """读取对象 UTF-8 文本；不存在则返回 None。"""
-        object_key = object_key.lstrip("/")
+        bucket_name, object_key = self._resolve_bucket_key(bucket_name, object_key)
         try:
             resp = self.client.get_object(bucket_name, object_key)
             data = resp.read()
@@ -297,10 +328,13 @@ class MinioStorage:
         self.remove_document_hierarchy(bucket_name, new_file_uri)
         moves: dict[str, str] = {}
         new_chunk_pref = hierarchy_chunks_prefix(new_file_uri)
+        physical_bucket = self._resolve_bucket(bucket_name)
 
         def _add(src: str, dst: str) -> None:
             if self.file_exists(bucket_name, src):
-                moves[src] = dst
+                _, physical_src = self._resolve_bucket_key(bucket_name, src)
+                _, physical_dst = self._resolve_bucket_key(bucket_name, dst)
+                moves[physical_src] = physical_dst
 
         _add(
             hierarchy_l0_object_key(old_file_uri),
@@ -320,33 +354,44 @@ class MinioStorage:
         )
 
         old_chunk_pref = hierarchy_chunks_prefix(old_file_uri)
+        _, physical_old_chunk_pref = self._resolve_bucket_key(
+            bucket_name, old_chunk_pref
+        )
         for obj in self.client.list_objects(
-            bucket_name, prefix=old_chunk_pref, recursive=True
+            physical_bucket, prefix=physical_old_chunk_pref, recursive=True
         ):
             ok = obj.object_name
-            if ok.startswith(old_chunk_pref):
-                moves[ok] = f"{new_chunk_pref}{ok[len(old_chunk_pref):]}"
+            if ok.startswith(physical_old_chunk_pref):
+                suffix = ok[len(physical_old_chunk_pref) :]
+                _, new_key = self._resolve_bucket_key(
+                    bucket_name, f"{new_chunk_pref}{suffix}"
+                )
+                moves[ok] = new_key
 
         old_tree = hierarchy_folder_prefix(old_file_uri)
+        _, physical_old_tree = self._resolve_bucket_key(bucket_name, old_tree)
         for obj in self.client.list_objects(
-            bucket_name, prefix=old_tree, recursive=True
+            physical_bucket, prefix=physical_old_tree, recursive=True
         ):
             ok = obj.object_name
-            if not ok.startswith(old_tree):
+            if not ok.startswith(physical_old_tree):
                 continue
-            rel = ok[len(old_tree) :]
+            rel = ok[len(physical_old_tree) :]
             if rel in (".abstract.md", ".overview.md"):
                 continue
             if rel.startswith(f"{CHUNKS_DIR}/"):
                 suf = rel[len(f"{CHUNKS_DIR}/") :]
-                moves[ok] = f"{new_chunk_pref}{suf}"
+                _, new_key = self._resolve_bucket_key(
+                    bucket_name, f"{new_chunk_pref}{suf}"
+                )
+                moves[ok] = new_key
 
         for old_key, new_key in moves.items():
             try:
                 self.client.copy_object(
-                    bucket_name, new_key, CopySource(bucket_name, old_key)
+                    physical_bucket, new_key, CopySource(physical_bucket, old_key)
                 )
-                self.remove_file(bucket_name, old_key)
+                self.client.remove_object(physical_bucket, old_key)
             except S3Error as e:
                 if e.code != "NoSuchKey":
                     raise

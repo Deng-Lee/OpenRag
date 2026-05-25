@@ -47,6 +47,7 @@ class StorageConfig(BaseSettings):
     access_key: Optional[str] = None
     secret_key: Optional[str] = None
     bucket: Optional[str] = "openrag"
+    prefix: Optional[str] = None
     # 对外访问对象用的 HTTP 根地址（path-style：{public_url}/{bucket}/{object_key}）
     public_url: Optional[str] = None
 
@@ -64,6 +65,9 @@ class StorageConfig(BaseSettings):
 
         self.access_key = pick(self.access_key, "MINIO_ROOT_USER")
         self.secret_key = pick(self.secret_key, "MINIO_ROOT_PASSWORD")
+        if self.prefix is not None:
+            prefix = str(self.prefix).strip().strip("/")
+            self.prefix = prefix or None
         return self
 
 
