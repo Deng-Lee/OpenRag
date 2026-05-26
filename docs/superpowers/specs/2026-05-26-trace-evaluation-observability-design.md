@@ -369,9 +369,97 @@ ABC 三路统一使用 0-3 相关性等级：
 - `llm_assisted`
 - `weighted_all`
 
-## 6. 采集点设计
+## 6. 数据库迁移策略
 
-### 6.1 上传链路
+当前项目启动时通过 `Base.metadata.create_all()` 建表，适合本地开发和全新测试库，但不适合生产环境中的长期 schema 演进。Trace 相关表虽然只保留 7 天，eval 相关表却是长期评测资产，后续必然会扩展字段、索引和约束，因此第一阶段需要同时引入 Alembic 迁移机制。
+
+### 6.1 迁移原则
+
+- 保留 `Base.metadata.create_all()`，继续服务本地开发、测试和全新空库初始化。
+- 新增 Alembic 基础配置和迁移目录，用于生产环境和已有数据库的 schema 变更。
+- trace/eval 新表的首次落库必须提供显式 Alembic migration。
+- 后续 eval 长期表的字段、索引、约束变更必须通过 Alembic migration，不依赖 `create_all()`。
+- 生产部署流程必须在 API/Worker 启动前执行 `alembic upgrade head`。
+
+### 6.2 第一阶段迁移内容
+
+第一版 migration 应创建：
+
+- `trace_runs`
+- `trace_spans`
+- `trace_snapshots`
+- `trace_artifacts`
+- `eval_datasets`
+- `eval_queries`
+- `eval_judgments`
+- `eval_runs`
+- `eval_results`
+
+迁移脚本应包含必要索引、唯一约束、外键约束和 JSONB 字段类型。若生产镜像尚未包含 `alembic.ini` 和迁移目录，部署计划需要同步调整 Dockerfile 或部署脚本，确保迁移命令可在 API Job、init 容器、CI 或运维环境中执行。
+
+### 6.3 与 create_all 的关系
+
+`create_all()` 只能创建不存在的表，不会修改已存在表结构。因此它不能作为 trace/eval 长期 schema 的升级方式。第一阶段允许它继续作为开发兜底，但生产环境应以 Alembic migration 为准。
+
+## 7. Trace Context 传播机制
+
+Trace 表结构中的 `trace_id`、`span_id` 和 `parent_span_id` 需要有明确的运行时传播机制。第一阶段采用 Python `contextvars` 保存当前 trace 上下文，避免把 `trace_id` 层层添加到 `DocumentProcessor`、`RetrievalService`、`Reranker` 等函数签名中。
+
+### 7.1 上下文内容
+
+Trace context 至少包含：
+
+- `trace_id`
+- 当前 `span_id`
+- `trace_type`
+- `workspace_id`
+- `user_id`
+- `file_id`
+- `task_id`
+- `eval_run_id`
+- `eval_query_id`
+- `sampling_reason`
+
+Trace service 提供统一接口读取当前 context，并提供 `start_span(stage)` / `finish_span()` 或上下文管理器形式的 span API。
+
+### 7.2 API 请求入口
+
+FastAPI middleware 负责：
+
+- 从请求头读取外部传入的 trace id，若不存在则生成新的 `trace_id`。
+- 根据路由或调用场景设置 `trace_type`。
+- 将 trace context 写入 `contextvars`。
+- 在响应头中返回 `trace_id`，便于调用方排查。
+- 在请求结束后清理 context，避免跨请求污染。
+
+普通搜索请求创建 `retrieval` trace；评测集执行中的搜索请求创建 `eval_retrieval` trace。
+
+### 7.3 Worker 入口
+
+Worker 不经过 FastAPI middleware，因此需要在 `TaskWorker._execute_task()` 或具体 task 执行入口创建 trace context：
+
+- `process_document` 创建 `document_processing` trace。
+- 上传入口已经创建 `upload` trace；处理任务开始时创建新的处理 trace，并通过 `task_id`、`file_id` 和 `workspace_id` 关联。
+- heartbeat 子进程不需要继承 trace context，第一阶段只要求任务执行主进程内的采集点可读取当前 context。
+
+### 7.4 Eval Run 入口
+
+Eval run 对每个 eval query 执行真实检索链路时显式创建 `eval_retrieval` trace context，并写入：
+
+- `eval_run_id`
+- `eval_query_id`
+- `dataset_id`
+- `search_config_snapshot`
+
+这样每条评测 query 都可以关联到对应 trace、snapshot 和 eval result。
+
+### 7.5 函数签名约束
+
+采集点应通过 Trace service 读取当前 context，不应为了 trace 在主要业务函数中层层增加 `trace_id`、`span_id` 参数。只有跨进程、异步任务、外部 API 调用等 contextvars 无法自然传播的边界，才允许显式传递最小必要关联字段。
+
+## 8. 采集点设计
+
+### 8.1 上传链路
 
 采集位置：
 
@@ -393,7 +481,7 @@ Span：
 
 不保存文件内容。
 
-### 6.2 文档处理链路
+### 8.2 文档处理链路
 
 采集位置：
 
@@ -430,7 +518,7 @@ Span：
 - 完整 `DocumentBlock` 默认快照。
 - embedding 向量。
 
-### 6.3 检索链路
+### 8.3 检索链路
 
 采集位置：
 
@@ -462,9 +550,9 @@ Span：
 - query 正文以外的敏感上下文。
 - chunk 正文。
 
-## 7. 指标设计
+## 9. 指标设计
 
-### 7.1 真实质量指标
+### 9.1 真实质量指标
 
 真实质量指标只在 eval run 中计算，依赖 `eval_judgments` 的 0-3 相关性等级。
 
@@ -487,7 +575,7 @@ NDCG 口径：
 
 - 使用 0-3 原始等级作为 gain。
 
-### 7.2 ABC 双轨口径
+### 9.2 ABC 双轨口径
 
 采用双轨制：
 
@@ -495,7 +583,7 @@ NDCG 口径：
 - A/B/C 加权综合分用于趋势观察和策略对比。
 - A、B、C 分来源指标单独输出，避免 LLM 辅助标注噪声掩盖问题。
 
-### 7.3 Stage Recall
+### 9.3 Stage Recall
 
 用于观察相关结果在各阶段是否被保留。
 
@@ -507,7 +595,7 @@ NDCG 口径：
 
 不包括 L0/L1。
 
-### 7.4 Rerank Delta
+### 9.4 Rerank Delta
 
 用于比较 rerank 前后质量变化。
 
@@ -519,7 +607,7 @@ NDCG 口径：
 - top50 overlap
 - rank_delta 分布
 
-### 7.5 无标注 proxy 指标
+### 9.5 无标注 proxy 指标
 
 普通线上检索不计算真实质量指标，只记录 proxy 指标：
 
@@ -533,9 +621,9 @@ NDCG 口径：
 
 proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 
-## 8. Eval Run 工作流
+## 10. Eval Run 工作流
 
-### 8.1 创建评测集
+### 10.1 创建评测集
 
 用户维护：
 
@@ -545,7 +633,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 
 标注对象优先使用 `chunk_id`。当业务样本只能定位到文件时，可先保存 `file_id` 级标注，但指标计算时应明确标注粒度，避免和 chunk 级指标混用。
 
-### 8.2 执行评测
+### 10.2 执行评测
 
 用户选择：
 
@@ -566,7 +654,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 6. 汇总 run 级指标。
 7. 保存 `eval_results`。
 
-### 8.3 参数对比
+### 10.3 参数对比
 
 不同参数组合产生不同 eval run。系统支持比较：
 
@@ -576,9 +664,9 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 - 不同 embedding/rerank 模型。
 - 不同 chunk 参数对应的索引版本。
 
-## 9. API 设计
+## 11. API 设计
 
-### 9.1 Trace 查询
+### 11.1 Trace 查询
 
 - `GET /traces`
 - `GET /traces/{trace_id}`
@@ -595,7 +683,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 - query_hash
 - 时间范围
 
-### 9.2 评测集管理
+### 11.2 评测集管理
 
 - `POST /eval/datasets`
 - `GET /eval/datasets`
@@ -606,7 +694,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 
 `POST /eval/import` 支持导入 A/B/C 三类标注数据，统一转换为 0-3 相关性等级。
 
-### 9.3 评测执行与结果
+### 11.3 评测执行与结果
 
 - `POST /eval/runs`
 - `GET /eval/runs`
@@ -616,7 +704,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 
 第一阶段可先提供 API，前端页面后续逐步补齐。
 
-## 10. 前端查看方式
+## 12. 前端查看方式
 
 第一阶段建议提供轻量管理页：
 
@@ -627,7 +715,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 
 如果开发资源有限，第一阶段可以先完成 API 和后端数据结构，前端只做最小可用查询页。
 
-## 11. 数据保留与清理
+## 13. 数据保留与清理
 
 统一保留 7 天：
 
@@ -651,7 +739,7 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 - 支持按 `expires_at` 清理 artifact。
 - MinIO artifact 删除失败时记录告警，不影响数据库清理继续进行。
 
-## 12. 错误处理
+## 14. 错误处理
 
 Trace 写入不能影响主链路：
 
@@ -665,9 +753,9 @@ Trace 写入不能影响主链路：
 - 对应 eval query 标记为 failed。
 - run_summary 排除 failed query，并记录 failed_count。
 
-## 13. 测试计划
+## 15. 测试计划
 
-### 13.1 单元测试
+### 15.1 单元测试
 
 - trace run/span/snapshot 创建与查询。
 - top50 snapshot 截断逻辑。
@@ -677,7 +765,7 @@ Trace 写入不能影响主链路：
 - ABC 分来源和加权综合指标计算。
 - Rerank Delta 和 Stage Recall 计算。
 
-### 13.2 集成测试
+### 15.2 集成测试
 
 - 上传文件后生成必要 trace。
 - 文档处理后记录 parse/chunk/embedding/vector/es/storage 关键摘要。
@@ -685,14 +773,14 @@ Trace 写入不能影响主链路：
 - eval run 批量执行并生成 eval_results。
 - trace 数据 7 天清理逻辑。
 
-### 13.3 回归测试
+### 15.3 回归测试
 
 - trace 写入失败不影响搜索接口返回。
 - trace 写入失败不影响文档处理任务成功。
 - L0/L1 关闭时不产生 L0/L1 指标。
 - 权限诊断关闭时不产生权限过滤指标。
 
-## 14. 验收标准
+## 16. 验收标准
 
 第一阶段完成后，应满足：
 
@@ -703,11 +791,13 @@ Trace 写入不能影响主链路：
 - 能计算 rerank 前后质量变化。
 - 能比较不同参数组合的 eval run。
 - trace 相关数据和 artifact 统一 7 天清理。
+- trace/eval 新表有 Alembic migration，生产部署可通过 `alembic upgrade head` 创建或升级 schema。
+- trace 采集通过 `contextvars` 和 Trace service 传播上下文，不在主要业务函数签名中层层增加 `trace_id` 参数。
 - 不记录 L0/L1 指标。
 - 不做权限诊断。
 - 不重复保存文件正文、chunk 正文、L0/L1 内容或 embedding 向量。
 
-## 15. 后续演进
+## 17. 后续演进
 
 第二阶段可考虑：
 
