@@ -13,7 +13,10 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.retrieval.reranker import Reranker
-from openrag.retrieval.retrieval_service import RetrievalService
+from openrag.retrieval.retrieval_service import (
+    RetrievalService,
+    l0_l1_retrieval_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,9 @@ def _get_vector_store():
 
 def _get_layer_store():
     """Milvus L0/L1 集合；不可用时返回 None（退化为平面切片检索）。"""
+    if not l0_l1_retrieval_enabled():
+        return None
+
     global _layer_store_instance, _layer_store_init_failed
     if _layer_store_init_failed:
         return None
@@ -240,10 +246,18 @@ def _execute_search(
         fulltext_store=_get_fulltext_store(),
     )
 
+    hierarchy_enabled = l0_l1_retrieval_enabled()
+    use_contextual_retrieval = request.use_contextual_retrieval and hierarchy_enabled
+    use_l1_llm_navigation = request.use_l1_llm_navigation and hierarchy_enabled
     is_hierarchical = endpoint == "hierarchical"
-    force_contextual = is_hierarchical and not request.use_contextual_retrieval
+    force_contextual = (
+        hierarchy_enabled and is_hierarchical and not request.use_contextual_retrieval
+    )
+    effective_hierarchical_boost = (
+        rerank_hierarchical_boost if hierarchy_enabled else None
+    )
 
-    if request.use_contextual_retrieval or force_contextual:
+    if use_contextual_retrieval or force_contextual:
         results = svc.search(
             query=request.query,
             user_id=user_id,
@@ -254,7 +268,7 @@ def _execute_search(
             contextual_l1_top_n=request.contextual_l1_top_n,
             contextual_chunk_fetch_multiplier=request.contextual_chunk_fetch_multiplier,
             retrieval_strategy=request.retrieval_strategy,
-            use_l1_llm_navigation=request.use_l1_llm_navigation,
+            use_l1_llm_navigation=use_l1_llm_navigation,
             vector_similarity_weight=request.vector_similarity_weight,
         )
     else:
@@ -271,19 +285,19 @@ def _execute_search(
         )
 
         if request.use_rerank and results:
-            if rerank_hierarchical_boost is not None:
-                reranker = Reranker(hierarchical_boost=rerank_hierarchical_boost)
+            if effective_hierarchical_boost is not None:
+                reranker = Reranker(hierarchical_boost=effective_hierarchical_boost)
             else:
                 reranker = Reranker()
             results = reranker.rerank(request.query, results, top_k=request.top_k)
         else:
             results = results[: request.top_k]
 
-    use_fused_scores = (request.use_contextual_retrieval or force_contextual) and bool(
+    use_fused_scores = (use_contextual_retrieval or force_contextual) and bool(
         results
     )
     if (
-        not request.use_contextual_retrieval
+        not use_contextual_retrieval
         and not force_contextual
         and request.vector_similarity_weight < 1.0 - 1e-12
         and bool(results)
@@ -319,11 +333,11 @@ def _execute_search(
         "hits=%d l1_llm_hits=%d modes=%s rerank=%s ms=%.2f",
         endpoint,
         request.workspace_id,
-        request.use_contextual_retrieval,
+        use_contextual_retrieval,
         force_contextual,
         request.retrieval_strategy,
         strat_resolved,
-        request.use_l1_llm_navigation,
+        use_l1_llm_navigation,
         l1_llm_applied,
         l1_llm_skip_reason,
         len(formatted),

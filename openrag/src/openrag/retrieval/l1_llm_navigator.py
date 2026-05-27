@@ -43,9 +43,9 @@ def llm_select_chunk_indices(
     if not file_summaries:
         return L1LlmNavigationResult(skip_reason="no_l1_text")
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("L1_NAV_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        logger.debug("L1 LLM navigator skipped: OPENAI_API_KEY unset")
+        logger.debug("L1 LLM navigator skipped: L1_NAV_API_KEY/OPENAI_API_KEY unset")
         return L1LlmNavigationResult(skip_reason="no_api_key")
 
     try:
@@ -55,7 +55,7 @@ def llm_select_chunk_indices(
         return L1LlmNavigationResult(skip_reason="no_openai_package")
 
     model = os.environ.get("L1_NAV_MODEL", _DEFAULT_MODEL)
-    base_url = os.environ.get("OPENAI_BASE_URL") or None
+    base_url = os.environ.get("L1_NAV_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or None
 
     lines = []
     for item in file_summaries:

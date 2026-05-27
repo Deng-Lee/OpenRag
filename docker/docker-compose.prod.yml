@@ -28,6 +28,22 @@ services:
       - MAX_UPLOAD_SIZE=20971520
       - UPLOAD_DIR=/app/uploads
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-1536}
+      - OPENRAG_RETRIEVAL_USE_L0_L1=${OPENRAG_RETRIEVAL_USE_L0_L1:-true}
+      - L1_NAV_API_KEY=${L1_NAV_API_KEY:-}
+      - L1_NAV_BASE_URL=${L1_NAV_BASE_URL:-}
+      - L1_NAV_MODEL=${L1_NAV_MODEL:-gpt-4o-mini}
+      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-local}
+      - RERANKER_MODEL=${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+      - RERANKER_BASE_URL=${RERANKER_BASE_URL:-https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank}
+      - RERANKER_API_KEY=${RERANKER_API_KEY:-}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - RERANKER_PAYLOAD_FORMAT=${RERANKER_PAYLOAD_FORMAT:-}
+      - RERANKER_MAX_DOCUMENTS=${RERANKER_MAX_DOCUMENTS:-}
+      - RERANKER_TIMEOUT=${RERANKER_TIMEOUT:-30}
     volumes:
       - api-uploads:/app/uploads
     depends_on:
@@ -202,7 +218,14 @@ services:
       - ELASTICSEARCH__ENABLED=${ELASTICSEARCH__ENABLED:-true}
       - ELASTICSEARCH__HOSTS=${ELASTICSEARCH__HOSTS:-http://elasticsearch:9200}
       - ELASTICSEARCH__VERIFY_CERTS=${ELASTICSEARCH__VERIFY_CERTS:-false}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-1536}
       - OPENRAG_PDF_BACKEND=${OPENRAG_PDF_BACKEND:-ragflow}
+      - OPENRAG_CHUNK_SIZE=${OPENRAG_CHUNK_SIZE:-128}
+      - OPENRAG_CHUNK_OVERLAP=${OPENRAG_CHUNK_OVERLAP:-50}
+      - OPENRAG_MIN_CHUNK_TOKENS=${OPENRAG_MIN_CHUNK_TOKENS:-32}
     depends_on:
       api:
         condition: service_healthy

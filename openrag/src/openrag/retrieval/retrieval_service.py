@@ -1,6 +1,7 @@
 """Retrieval service integrating Milvus vector search with permission filtering."""
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -33,6 +34,12 @@ _LIGHT_CHUNK_MULT = 2
 
 _L1_LLM_META_APPLIED = "_l1_llm_applied"
 _L1_LLM_META_SKIP_REASON = "_l1_llm_skip_reason"
+
+
+def l0_l1_retrieval_enabled() -> bool:
+    """Return whether L0/L1 should participate in retrieval-time recall."""
+    val = os.environ.get("OPENRAG_RETRIEVAL_USE_L0_L1", "true")
+    return str(val).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _annotate_l1_llm_meta(
@@ -139,6 +146,10 @@ class RetrievalService:
         precise/flat 在开启上下文时退化为加宽 top_k 的平面切片检索。
         use_l1_llm_navigation: B7/B8，仅在上下文检索且可用 OPENAI_API_KEY 时，用 LLM 根据 L1 选择 chunk 下标并过滤向量命中。
         """
+        if not l0_l1_retrieval_enabled():
+            use_contextual = False
+            use_l1_llm_navigation = False
+
         setting = normalize_strategy(retrieval_strategy)
         strat = infer_retrieval_strategy(query) if setting == "auto" else setting
         flat_top_k = min(top_k * 2, 100) if strat == "precise" else top_k

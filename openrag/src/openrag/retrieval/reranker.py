@@ -4,10 +4,16 @@ import logging
 import os
 from typing import Optional
 
+import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+_DASHSCOPE_RERANK_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+)
+_API_RERANK_PROVIDERS = {"api", "dashscope", "dashscope_vl", "http"}
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded CrossEncoder model (sentence-transformers)
@@ -48,6 +54,143 @@ def _get_cross_encoder_model(model_name: str):
         return None
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class DashScopeRerankAdapter:
+    """DashScope HTTP adapter for qwen3-vl-rerank / qwen3-rerank."""
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        max_documents: Optional[int] = None,
+        payload_format: Optional[str] = None,
+    ):
+        self.model = model or os.environ.get("RERANKER_MODEL", "qwen3-vl-rerank")
+        self.api_key = (
+            api_key
+            or os.environ.get("RERANKER_API_KEY")
+            or os.environ.get("DASHSCOPE_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        self.base_url = (
+            base_url or os.environ.get("RERANKER_BASE_URL") or _DASHSCOPE_RERANK_URL
+        )
+        self.timeout = timeout if timeout is not None else _env_float("RERANKER_TIMEOUT", 30.0)
+        self.payload_format = (
+            payload_format
+            or os.environ.get("RERANKER_PAYLOAD_FORMAT")
+            or ("vl" if "vl" in self.model.lower() else "text")
+        ).lower()
+        default_max = 100 if self.payload_format == "vl" else 500
+        self.max_documents = max_documents or _env_int("RERANKER_MAX_DOCUMENTS", default_max)
+        self.return_documents = _env_bool("RERANKER_RETURN_DOCUMENTS", False)
+        self.instruct = os.environ.get("RERANKER_INSTRUCT")
+
+    def score(self, query: str, results: list[dict]) -> list[float]:
+        """Return relevance scores aligned with the input result order."""
+        if not results:
+            return []
+        if not self.api_key:
+            raise RuntimeError("RERANKER_API_KEY/DASHSCOPE_API_KEY/OPENAI_API_KEY is not set")
+
+        docs = results[: max(1, self.max_documents)]
+        payload = self._build_payload(query, docs)
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        ranked = self._extract_ranked_results(data)
+
+        scores = [0.0] * len(results)
+        for item in ranked:
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(docs):
+                continue
+            score = item.get("relevance_score", item.get("score", 0.0))
+            try:
+                scores[idx] = float(score)
+            except (TypeError, ValueError):
+                scores[idx] = 0.0
+        return scores
+
+    def _build_payload(self, query: str, docs: list[dict]) -> dict:
+        texts = [str(d.get("text", "") or "") for d in docs]
+        top_n = len(texts)
+        parameters = {
+            "return_documents": self.return_documents,
+            "top_n": top_n,
+        }
+        if self.instruct and self.payload_format != "vl":
+            parameters["instruct"] = self.instruct
+
+        if self.payload_format == "vl":
+            input_data = {
+                "query": {"text": query},
+                "documents": [{"text": text} for text in texts],
+            }
+        else:
+            input_data = {
+                "query": query,
+                "documents": texts,
+            }
+
+        return {
+            "model": self.model,
+            "input": input_data,
+            "parameters": parameters,
+        }
+
+    @staticmethod
+    def _extract_ranked_results(data: dict) -> list[dict]:
+        if not isinstance(data, dict):
+            return []
+        output = data.get("output")
+        if isinstance(output, dict) and isinstance(output.get("results"), list):
+            return output["results"]
+        if isinstance(data.get("results"), list):
+            return data["results"]
+        return []
+
+
 class Reranker:
     """
     Reranker that uses cross-encoder models and hierarchical information to improve ranking.
@@ -77,6 +220,18 @@ class Reranker:
         self.hierarchical_boost = hierarchical_boost
         self.position_boost = position_boost
         self._model = None
+        self.provider = os.environ.get("RERANKER_PROVIDER", "local").strip().lower()
+        api_model = os.environ.get("RERANKER_MODEL") or "qwen3-vl-rerank"
+        self._api_adapter = (
+            DashScopeRerankAdapter(model=api_model)
+            if self.provider in _API_RERANK_PROVIDERS
+            else None
+        )
+
+    @property
+    def model(self):
+        """Backward-compatible access to the lazily loaded local model."""
+        return self._model
 
     def _ensure_model(self):
         """Lazy-load the cross-encoder model on first use."""
@@ -140,6 +295,19 @@ class Reranker:
         self, query: str, results: list[dict]
     ) -> list[float]:
         """Score all query-text pairs in one batch call; fallback to keyword overlap."""
+        if self._api_adapter is not None:
+            try:
+                scores = self._api_adapter.score(query, results)
+                logger.info(
+                    "reranker api provider=%s model=%s batch=%d",
+                    self.provider,
+                    self._api_adapter.model,
+                    len(results),
+                )
+                return scores
+            except Exception as exc:
+                logger.warning("API reranker failed, falling back to local reranker: %s", exc)
+
         self._ensure_model()
 
         if self._model is not None:
@@ -169,6 +337,10 @@ class Reranker:
 
         # Fallback: keyword overlap (original mock logic)
         return [self._keyword_overlap_score(query, r.get("text", "")) for r in results]
+
+    def _compute_cross_encoder_score(self, query: str, text: str) -> float:
+        """Compatibility helper for single-pair tests and callers."""
+        return self._batch_cross_encoder_scores(query, [{"text": text}])[0]
 
     @staticmethod
     def _keyword_overlap_score(query: str, text: str) -> float:
@@ -254,8 +426,11 @@ class Reranker:
             ).scalar_one_or_none()
 
             if parent_chunk:
+                text_preview = getattr(parent_chunk, "text_preview", None)
+                if not isinstance(text_preview, str):
+                    text_preview = getattr(parent_chunk, "text", "") or ""
                 expanded_result["parent_context"] = {
-                    "text": parent_chunk.text_preview or "",
+                    "text": text_preview,
                     "level": parent_chunk.level,
                     "block_type": parent_chunk.block_type,
                 }
