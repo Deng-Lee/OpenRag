@@ -26,6 +26,7 @@ from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
 from openrag.storage.minio_storage import MinioStorage
 from openrag.database import SessionLocal, get_engine
+from openrag.tracing.context import reset_trace_context, set_trace_context
 
 import logging as _logging
 
@@ -170,6 +171,15 @@ class TaskWorker:
         """
         task_id = task["id"]
         print(f"Executing task {task_id}")
+        set_trace_context(
+            trace_id=task.get("trace_id") or uuid.uuid4().hex,
+            trace_type="document_processing",
+            workspace_id=task.get("workspace_id"),
+            user_id=task.get("user_id"),
+            file_id=task.get("file_id"),
+            task_id=str(task_id),
+            sampling_reason="worker_task",
+        )
 
         # Start heartbeat process
         heartbeat_proc = multiprocessing.Process(
@@ -220,6 +230,7 @@ class TaskWorker:
             # Stop heartbeat
             heartbeat_proc.terminate()
             heartbeat_proc.join(timeout=5)
+            reset_trace_context()
 
     def _process_document(self, task: Dict[str, Any], task_id: int) -> Dict[str, Any]:
         """Process a document task

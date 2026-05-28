@@ -20,8 +20,9 @@ OpenRag 当前已经具备文件上传、异步文档处理、文本切块、向
 第一阶段采用“PostgreSQL 索引 + MinIO Artifact”的内部 Trace Store 方案：
 
 - PostgreSQL 保存可查询、可聚合、可计算指标的数据。
-- MinIO 仅在失败、debug 或采样命中时保存较大的 artifact。
-- 默认不重复保存正文、文件内容、chunk 全文、L0/L1 内容或 embedding 向量。
+- MinIO 保存 parse 后完整文件内容的长期派生产物，以及失败、debug 或采样命中时的较大 artifact。
+- parse 后完整文件内容以 `canonical.json + canonical.md` 形式保存到 MinIO，PostgreSQL 只保存引用、hash、parser 版本和状态。
+- Trace 表不直接保存文件正文、chunk 全文、L0/L1 内容或 embedding 向量。
 - 检索质量评测以评测集为主入口，通过批量 eval run 计算真实质量指标。
 - 普通线上检索保存 trace、top50 快照和 proxy 指标，但不计算 Precision/NDCG 等需要标注的真实指标。
 - `trace_runs`、`trace_spans`、`trace_snapshots` 和大对象 artifact 统一保留 7 天。
@@ -40,14 +41,17 @@ OpenRag 当前已经具备文件上传、异步文档处理、文本切块、向
 
 ## 3. 核心原则
 
-### 3.1 能反查的数据不重复保存
+### 3.1 Trace 表不直接保存正文
 
-Trace 不做第二套业务数据仓库。凡是能从现有数据反查的内容，不在 trace 中重复保存：
+Trace 不做第二套业务数据仓库。文件正文和 chunk 全文不写入 `trace_runs`、`trace_spans` 或 `trace_snapshots`。第一阶段新增一类长期文档派生产物：parse 后完整文件内容。它不属于短期 trace artifact，而是文件处理结果的一部分，用于评测集生成、evidence anchor、重分块映射和问题排查。
+
+能从现有数据反查或从 parse 产物重建的内容，不在 trace 中重复保存：
 
 - 文件元数据从 `files` 反查。
 - 任务状态从 `tasks` 反查。
 - chunk 元数据从 `document_chunks` 反查。
-- chunk 正文从 MinIO L2 或本地层级存储反查。
+- parse 后完整文件内容从 `document_parse_artifacts` 指向的 MinIO 对象反查。
+- chunk 正文从 MinIO L2、本地层级存储，或 parse 产物加 chunk 参数重建。
 - 文件内容从 MinIO 源文件反查。
 - L0/L1/L2 层级内容从 `files.l0_path/l1_path/l2_path` 指向的 MinIO 对象反查。
 
@@ -88,11 +92,14 @@ PostgreSQL 存储：
 
 MinIO 存储：
 
+- parse 后完整文件内容：
+  - `canonical.json`：权威结构化 parse 产物，保存 blocks、页码、标题、char span、bbox、表格结构等定位信息。
+  - `canonical.md`：完整可读 parse 后文档，用于人工审核、LLM 生成 query 和排查。
 - 失败时的完整解析块快照。
 - debug 模式下的完整 `DocumentBlock` 或 OCR/layout/table 原始结构。
 - LLM 辅助标注解释等较大对象。
 
-第一阶段默认不写大对象 artifact。
+parse 后完整文件内容默认写入 MinIO，且生命周期跟随文件和 parser/source hash；短期 trace artifact 仍只在失败、debug 或采样命中时写入。
 
 ### 4.2 不选其他方案的原因
 
@@ -108,7 +115,50 @@ MinIO 存储：
 
 ## 5. 数据模型设计
 
-### 5.1 trace_runs
+### 5.1 document_parse_artifacts
+
+表示 parse 后完整文件内容的长期派生产物引用。该表不属于 7 天 trace 清理范围。
+
+MinIO 对象建议路径：
+
+```text
+parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}/canonical.json
+parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}/canonical.md
+```
+
+`canonical.json` 是权威结构化产物，必须保存；`canonical.md` 是完整可读产物，必须保存；`canonical.txt` 不作为主产物，需要纯文本时可由前两者派生。
+
+关键字段：
+
+- `id`
+- `artifact_id`
+- `file_id`
+- `workspace_id`
+- `source_doc_hash`
+- `parser_name`
+- `parser_version`
+- `canonical_text_hash`
+- `canonical_json_bucket`
+- `canonical_json_object_key`
+- `canonical_json_size_bytes`
+- `canonical_md_bucket`
+- `canonical_md_object_key`
+- `canonical_md_size_bytes`
+- `block_count`
+- `page_count`
+- `block_type_counts`
+- `status`
+- `error_message`
+- `created_at`
+- `updated_at`
+
+索引建议：
+
+- `(file_id, source_doc_hash, parser_name, parser_version)` 唯一索引
+- `(workspace_id, created_at)`
+- `(canonical_text_hash)`
+
+### 5.2 trace_runs
 
 表示一次完整链路。第一阶段主要包括：
 
@@ -151,7 +201,7 @@ MinIO 存储：
 - `(eval_run_id, eval_query_id)`
 - `(query_hash, created_at)`
 
-### 5.2 trace_spans
+### 5.3 trace_spans
 
 表示链路中的阶段步骤。
 
@@ -182,7 +232,7 @@ MinIO 存储：
 - `(trace_id, stage)`
 - `(stage, created_at)`
 
-### 5.3 trace_snapshots
+### 5.4 trace_snapshots
 
 保存检索、融合、重排阶段 top50 紧凑快照。该表独立于 `trace_spans.metrics`，便于按 `chunk_id`、`stage`、`rank`、`score` 查询和诊断。
 
@@ -225,9 +275,9 @@ MinIO 存储：
 - `(chunk_id, created_at)`
 - `(file_id, created_at)`
 
-### 5.4 trace_artifacts
+### 5.5 trace_artifacts
 
-保存大对象引用，不保存正文内容本身。
+保存短期大对象引用，不保存长期 parse 后完整文件内容。parse 后完整内容使用 `document_parse_artifacts`。
 
 关键字段：
 
@@ -247,7 +297,7 @@ MinIO 存储：
 
 Artifact 默认只在失败、debug 开关、采样命中或指定 workspace/query 时保存。
 
-### 5.5 eval_datasets
+### 5.6 eval_datasets
 
 表示一套评测集。
 
@@ -263,7 +313,7 @@ Artifact 默认只在失败、debug 开关、采样命中或指定 workspace/que
 - `created_at`
 - `updated_at`
 
-### 5.6 eval_queries
+### 5.7 eval_queries
 
 表示评测 query。
 
@@ -279,7 +329,7 @@ Artifact 默认只在失败、debug 开关、采样命中或指定 workspace/que
 - `created_at`
 - `updated_at`
 
-### 5.7 eval_judgments
+### 5.8 eval_judgments
 
 表示 query 与 chunk/file 的相关性标注。
 
@@ -321,7 +371,7 @@ ABC 三路统一使用 0-3 相关性等级：
 
 权重应配置化，不在指标计算逻辑中写死。
 
-### 5.8 eval_runs
+### 5.9 eval_runs
 
 表示一次评测执行。
 
@@ -340,7 +390,7 @@ ABC 三路统一使用 0-3 相关性等级：
 - `metadata`
 - `created_at`
 
-### 5.9 eval_results
+### 5.10 eval_results
 
 保存评测结果。可以按 eval run 汇总，也可以按 eval query 保存明细。
 
@@ -385,6 +435,7 @@ ABC 三路统一使用 0-3 相关性等级：
 
 第一版 migration 应创建：
 
+- `document_parse_artifacts`
 - `trace_runs`
 - `trace_spans`
 - `trace_snapshots`
@@ -479,7 +530,7 @@ Span：
 - `file_id`、`task_id`、`task_type`。
 - 必要的粗粒度耗时和失败原因。
 
-不保存文件内容。
+上传 trace 不保存文件内容本身；源文件仍保存在既有对象存储，parse 后完整内容在文档处理阶段另存为 `canonical.json` / `canonical.md`。
 
 ### 8.2 文档处理链路
 
@@ -503,6 +554,7 @@ Span：
 
 - `parse.document` 的耗时只包括 `parser.parse()` 从开始到结束的执行时间，不包含任务等待时间或 worker 下载时间。
 - parser 实际类、parser_type、block_count、page_count、block_type 分布。
+- parse 成功后保存 `canonical.json` 和 `canonical.md` 到 MinIO，并在 `document_parse_artifacts` 中记录 object key、hash、parser 版本、block_count、page_count 和状态。
 - chunk_method、chunk_size、overlap、min_chunk_tokens。
 - chunk_count、token min/max/mean、短 chunk 数、空 chunk 数、page/bbox 覆盖率。
 - embedding model、dimension、batch_size、batch_count、chunk_count、成功/失败数。
@@ -515,7 +567,7 @@ Span：
 - 任务等待时间。
 - 父目录层级传播指标。
 - L0/L1 指标。
-- 完整 `DocumentBlock` 默认快照。
+- 完整 `DocumentBlock` 默认不写入短期 trace artifact。结构化 blocks 已作为 `canonical.json` 长期保存；短期 trace artifact 只用于失败、debug 或采样命中场景。
 - embedding 向量。
 
 ### 8.3 检索链路
@@ -727,6 +779,8 @@ proxy 指标不能替代 Precision/NDCG，只用于异常观察。
 
 长期保留：
 
+- `document_parse_artifacts`
+- MinIO parse 产物 `canonical.json` / `canonical.md`
 - `eval_datasets`
 - `eval_queries`
 - `eval_judgments`
@@ -790,12 +844,14 @@ Trace 写入不能影响主链路：
 - 能计算 `Precision@K`、`Recall@K`、`HitRate@K`、`MRR@50`、`MAP@50`、`NDCG@K`。
 - 能计算 rerank 前后质量变化。
 - 能比较不同参数组合的 eval run。
+- 能保存 parse 后完整文件内容为 MinIO 中的 `canonical.json` 和 `canonical.md`，并通过 `document_parse_artifacts` 反查。
 - trace 相关数据和 artifact 统一 7 天清理。
+- parse 产物不参与 7 天 trace 清理，生命周期跟随文件和 parser/source hash。
 - trace/eval 新表有 Alembic migration，生产部署可通过 `alembic upgrade head` 创建或升级 schema。
 - trace 采集通过 `contextvars` 和 Trace service 传播上下文，不在主要业务函数签名中层层增加 `trace_id` 参数。
 - 不记录 L0/L1 指标。
 - 不做权限诊断。
-- 不重复保存文件正文、chunk 正文、L0/L1 内容或 embedding 向量。
+- Trace 表不直接保存文件正文、chunk 正文、L0/L1 内容或 embedding 向量。
 
 ## 17. 后续演进
 

@@ -17,7 +17,7 @@
 整体流程分五步：
 
 1. 建立 392 个文件的 corpus manifest，明确文件来源、格式、hash 和可读取位置。
-2. 解析 392 个文件，形成可复用的规范化文档视图和 evidence span 定位能力。
+2. 解析 392 个文件，将 parse 后完整文件内容保存为 MinIO `canonical.json + canonical.md`，并形成可复用的规范化文档视图和 evidence span 定位能力。
 3. 让 LLM 基于文档、章节、段落或证据片段生成 60-70 条原始候选 query。
 4. 人工审核并保留 50 条 approved query，同时补齐源文档 evidence span 锚点。
 5. 将 evidence span 映射到 2-3 组分块参数下的 chunk，再运行 mini eval。
@@ -692,17 +692,23 @@ LLM 可以负责生成候选 query，但第一轮 50 条必须人工审核。人
 - 输入：`docs/eval/corpus_manifest.2026-05-27.json`
 - 参考：`openrag/src/openrag/processors/document_processor.py`
 - 参考：`openrag/src/openrag/parsers/`
-- 产出：`docs/eval/canonical_docs.2026-05-27.jsonl`
+- 产出：MinIO `parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}/canonical.json`
+- 产出：MinIO `parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}/canonical.md`
+- 产出：`docs/eval/canonical_docs.2026-05-27.jsonl`，只保存 parse 产物引用和定位索引摘要，不作为唯一完整正文存储。
 
 - [ ] 对 `include_in_eval=true` 的文件执行 parse。
 - [ ] 为每个文件记录 parser 名称、parser 版本、解析时间、解析状态、失败原因。
-- [ ] 导出规范化文档视图，每行至少包含 `corpus_file_id`、`file_id`、`source_doc_hash`、`canonical_text_hash`、`parser_name`、`parser_version`。
+- [ ] 将 parse 后完整文件内容保存为 `canonical.json` 和 `canonical.md`。
+- [ ] `canonical.json` 保存权威结构化 blocks、页码、标题、char span、bbox、表格结构和 block_type。
+- [ ] `canonical.md` 保存完整可读 parse 后文档，用于人工审核、LLM 生成 query 和排查。
+- [ ] 导出规范化文档视图引用索引，每行至少包含 `corpus_file_id`、`file_id`、`source_doc_hash`、`canonical_text_hash`、`parser_name`、`parser_version`、`canonical_json_object_key`、`canonical_md_object_key`。
 - [ ] 导出可定位 block 或 paragraph，至少包含 `block_id`、`text`、`page_number`、`section_heading`、`char_start`、`char_end`；PDF/OCR 有 bbox 时同时保存 `bbox`。
 - [ ] 对解析失败文件写入 `parse_status=failed` 和 `parse_error`，不要静默跳过。
 
 验证：
 
 - 每个 `include_in_eval=true` 文件都有一条 canonical doc 记录。
+- 每个成功解析文件都有 MinIO `canonical.json` 和 `canonical.md`。
 - 每个成功解析的文件至少有一种 evidence locator：`char_start/char_end`、`page_number + bbox`、`block_id/paragraph_index` 或 `evidence_quote + quote_before/quote_after`。
 - `source_doc_hash` 与 manifest 一致。
 - 解析失败文件数量和原因可汇总。
