@@ -275,14 +275,14 @@ parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}
 - 修改：`openrag/src/openrag/search/es_chunk_store.py`
 - 测试：`openrag/tests/test_retrieval_trace.py`
 
-- [ ] 在 `retrieval.request` span 记录 `query_hash`、`query_preview`、`workspace_id`、`top_k`、`use_rerank`、`vector_similarity_weight`、`retrieval_strategy`。
-- [ ] 在 `retrieval.embed_query` span 记录 embedding model、dimension、是否成功。
-- [ ] 在 `retrieval.chunk_search` 阶段保存 chunk recall top50：`rank`、`chunk_id`、`file_id`、`vector_score`。
-- [ ] 在 `retrieval.es_fusion` 阶段保存 fusion input/output top50：`vector_score`、`bm25_score`、`fused_score`。
-- [ ] 在 `retrieval.rerank` 阶段保存 rerank input/output top50：`original_rank`、`fused_score`、`rerank_score`、`rank_delta`。
-- [ ] 在 `retrieval.response` span 记录 final result count、zero_hit、top50 source file count、fusion overlap、rerank overlap。
-- [ ] 不保存 query 正文以外的敏感上下文，不保存 chunk 正文。
-- [ ] L0/L1 关闭时不产生 L0/L1 指标。
+- [x] 在 `retrieval.request` span 记录 `query_hash`、`query_preview`、`workspace_id`、`top_k`、`use_rerank`、`vector_similarity_weight`、`retrieval_strategy`。
+- [x] 在 `retrieval.embed_query` span 记录 embedding model、dimension、是否成功。
+- [x] 在 `retrieval.chunk_search` 阶段保存 chunk recall top50：`rank`、`chunk_id`、`file_id`、`vector_score`。
+- [x] 在 `retrieval.es_fusion` 阶段保存 fusion input/output top50：`vector_score`、`bm25_score`、`fused_score`。
+- [x] 在 `retrieval.rerank` 阶段保存 rerank input/output top50：`original_rank`、`fused_score`、`rerank_score`、`rank_delta`。
+- [x] 在 `retrieval.response` span 记录 final result count、zero_hit、top50 source file count、fusion overlap、rerank overlap。
+- [x] 不保存 query 正文以外的敏感上下文，不保存 chunk 正文。
+- [x] L0/L1 关闭时不产生 L0/L1 指标。
 
 验证：
 
@@ -290,6 +290,19 @@ parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}
 - rerank on/off 都有可解释快照。
 - ES 不可用时 trace 记录 skip reason，但搜索正常降级。
 - `pytest openrag/tests/test_retrieval_trace.py -v` 通过。
+
+### Task 6 执行进度与结论
+
+- 实现日期：2026-05-28。
+- 实现代理：`019e6c84-cce2-76c3-a48c-525267c8beda`。
+- 验证代理：Task6 验证 subagent。
+- 验证命令结果：
+  - `cd openrag; python -m pytest tests/test_retrieval_trace.py -v`：通过，`2 passed, 5 warnings in 1.43s`。
+  - `cd openrag; python -m pytest tests/test_reranker.py -v`：通过，`17 passed in 0.56s`。
+  - trace commit 失败模拟脚本：通过，搜索仍返回 `trace_commit_failure_search_total=1`。
+  - `git diff --check`：退出码 0，仅提示既有 CRLF warning。
+- 结论：Task6 已完成并通过独立验证。普通搜索可生成 `retrieval` trace、request/embed/chunk_search/es_fusion/rerank/response spans 与 top50 snapshots；ES 不可用时记录 `skip_reason` 并正常降级；快照不保存 chunk 正文，ES 分数查询使用 `_source=False`；L0/L1 关闭时未产生 L0/L1 指标；trace commit 失败不会阻断搜索主链路。
+- 遗留风险：测试输出仍包含既有 Pydantic v2 与 FastAPI `on_event` deprecation warnings；工作区存在用户侧 `docs/eval/*` 未提交/未跟踪改动，本次验证未触碰、未暂存；`git diff --check` 仍有 CRLF 提示。
 
 ---
 

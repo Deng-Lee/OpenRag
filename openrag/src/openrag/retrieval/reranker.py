@@ -8,6 +8,8 @@ import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from openrag.services.trace_service import TraceService
+
 logger = logging.getLogger(__name__)
 
 _DASHSCOPE_RERANK_URL = (
@@ -238,7 +240,13 @@ class Reranker:
         if self._model is None:
             self._model = _get_cross_encoder_model(self.model_name)
 
-    def rerank(self, query: str, results: list[dict], top_k: int = 10) -> list[dict]:
+    def rerank(
+        self,
+        query: str,
+        results: list[dict],
+        top_k: int = 10,
+        trace_service: Optional[TraceService] = None,
+    ) -> list[dict]:
         """
         Rerank results using cross-encoder and hierarchical/position boosts.
 
@@ -253,8 +261,24 @@ class Reranker:
         if not results:
             return []
 
+        trace_service = trace_service or _NullTraceService()
+        trace_service.start_span(
+            "retrieval.rerank",
+            input_summary={
+                "model": self.model_name,
+                "provider": self.provider,
+                "candidate_count": len(results),
+                "top_k": top_k,
+            },
+        )
+        _record_rerank_snapshots(trace_service, results, phase="input")
+
         # Compute reranked scores for each result
-        cross_scores = self._batch_cross_encoder_scores(query, results)
+        try:
+            cross_scores = self._batch_cross_encoder_scores(query, results)
+        except Exception as exc:
+            trace_service.fail_span(error_message=str(exc))
+            raise
 
         reranked_results = []
         for i, result in enumerate(results):
@@ -285,7 +309,15 @@ class Reranker:
         reranked_results.sort(key=lambda x: x["reranked_score"], reverse=True)
 
         # Return top_k results
-        return reranked_results[:top_k]
+        final_results = reranked_results[:top_k]
+        _record_rerank_snapshots(
+            trace_service,
+            final_results,
+            phase="output",
+            original_rank_by_chunk_id=_original_rank_by_chunk_id(results),
+        )
+        trace_service.finish_span(output_summary={"result_count": len(final_results)})
+        return final_results
 
     # ------------------------------------------------------------------
     # Cross-encoder scoring: real model with keyword fallback
@@ -441,3 +473,78 @@ class Reranker:
             expanded_result["parent_context"] = None
 
         return expanded_result
+
+
+class _NullTraceService:
+    def start_span(self, *args, **kwargs):
+        return None
+
+    def finish_span(self, *args, **kwargs):
+        return None
+
+    def fail_span(self, *args, **kwargs):
+        return None
+
+    def record_snapshot(self, *args, **kwargs):
+        return None
+
+
+def _record_rerank_snapshots(
+    trace_service,
+    results: list[dict],
+    *,
+    phase: str,
+    original_rank_by_chunk_id: Optional[dict[str, int]] = None,
+) -> None:
+    for rank, result in enumerate(results[:50], start=1):
+        chunk_id = result.get("chunk_id")
+        chunk_key = str(chunk_id) if chunk_id is not None else None
+        original_rank = (
+            original_rank_by_chunk_id.get(chunk_key, rank)
+            if original_rank_by_chunk_id is not None and chunk_key is not None
+            else rank
+        )
+        rerank_score = result.get("reranked_score")
+        trace_service.record_snapshot(
+            stage="retrieval.rerank",
+            rank=rank,
+            chunk_id=chunk_key,
+            file_id=_safe_int(result.get("file_id")),
+            score=_safe_float(rerank_score),
+            score_parts={
+                "fused_score": _safe_float(result.get("fused_score", result.get("score"))),
+                "rerank_score": _safe_float(rerank_score),
+            },
+            metadata={
+                "phase": phase,
+                "original_rank": original_rank,
+                "rank_delta": original_rank - rank,
+            },
+        )
+
+
+def _original_rank_by_chunk_id(results: list[dict]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for rank, result in enumerate(results, start=1):
+        chunk_id = result.get("chunk_id")
+        if chunk_id is not None:
+            out[str(chunk_id)] = rank
+    return out
+
+
+def _safe_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

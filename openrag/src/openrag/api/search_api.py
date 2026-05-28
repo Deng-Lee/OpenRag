@@ -1,7 +1,9 @@
 """Search API endpoints with permission checks and reranking."""
 
+import hashlib
 import logging
 import time
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from openrag.database import get_db
+from openrag.models import TraceRun
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel
 from openrag.embedding.embedding_engine import EmbeddingEngine
@@ -17,6 +20,8 @@ from openrag.retrieval.retrieval_service import (
     RetrievalService,
     l0_l1_retrieval_enabled,
 )
+from openrag.services.trace_service import TraceService
+from openrag.tracing.context import get_trace_context, set_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +243,12 @@ def _execute_search(
     rerank_hierarchical_boost: Optional[float],
 ) -> SearchResponse:
     start = time.time()
+    trace_service, started_trace_run = _prepare_retrieval_trace(
+        db=db,
+        user_id=user_id,
+        request=request,
+        endpoint=endpoint,
+    )
     svc = RetrievalService(
         db=db,
         embedding_engine=_get_embedding_engine(),
@@ -246,114 +257,136 @@ def _execute_search(
         fulltext_store=_get_fulltext_store(),
     )
 
-    hierarchy_enabled = l0_l1_retrieval_enabled()
-    use_contextual_retrieval = request.use_contextual_retrieval and hierarchy_enabled
-    use_l1_llm_navigation = request.use_l1_llm_navigation and hierarchy_enabled
-    is_hierarchical = endpoint == "hierarchical"
-    force_contextual = (
-        hierarchy_enabled and is_hierarchical and not request.use_contextual_retrieval
-    )
-    effective_hierarchical_boost = (
-        rerank_hierarchical_boost if hierarchy_enabled else None
-    )
-
-    if use_contextual_retrieval or force_contextual:
-        results = svc.search(
-            query=request.query,
-            user_id=user_id,
-            workspace_id=request.workspace_id,
-            top_k=request.top_k,
-            use_contextual=True,
-            contextual_l0_top_n=request.contextual_l0_top_n,
-            contextual_l1_top_n=request.contextual_l1_top_n,
-            contextual_chunk_fetch_multiplier=request.contextual_chunk_fetch_multiplier,
-            retrieval_strategy=request.retrieval_strategy,
-            use_l1_llm_navigation=use_l1_llm_navigation,
-            vector_similarity_weight=request.vector_similarity_weight,
+    try:
+        hierarchy_enabled = l0_l1_retrieval_enabled()
+        use_contextual_retrieval = request.use_contextual_retrieval and hierarchy_enabled
+        use_l1_llm_navigation = request.use_l1_llm_navigation and hierarchy_enabled
+        is_hierarchical = endpoint == "hierarchical"
+        force_contextual = (
+            hierarchy_enabled and is_hierarchical and not request.use_contextual_retrieval
         )
-    else:
-        fetch_k = request.top_k * 3 if request.use_rerank else request.top_k
-        results = svc.search(
-            query=request.query,
-            user_id=user_id,
-            workspace_id=request.workspace_id,
-            top_k=fetch_k,
-            use_contextual=False,
-            retrieval_strategy=request.retrieval_strategy,
-            use_l1_llm_navigation=False,
-            vector_similarity_weight=request.vector_similarity_weight,
+        effective_hierarchical_boost = (
+            rerank_hierarchical_boost if hierarchy_enabled else None
         )
 
-        if request.use_rerank and results:
-            if effective_hierarchical_boost is not None:
-                reranker = Reranker(hierarchical_boost=effective_hierarchical_boost)
-            else:
-                reranker = Reranker()
-            results = reranker.rerank(request.query, results, top_k=request.top_k)
+        if use_contextual_retrieval or force_contextual:
+            results = svc.search(
+                query=request.query,
+                user_id=user_id,
+                workspace_id=request.workspace_id,
+                top_k=request.top_k,
+                use_contextual=True,
+                contextual_l0_top_n=request.contextual_l0_top_n,
+                contextual_l1_top_n=request.contextual_l1_top_n,
+                contextual_chunk_fetch_multiplier=request.contextual_chunk_fetch_multiplier,
+                retrieval_strategy=request.retrieval_strategy,
+                use_l1_llm_navigation=use_l1_llm_navigation,
+                vector_similarity_weight=request.vector_similarity_weight,
+            )
         else:
-            results = results[: request.top_k]
+            fetch_k = request.top_k * 3 if request.use_rerank else request.top_k
+            results = svc.search(
+                query=request.query,
+                user_id=user_id,
+                workspace_id=request.workspace_id,
+                top_k=fetch_k,
+                use_contextual=False,
+                retrieval_strategy=request.retrieval_strategy,
+                use_l1_llm_navigation=False,
+                vector_similarity_weight=request.vector_similarity_weight,
+            )
 
-    use_fused_scores = (use_contextual_retrieval or force_contextual) and bool(
-        results
-    )
-    if (
-        not use_contextual_retrieval
-        and not force_contextual
-        and request.vector_similarity_weight < 1.0 - 1e-12
-        and bool(results)
-    ):
-        use_fused_scores = True
-    formatted = _format(results, reranked=use_fused_scores or request.use_rerank)
-    elapsed_ms = (time.time() - start) * 1000
+            pre_rerank_results = list(results)
+            if request.use_rerank and results:
+                if effective_hierarchical_boost is not None:
+                    reranker = Reranker(hierarchical_boost=effective_hierarchical_boost)
+                else:
+                    reranker = Reranker()
+                results = reranker.rerank(
+                    request.query,
+                    results,
+                    top_k=request.top_k,
+                    trace_service=trace_service,
+                )
+            else:
+                results = results[: request.top_k]
 
-    l1_llm_applied = None
-    l1_llm_skip_reason = None
-    if results:
-        first = results[0]
-        l1_llm_applied = first.get("_l1_llm_applied")
-        l1_llm_skip_reason = first.get("_l1_llm_skip_reason")
+        if use_contextual_retrieval or force_contextual:
+            pre_rerank_results = list(results)
 
-    strat_resolved = None
-    if results:
-        strat_resolved = next(
-            (
-                r.get("retrieval_strategy")
-                for r in results
-                if r.get("retrieval_strategy")
-            ),
-            None,
+        use_fused_scores = (use_contextual_retrieval or force_contextual) and bool(
+            results
         )
-    modes = {r.get("retrieval_mode") for r in results if r.get("retrieval_mode")}
-    l1_llm_hits = sum(1 for r in results if r.get("l1_llm_filtered"))
+        if (
+            not use_contextual_retrieval
+            and not force_contextual
+            and request.vector_similarity_weight < 1.0 - 1e-12
+            and bool(results)
+        ):
+            use_fused_scores = True
+        formatted = _format(results, reranked=use_fused_scores or request.use_rerank)
+        elapsed_ms = (time.time() - start) * 1000
 
-    logger.info(
-        "retrieval_complete endpoint=%s workspace_id=%s contextual=%s "
-        "force_contextual=%s strategy_req=%s strategy_resolved=%s "
-        "use_l1_llm_req=%s l1_llm_applied=%s l1_llm_skip=%s "
-        "hits=%d l1_llm_hits=%d modes=%s rerank=%s ms=%.2f",
-        endpoint,
-        request.workspace_id,
-        use_contextual_retrieval,
-        force_contextual,
-        request.retrieval_strategy,
-        strat_resolved,
-        use_l1_llm_navigation,
-        l1_llm_applied,
-        l1_llm_skip_reason,
-        len(formatted),
-        l1_llm_hits,
-        ",".join(sorted(str(m) for m in modes if m)) if modes else "-",
-        request.use_rerank,
-        elapsed_ms,
-    )
+        l1_llm_applied = None
+        l1_llm_skip_reason = None
+        if results:
+            first = results[0]
+            l1_llm_applied = first.get("_l1_llm_applied")
+            l1_llm_skip_reason = first.get("_l1_llm_skip_reason")
 
-    return SearchResponse(
-        results=formatted,
-        total=len(formatted),
-        query_time_ms=elapsed_ms,
-        l1_llm_applied=l1_llm_applied,
-        l1_llm_skip_reason=l1_llm_skip_reason,
-    )
+        strat_resolved = None
+        if results:
+            strat_resolved = next(
+                (
+                    r.get("retrieval_strategy")
+                    for r in results
+                    if r.get("retrieval_strategy")
+                ),
+                None,
+            )
+        modes = {r.get("retrieval_mode") for r in results if r.get("retrieval_mode")}
+        l1_llm_hits = sum(1 for r in results if r.get("l1_llm_filtered"))
+
+        logger.info(
+            "retrieval_complete endpoint=%s workspace_id=%s contextual=%s "
+            "force_contextual=%s strategy_req=%s strategy_resolved=%s "
+            "use_l1_llm_req=%s l1_llm_applied=%s l1_llm_skip=%s "
+            "hits=%d l1_llm_hits=%d modes=%s rerank=%s ms=%.2f",
+            endpoint,
+            request.workspace_id,
+            use_contextual_retrieval,
+            force_contextual,
+            request.retrieval_strategy,
+            strat_resolved,
+            use_l1_llm_navigation,
+            l1_llm_applied,
+            l1_llm_skip_reason,
+            len(formatted),
+            l1_llm_hits,
+            ",".join(sorted(str(m) for m in modes if m)) if modes else "-",
+            request.use_rerank,
+            elapsed_ms,
+        )
+
+        _record_response_trace(
+            trace_service,
+            final_results=results,
+            pre_rerank_results=pre_rerank_results,
+        )
+        if started_trace_run:
+            trace_service.finish_run()
+
+        return SearchResponse(
+            results=formatted,
+            total=len(formatted),
+            query_time_ms=elapsed_ms,
+            l1_llm_applied=l1_llm_applied,
+            l1_llm_skip_reason=l1_llm_skip_reason,
+        )
+    except Exception as exc:
+        if started_trace_run:
+            trace_service.fail_run(error_stage="retrieval", error_message=str(exc))
+        raise
 
 
 @router.post("/semantic", response_model=SearchResponse)
@@ -440,6 +473,104 @@ def _format(results: list[dict], reranked: bool = False) -> list[SearchResult]:
             )
         )
     return out
+
+
+def _prepare_retrieval_trace(
+    *,
+    db: Session,
+    user_id: int,
+    request: SearchRequest,
+    endpoint: str,
+) -> tuple[TraceService, bool]:
+    trace_service = TraceService(db)
+    query_hash = _query_hash(request.query)
+    query_preview = _preview_query(request.query)
+    ctx = get_trace_context()
+    trace_id = ctx["trace_id"] or uuid.uuid4().hex
+    trace_type = ctx["trace_type"] or "retrieval"
+    set_trace_context(
+        trace_id=trace_id,
+        trace_type=trace_type,
+        workspace_id=request.workspace_id,
+        user_id=user_id,
+    )
+
+    started_run = False
+    if trace_type == "retrieval":
+        existing = db.query(TraceRun).filter(TraceRun.trace_id == trace_id).first()
+        if existing is None:
+            trace_service.start_run(
+                trace_type="retrieval",
+                trace_id=trace_id,
+                workspace_id=request.workspace_id,
+                user_id=user_id,
+                query_hash=query_hash,
+                query_preview=query_preview,
+                sampling_reason=ctx["sampling_reason"] or "search_api",
+                search_config_snapshot={
+                    "endpoint": endpoint,
+                    "top_k": request.top_k,
+                    "use_rerank": request.use_rerank,
+                    "use_contextual_retrieval": request.use_contextual_retrieval,
+                    "retrieval_strategy": request.retrieval_strategy,
+                    "vector_similarity_weight": request.vector_similarity_weight,
+                },
+            )
+            started_run = True
+
+    trace_service.start_span(
+        "retrieval.request",
+        input_summary={
+            "query_hash": query_hash,
+            "query_preview": query_preview,
+            "workspace_id": request.workspace_id,
+            "top_k": request.top_k,
+            "use_rerank": request.use_rerank,
+            "vector_similarity_weight": request.vector_similarity_weight,
+            "retrieval_strategy": request.retrieval_strategy,
+        },
+    )
+    trace_service.finish_span(output_summary={"endpoint": endpoint})
+    return trace_service, started_run
+
+
+def _record_response_trace(
+    trace_service: TraceService,
+    *,
+    final_results: list[dict],
+    pre_rerank_results: list[dict],
+) -> None:
+    final_top50 = final_results[:50]
+    pre_top50 = pre_rerank_results[:50]
+    output_summary = {
+        "final_result_count": len(final_results),
+        "zero_hit": len(final_results) == 0,
+        "top50_source_file_count": len(
+            {r.get("file_id") for r in final_top50 if r.get("file_id") is not None}
+        ),
+        "fusion_overlap": _chunk_overlap(pre_top50, final_top50),
+        "rerank_overlap": _chunk_overlap(pre_top50, final_top50),
+    }
+    trace_service.start_span("retrieval.response")
+    trace_service.finish_span(output_summary=output_summary)
+
+
+def _chunk_overlap(left: list[dict], right: list[dict]) -> int:
+    left_ids = {str(r.get("chunk_id")) for r in left if r.get("chunk_id")}
+    right_ids = {str(r.get("chunk_id")) for r in right if r.get("chunk_id")}
+    return len(left_ids & right_ids)
+
+
+def _query_hash(query: str) -> str:
+    normalized = " ".join((query or "").split()).lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _preview_query(query: str, max_len: int = 512) -> str:
+    normalized = " ".join((query or "").split())
+    if len(normalized) <= max_len:
+        return normalized
+    return normalized[: max_len - 1] + "..."
 
 
 @router.get("/chunks/{chunk_id}", response_model=ChunkContextResponse)
