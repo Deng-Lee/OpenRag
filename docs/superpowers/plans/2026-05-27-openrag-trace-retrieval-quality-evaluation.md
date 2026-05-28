@@ -238,20 +238,31 @@ parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}
 - 测试：`openrag/tests/test_traces_api.py`
 - 测试：`openrag/tests/test_eval_api.py`
 
-- [ ] 新增 `GET /traces`，支持按 `trace_type`、`workspace_id`、`file_id`、`task_id`、`eval_run_id`、`eval_query_id`、`query_hash`、时间范围筛选。
-- [ ] 新增 `GET /traces/{trace_id}`，返回 run、spans 和基础错误信息。
-- [ ] 新增 `GET /traces/{trace_id}/snapshots`，支持按 stage 返回 top50 快照。
-- [ ] 新增 `POST /eval/datasets`、`GET /eval/datasets`、`GET /eval/datasets/{id}`。
-- [ ] 新增 `POST /eval/queries`、`POST /eval/judgments`、`POST /eval/import`。
-- [ ] 新增 `POST /eval/runs`、`GET /eval/runs`、`GET /eval/runs/{id}`、`GET /eval/runs/{id}/results`。
-- [ ] 新增 `GET /eval/runs/{id}/compare?baseline_id=...`，返回两个 eval run 的 summary diff。
-- [ ] 第一版 API 返回 JSON 即可，不做前端页面。
+- [x] 新增 `GET /traces`，支持按 `trace_type`、`workspace_id`、`file_id`、`task_id`、`eval_run_id`、`eval_query_id`、`query_hash`、时间范围筛选。
+- [x] 新增 `GET /traces/{trace_id}`，返回 run、spans 和基础错误信息。
+- [x] 新增 `GET /traces/{trace_id}/snapshots`，支持按 stage 返回 top50 快照。
+- [x] 新增 `POST /eval/datasets`、`GET /eval/datasets`、`GET /eval/datasets/{id}`。
+- [x] 新增 `POST /eval/queries`、`POST /eval/judgments`、`POST /eval/import`。
+- [x] 新增 `POST /eval/runs`、`GET /eval/runs`、`GET /eval/runs/{id}`、`GET /eval/runs/{id}/results`。
+- [x] 新增 `GET /eval/runs/{id}/compare?baseline_id=...`，返回两个 eval run 的 summary diff。
+- [x] 第一版 API 返回 JSON 即可，不做前端页面。
 
 验证：
 
 - API 鉴权沿用现有 dependency。
 - `pytest openrag/tests/test_traces_api.py openrag/tests/test_eval_api.py -v` 通过。
 - `GET /openapi.json` 能包含 trace/eval 路由。
+
+### Task 5 执行进度与结论
+
+- 实现日期：2026-05-28。
+- 实现代理：`019e6c7b-88a5-74d1-9a4b-0b302709cd84`。
+- 验证代理：Task5 验证 subagent。
+- 验证命令结果：
+  - `cd openrag; python -m pytest tests/test_traces_api.py tests/test_eval_api.py -v`：通过，`5 passed, 5 warnings in 1.77s`。
+  - `git diff --check`：退出码 0，仅提示 `docs/eval/foreign_exchange_file_word_summary.md` 与 `openrag/src/openrag/api/main.py` 未来可能被 Git 转为 CRLF。
+- 结论：Task5 已完成并通过独立验证。`/traces`、`/traces/{trace_id}`、`/traces/{trace_id}/snapshots`、eval dataset/query/judgment/import/run/results/compare API 均已实现；鉴权与 DB session 沿用现有 FastAPI dependency；`GET /openapi.json` 已覆盖 trace/eval 路由。
+- 遗留风险：测试输出仍包含既有 Pydantic v2 与 FastAPI `on_event` deprecation warnings；工作区存在用户侧 `docs/eval/*` 未提交改动，本次验证未触碰、未暂存。
 
 ---
 

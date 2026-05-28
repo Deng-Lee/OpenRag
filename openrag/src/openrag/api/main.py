@@ -29,6 +29,8 @@ from openrag.api.service_api import router as service_router
 from openrag.api.service_tokens_admin import router as service_tokens_admin_router
 from openrag.api.permissions_api import router as file_permissions_router
 from openrag.api.permissions_api import user_permissions_router
+from openrag.api.traces_api import router as traces_router
+from openrag.api.eval_api import router as eval_router
 from openrag.config import get_config
 from openrag.tracing.context import reset_trace_context, set_trace_context
 
@@ -217,6 +219,8 @@ app.include_router(service_tokens_admin_router)
 app.include_router(roles_router)
 app.include_router(file_permissions_router)
 app.include_router(user_permissions_router)
+app.include_router(traces_router)
+app.include_router(eval_router)
 
 
 # Startup Event
