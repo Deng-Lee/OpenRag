@@ -317,21 +317,21 @@ parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}
 - 测试：`openrag/tests/test_document_processing_trace.py`
 - 测试：`openrag/tests/test_parse_artifact_service.py`
 
-- [ ] 上传链路记录 `upload.validate`、`upload.store_minio`、`upload.create_records` span。
-- [ ] 文档处理链路记录 `worker.download_file`、`parse.document`、`parsed_artifacts.persist`、`chunk.build`、`embedding.chunks`、`vector.milvus_insert`、`fulltext.es_index`、`storage.save_chunks`、`metadata.persist_chunks` span。
-- [ ] `parse.document.duration_ms` 只统计 `parser.parse()` 开始到结束，不包含任务等待或 worker 下载时间。
-- [ ] `parse_artifact_service.py` 将 parse 后完整内容写入 MinIO：
+- [x] 上传链路记录 `upload.validate`、`upload.store_minio`、`upload.create_records` span。
+- [x] 文档处理链路记录 `worker.download_file`、`parse.document`、`parsed_artifacts.persist`、`chunk.build`、`embedding.chunks`、`vector.milvus_insert`、`fulltext.es_index`、`storage.save_chunks`、`metadata.persist_chunks` span。
+- [x] `parse.document.duration_ms` 只统计 `parser.parse()` 开始到结束，不包含任务等待或 worker 下载时间。
+- [x] `parse_artifact_service.py` 将 parse 后完整内容写入 MinIO：
   - `canonical.json`：权威结构化产物，包含 blocks、页码、标题、char span、bbox、表格结构和 block_type。
   - `canonical.md`：完整可读 parse 后文档，保留标题、段落、列表、表格和页码标记。
-- [ ] `parsed_artifacts.persist` span 记录 `canonical_json_object_key`、`canonical_md_object_key`、`canonical_text_hash`、`block_count`、`page_count`、`size_bytes` 和写入状态；不把正文写入 span。
-- [ ] 在 `document_parse_artifacts` 中 upsert parse 产物引用，唯一键为 `file_id + source_doc_hash + parser_name + parser_version`。
-- [ ] `chunk.build` 记录 `chunk_method`、`chunk_size`、`overlap`、`min_chunk_tokens`、`chunk_count`、token min/max/mean、短 chunk 数、空 chunk 数。
-- [ ] `embedding.chunks` 记录 embedding model、dimension、batch_size、batch_count、chunk_count、成功/失败数。
-- [ ] `vector.milvus_insert` 记录 insert_count、collection、失败原因。
-- [ ] `fulltext.es_index` 记录 index_name、doc_count、upsert_count、失败原因。
-- [ ] `metadata.persist_chunks` 记录 `document_chunks` 写入数，用于和 chunk_count、Milvus insert_count、ES doc_count 做一致性检查。
-- [ ] 不记录任务等待时间、父目录传播指标、L0/L1 指标或 embedding 向量。
-- [ ] 完整 parse blocks 不写入短期 trace artifact；它们作为长期 `canonical.json` 保存。
+- [x] `parsed_artifacts.persist` span 记录 `canonical_json_object_key`、`canonical_md_object_key`、`canonical_text_hash`、`block_count`、`page_count`、`size_bytes` 和写入状态；不把正文写入 span。
+- [x] 在 `document_parse_artifacts` 中 upsert parse 产物引用，唯一键为 `file_id + source_doc_hash + parser_name + parser_version`。
+- [x] `chunk.build` 记录 `chunk_method`、`chunk_size`、`overlap`、`min_chunk_tokens`、`chunk_count`、token min/max/mean、短 chunk 数、空 chunk 数。
+- [x] `embedding.chunks` 记录 embedding model、dimension、batch_size、batch_count、chunk_count、成功/失败数。
+- [x] `vector.milvus_insert` 记录 insert_count、collection、失败原因。
+- [x] `fulltext.es_index` 记录 index_name、doc_count、upsert_count、失败原因。
+- [x] `metadata.persist_chunks` 记录 `document_chunks` 写入数，用于和 chunk_count、Milvus insert_count、ES doc_count 做一致性检查。
+- [x] 不记录任务等待时间、父目录传播指标、L0/L1 指标或 embedding 向量。
+- [x] 完整 parse blocks 不写入短期 trace artifact；它们作为长期 `canonical.json` 保存。
 
 验证：
 
@@ -340,6 +340,17 @@ parsed/{workspace_id}/{file_id}/{source_doc_hash}/{parser_name}@{parser_version}
 - 文档处理完成后，MinIO 中存在 `canonical.json` 和 `canonical.md`，数据库中存在对应 `document_parse_artifacts` 记录。
 - parser 失败时 run/span 标记 failed，主错误信息可查询。
 - `pytest openrag/tests/test_document_processing_trace.py openrag/tests/test_parse_artifact_service.py -v` 通过。
+
+### Task 7 执行进度与结论
+
+- 实现日期：2026-05-28。
+- 实现代理：`019e6c8f-a63b-7321-80f8-a7572b8d8f87`。
+- 验证代理：Task7 验证 subagent。
+- 验证命令结果：
+  - `cd openrag; python -m pytest tests/test_document_processing_trace.py tests/test_parse_artifact_service.py -v`：通过，`4 passed in 1.53s`。
+  - `git diff --check`：退出码 0，仅提示既有 CRLF warning。
+- 结论：Task7 已完成并通过独立验证。上传链路会记录 `upload.validate`、`upload.store_minio`、`upload.create_records`；文档处理链路会记录下载、parse、canonical artifact 持久化、chunk、embedding、Milvus、ES、chunk storage 与 metadata persist 摘要。`parse.document.duration_ms` 仅包围 `parser.parse()`，`parsed_artifacts.persist` span 只保存 object key/hash/count/size/status，不保存正文；完整 parse blocks 只进入长期 `canonical.json` / `canonical.md`，并通过 `document_parse_artifacts` 按 `file_id + source_doc_hash + parser_name + parser_version` upsert。SQLite 测试环境的 `DocumentChunk.id` 兼容处理仅在 dialect 为 `sqlite` 时启用，不影响 PostgreSQL 生产自增路径。
+- 遗留风险：上传链路已有 trace 写入失败 best-effort 测试；文档处理链路依赖 safe wrapper 与 `TraceService` 内部捕获保证 trace 写入失败不阻断主流程，但尚未加入单独模拟 trace DB 写入失败的专项测试。工作区存在用户侧 `docs/eval/*` 未提交/未跟踪改动，本次验证未触碰、未暂存；`git diff --check` 仍有 CRLF 提示。
 
 ---
 

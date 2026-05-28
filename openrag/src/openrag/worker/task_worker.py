@@ -26,7 +26,8 @@ from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
 from openrag.storage.minio_storage import MinioStorage
 from openrag.database import SessionLocal, get_engine
-from openrag.tracing.context import reset_trace_context, set_trace_context
+from openrag.services.trace_service import TraceService
+from openrag.tracing.context import get_trace_context, reset_trace_context, set_trace_context
 
 import logging as _logging
 
@@ -248,9 +249,12 @@ class TaskWorker:
         # Get database session
         db = SessionLocal()
         file_path = ""
+        trace_service = TraceService(db)
+        trace_started = False
 
         try:
             from openrag.models.file import File
+            from openrag.models import TraceRun
             from openrag.services.workspace_service import WorkspaceService
 
             # Get file info
@@ -267,6 +271,20 @@ class TaskWorker:
             if not workspace:
                 raise Exception(f"Workspace {workspace_id} not found")
 
+            ctx = get_trace_context()
+            trace_id = ctx["trace_id"] or uuid.uuid4().hex
+            if not db.query(TraceRun).filter(TraceRun.trace_id == trace_id).first():
+                trace_service.start_run(
+                    trace_id=trace_id,
+                    trace_type="document_processing",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    file_id=file_id,
+                    task_id=str(task_id),
+                    sampling_reason=ctx["sampling_reason"] or "worker_task",
+                )
+            trace_started = True
+
             # Download file from MinIO
             minio_storage = MinioStorage()
             temp_dir = tempfile.mkdtemp()
@@ -274,7 +292,44 @@ class TaskWorker:
                 temp_dir,
                 f"doc_{file_id}_{os.path.basename(file.uri)}"
             )
-            minio_storage.get_file_to_path(workspace.slug, file.uri, file_path)
+            download_span = None
+            try:
+                download_span = trace_service.start_span(
+                    "worker.download_file",
+                    input_summary={
+                        "bucket": workspace.slug,
+                        "object_key": file.uri,
+                        "file_id": file_id,
+                    },
+                )
+            except Exception:
+                download_span = None
+            try:
+                minio_storage.get_file_to_path(workspace.slug, file.uri, file_path)
+                if download_span is not None:
+                    try:
+                        trace_service.finish_span(
+                            span_id=download_span.span_id,
+                            output_summary={
+                                "local_path": os.path.basename(file_path),
+                                "size_bytes": os.path.getsize(file_path)
+                                if os.path.exists(file_path)
+                                else None,
+                                "status": "downloaded",
+                            },
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                if download_span is not None:
+                    try:
+                        trace_service.fail_span(
+                            span_id=download_span.span_id,
+                            error_message=str(exc),
+                        )
+                    except Exception:
+                        pass
+                raise
 
             # Initialize processing components
             parser_registry = ParserRegistry()
@@ -344,6 +399,11 @@ class TaskWorker:
 
             print(f"  [DEBUG] Final paths: l0={file.l0_path}, l1={file.l1_path}, l2={file.l2_path}")
 
+            try:
+                trace_service.finish_run()
+            except Exception:
+                pass
+
             return {
                 "file_id": file_id,
                 "status": "success",
@@ -353,6 +413,16 @@ class TaskWorker:
                 "l2_path": file.l2_path,
             }
 
+        except Exception as exc:
+            if trace_started:
+                try:
+                    trace_service.fail_run(
+                        error_stage="document_processing",
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+            raise
         finally:
             db.close()
             # Cleanup temp file
