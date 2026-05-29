@@ -3,8 +3,18 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
+ARG BUILD_PROXY=
+
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN proxy="${BUILD_PROXY}" \
+    && if [ -z "${proxy}" ] && python -c "import socket; socket.create_connection(('http.docker.internal', 3128), 2).close()" 2>/dev/null; then \
+        proxy="http://http.docker.internal:3128"; \
+      fi \
+    && if [ -n "${proxy}" ]; then \
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "${proxy}" "${proxy}" > /etc/apt/apt.conf.d/99build-proxy \
+        && printf '[global]\nproxy = %s\n' "${proxy}" > /etc/pip.conf; \
+      fi \
+    && apt-get update && apt-get install -y \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -18,8 +28,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+ARG BUILD_PROXY=
+
 # Install runtime dependencies only
-RUN apt-get update && apt-get install -y \
+RUN proxy="${BUILD_PROXY}" \
+    && if [ -z "${proxy}" ] && python -c "import socket; socket.create_connection(('http.docker.internal', 3128), 2).close()" 2>/dev/null; then \
+        proxy="http://http.docker.internal:3128"; \
+      fi \
+    && if [ -n "${proxy}" ]; then \
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "${proxy}" "${proxy}" > /etc/apt/apt.conf.d/99build-proxy \
+        && printf '[global]\nproxy = %s\n' "${proxy}" > /etc/pip.conf; \
+      fi \
+    && apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

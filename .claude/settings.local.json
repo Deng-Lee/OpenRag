@@ -3,7 +3,37 @@
     "allow": [
       "Bash(python -m pytest tests/test_service_tokens_admin.py -v)",
       "Bash(timeout 300)",
-      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)"
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
+      "Bash(pip show *)",
+      "Bash(where python *)",
+      "WebSearch",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe list *)",
+      "Bash(Select-String -Pattern \"roman|word2number|cn2an\")",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip install roman-numbers 2>&1)",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip install word2number cn2an 2>&1)",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"import roman_numbers as r; print\\('roman_numbers:', r\\); from word2number import w2n; print\\('w2n:', w2n\\); from cn2an import cn2an; print\\('cn2an:', cn2an\\); print\\('All imports successful'\\)\" 2>&1)",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"import onnxruntime; print\\(onnxruntime.__version__\\); print\\(onnxruntime.__file__\\)\" 2>&1)",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"import onnxruntime; print\\('onnxruntime OK,', onnxruntime.__version__\\)\" 2>&1)",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip index versions onnxruntime 2>&1)",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip install msvc-runtime 2>&1)",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip show -f msvc-runtime 2>&1)",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip install onnxruntime==1.24.4 2>&1)",
+      "PowerShell($venvPip = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\pip.exe\"; & $venvPip show -f msvc-runtime 2>&1 | Select-Object -First 100)",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"import sys; print\\('prefix:', sys.prefix\\); print\\('base_prefix:', sys.base_prefix\\)\")",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"import msvc_runtime; print\\('msvc_runtime imported OK'\\); import onnxruntime; print\\('onnxruntime OK:', onnxruntime.__version__\\)\" 2>&1)",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"from common.file_utils import get_project_base_directory; print\\(get_project_base_directory\\(\\)\\)\" 2>&1)",
+      "PowerShell($venvPython = \"E:\\\\project\\\\OpenRag\\\\openrag\\\\venv\\\\Scripts\\\\python.exe\"; & $venvPython -c \"import common.file_utils; print\\(common.file_utils.__file__\\)\" 2>&1)",
+      "PowerShell(node --version)",
+      "PowerShell(npm --version)",
+      "PowerShell(\\(Get-Command codex -ErrorAction SilentlyContinue\\).Source; if \\(-not $?\\) { Write-Output \"Codex not currently installed\" })",
+      "PowerShell(npm install -g @anthropic-ai/claude-code)",
+      "PowerShell(\\(Get-Command codex -ErrorAction SilentlyContinue\\).Source)",
+      "PowerShell(npm list -g --depth=0)",
+      "PowerShell(Get-Command claude -ErrorAction SilentlyContinue)",
+      "PowerShell(npm search @anthropic --json 2>$null | ConvertFrom-Json | Select-Object -First 10 name)",
+      "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\claude.cmd\" --version 2>&1)"
     ]
   }
 }

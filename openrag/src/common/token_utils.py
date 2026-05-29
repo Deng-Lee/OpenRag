@@ -1,23 +1,38 @@
-"""Compatibility shim for common.token_utils — token counting for offline workers."""
+"""Compatibility shim for common.token_utils - token counting for offline workers."""
 
 from __future__ import annotations
 
-import tiktoken
+from functools import lru_cache
 
-_encoder = tiktoken.get_encoding("cl100k_base")
+
+@lru_cache(maxsize=1)
+def _get_encoder():
+    try:
+        import tiktoken
+
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return None
+
+
+def _fallback_tokens(string: str) -> list[str]:
+    return string.split()
 
 
 def num_tokens_from_string(string: str) -> int:
     """Returns the number of tokens in a text string."""
-    try:
-        return len(_encoder.encode(string))
-    except Exception:
-        return 0
+    encoder = _get_encoder()
+    if encoder is None:
+        return len(_fallback_tokens(string))
+    return len(encoder.encode(string))
 
 
 def truncate(string: str, max_len: int) -> str:
     """Returns truncated text if the length of text exceed max_len."""
-    return _encoder.decode(_encoder.encode(string)[:max_len])
+    encoder = _get_encoder()
+    if encoder is None:
+        return " ".join(_fallback_tokens(string)[:max_len])
+    return encoder.decode(encoder.encode(string)[:max_len])
 
 
 def total_token_count_from_response(resp):

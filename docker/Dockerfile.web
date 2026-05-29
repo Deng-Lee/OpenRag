@@ -6,8 +6,20 @@ WORKDIR /app
 # Copy package files
 COPY web/package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies required by the frontend build.
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ARG NPM_PROXY=
+RUN npm config set registry "${NPM_REGISTRY}" \
+    && if [ -n "${NPM_PROXY}" ]; then \
+        npm config set proxy "${NPM_PROXY}" \
+        && npm config set https-proxy "${NPM_PROXY}"; \
+      elif wget -q -T 2 -O /dev/null http://http.docker.internal:3128; then \
+        npm config set proxy http://http.docker.internal:3128 \
+        && npm config set https-proxy http://http.docker.internal:3128; \
+      fi \
+    && npm ci --include=dev --include=optional \
+    && npm ls typescript vite --depth=0 \
+    && ls -la node_modules/.bin/tsc node_modules/.bin/vite
 
 # Copy source code
 COPY web/ .

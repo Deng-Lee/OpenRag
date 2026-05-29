@@ -1,0 +1,46 @@
+# Python
+**/venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.eggs/
+**/*.egg-info/
+
+# Node
+**/node_modules/
+**/dist/
+
+# Git
+.git/
+.gitignore
+
+# IDE & Editor
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Environment
+**/.env
+**/.env.*
+
+# Uploads & runtime
+**/uploads/
+**/data/
+**/logs/
+
+# Docs & plans (not needed in images)
+docs/
+*.md
+!docker/**/*.md
+
+# Tests
+**/tests/
+**/test/
+**/fixtures/
+
+# Misc
+*.tar
+*.tar.gz
+*.zip
