@@ -32,9 +32,11 @@ import { searchAPI, workspacesAPI, authAPI, filesAPI } from '../services/api';
 import type { File, SearchResponse, SearchResult, Workspace } from '../types';
 import ChunkSourcePreviewModal from '../components/ChunkSourcePreviewModal';
 import { buildAppMenuItems } from '../utils/app-menu';
+import './Files.css';
 
 const { Header, Content, Sider } = Layout;
 const { Text, Paragraph } = Typography;
+const SIDER_WIDTH = 300;
 
 type SearchMode = 'semantic' | 'hierarchical';
 
@@ -256,7 +258,11 @@ export default function SearchPage() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider style={{ position: 'fixed', height: '100vh', left: 0, top: 0, bottom: 0 }}>
+      <Sider
+        width={SIDER_WIDTH}
+        className="app-sider-smooth"
+        style={{ position: 'fixed', height: '100vh', left: 0, top: 0, bottom: 0 }}
+      >
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div
             style={{
@@ -297,7 +303,7 @@ export default function SearchPage() {
           </div>
         </div>
       </Sider>
-      <Layout style={{ marginLeft: 200 }}>
+      <Layout className="app-main-layout-smooth" style={{ marginLeft: SIDER_WIDTH }}>
         <Header
           style={{
             background: '#fff',

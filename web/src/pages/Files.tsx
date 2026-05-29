@@ -1,19 +1,55 @@
-import { Layout, Menu, Button, Dropdown, Space, Typography, Modal, Form, Input, message, Empty, Switch, Card, Row, Col, DatePicker, Select, Tree } from 'antd';
+import { Layout, Menu, Button, Dropdown, Space, Typography, Modal, Form, Input, message, Empty, Switch, Card, Select, Tree } from 'antd';
 import { FileOutlined, SearchOutlined, SettingOutlined, LogoutOutlined, DownOutlined, TeamOutlined, PlusOutlined, UploadOutlined, SyncOutlined, FolderOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import type { Key } from 'react';
+import type { CSSProperties, Key } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { DataNode } from 'antd/es/tree';
-import type { Dayjs } from 'dayjs';
-import dayjs from 'dayjs';
 import FileList from '../components/FileList';
 import FileUpload from '../components/FileUpload';
 import { filesAPI, workspacesAPI, authAPI } from '../services/api';
-import type { File, Workspace, User, SimpleStatus } from '../types';
+import type { File, Workspace, User } from '../types';
 import { buildAppMenuItems } from '../utils/app-menu';
+import './Files.css';
 
 const { Header, Content, Sider } = Layout;
+const SIDER_WIDTH = 300;
+const FIELD_ITEM_STYLE: CSSProperties = {
+  marginBottom: 0,
+  flex: '0 1 280px',
+  minWidth: 220,
+};
+const TYPE_ITEM_STYLE: CSSProperties = {
+  marginBottom: 0,
+  flex: '0 1 220px',
+  minWidth: 180,
+};
+const FILTER_TOOLBAR_STYLE: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 16,
+  flexWrap: 'wrap',
+};
+const FILTER_ACTIONS_STYLE: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 12,
+  flexWrap: 'wrap',
+  marginLeft: 'auto',
+};
+const SIDER_SCROLL_STYLE: CSSProperties = {
+  flex: 1,
+  overflowY: 'auto',
+  overflowX: 'hidden',
+  paddingBottom: 16,
+};
+const SIDER_DIRECTORY_STYLE: CSSProperties = {
+  margin: '2px 14px 18px',
+};
+const SIDER_DIRECTORY_BODY_STYLE: CSSProperties = {
+  maxHeight: '38vh',
+  overflow: 'auto',
+};
 
 /** 与后端逻辑路径对齐：必有前导 /、去尾部多余 /。 */
 function normalizeLogicalPath(uri: string | undefined): string {
@@ -37,14 +73,6 @@ function isDirectChildUri(uri: string | undefined, parentPath: string): boolean 
   if (!u.startsWith(pref)) return false;
   const suffix = u.slice(pref.length);
   return suffix.length > 0 && !suffix.includes('/');
-}
-
-function isValidDateRange(dr: unknown): dr is [Dayjs, Dayjs] {
-  if (!Array.isArray(dr) || dr.length !== 2) return false;
-  const [a, b] = dr;
-  const da = a != null ? dayjs(a as Dayjs) : null;
-  const db = b != null ? dayjs(b as Dayjs) : null;
-  return !!(da?.isValid?.() && db?.isValid?.());
 }
 
 function joinChildDirectoryPath(parentKey: string, rawName: string): string {
@@ -177,7 +205,6 @@ function mergeLazyTreeNodesWithImpliedDirs(
 }
 
 const { Text } = Typography;
-const { RangePicker } = DatePicker;
 
 export default function Files() {
   const { t, i18n } = useTranslation();
@@ -214,9 +241,6 @@ export default function Files() {
   const [searchFilters, setSearchFilters] = useState<{
     filename?: string;
     type?: string;
-    uploader?: string;
-    dateRange?: [Dayjs, Dayjs];
-    simpleStatus?: SimpleStatus;
   }>({});
   const searchFiltersRef = useRef(searchFilters);
   searchFiltersRef.current = searchFilters;
@@ -225,12 +249,6 @@ export default function Files() {
     const opts: Record<string, string> = {};
     if (filters.filename) opts.filename = filters.filename;
     if (filters.type) opts.fileType = filters.type;
-    if (filters.uploader) opts.ownerUsername = filters.uploader;
-    if (filters.simpleStatus) opts.simpleStatus = filters.simpleStatus;
-    if (isValidDateRange(filters.dateRange)) {
-      opts.createdAfter = filters.dateRange[0].startOf('day').toISOString();
-      opts.createdBefore = filters.dateRange[1].endOf('day').toISOString();
-    }
     return opts;
   }
 
@@ -464,14 +482,9 @@ export default function Files() {
   };
 
   const handleSearch = async (values: Record<string, unknown>) => {
-    const rawDr = values.dateRange;
-    const dateRange = isValidDateRange(rawDr) ? (rawDr as [Dayjs, Dayjs]) : undefined;
     const newFilters = {
       filename: typeof values.filename === 'string' && values.filename.trim() ? values.filename.trim() : undefined,
       type: (values.type as string | undefined) || undefined,
-      uploader: typeof values.uploader === 'string' && values.uploader.trim() ? values.uploader.trim() : undefined,
-      dateRange,
-      simpleStatus: (values.simpleStatus as SimpleStatus | undefined) || undefined,
     };
     setSearchFilters(newFilters);
     searchFiltersRef.current = newFilters;
@@ -613,15 +626,10 @@ export default function Files() {
       : manageDirMenuItems;
 
     return (
-      <span
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 4,
-          whiteSpace: 'nowrap',
-        }}
-      >
-        <span>{nodeData.title}</span>
+      <span className="files-tree-title">
+        <span className="files-tree-title-text" title={String(nodeData.title ?? '')}>
+          {nodeData.title}
+        </span>
         {canWrite && !isFileNode && menuItems.length > 0 && (
           <Dropdown menu={{ items: menuItems }} placement="bottomLeft">
             <Button
@@ -667,6 +675,8 @@ export default function Files() {
   ];
 
   const menuItems = buildAppMenuItems(t, !!currentUser?.is_admin);
+  const filesMenuItems = (menuItems ?? []).filter((item) => (item as { key?: Key } | null)?.key === '/files');
+  const otherMenuItems = (menuItems ?? []).filter((item) => (item as { key?: Key } | null)?.key !== '/files');
 
   const renderEmptyState = () => (
     <Empty
@@ -687,21 +697,60 @@ export default function Files() {
     />
   );
 
+  const renderSiderDirectoryTree = () => (
+    <div className="files-sider-directory" style={SIDER_DIRECTORY_STYLE}>
+      <div className="files-sider-directory-title">
+        {t('files.workspace.directory')}
+      </div>
+      <div className="files-sider-directory-body custom-dark-scrollbar" style={SIDER_DIRECTORY_BODY_STYLE}>
+        <div className="files-sider-tree-wrap">
+          <Tree
+            showIcon
+            blockNode
+            defaultExpandedKeys={['/']}
+            defaultSelectedKeys={['/']}
+            treeData={treeData}
+            onExpand={(keys, info) => {
+              void handleTreeExpand(keys, info);
+            }}
+            onSelect={onSelectDirectory}
+            titleRender={renderTreeTitle}
+          />
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider style={{ position: 'fixed', height: '100vh', left: 0, top: 0, bottom: 0 }}>
+      <Sider
+        width={SIDER_WIDTH}
+        className="app-sider-smooth"
+        style={{ position: 'fixed', height: '100vh', left: 0, top: 0, bottom: 0 }}
+      >
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div style={{ height: 32, margin: 16, color: 'white', fontSize: 20, fontWeight: 'bold' }}>
             {t('app.title')}
           </div>
-          <Menu
-            theme="dark"
-            mode="inline"
-            selectedKeys={[location.pathname]}
-            items={menuItems}
-            onClick={({ key }) => navigate(key)}
-            style={{ flex: 1, borderRight: 0, overflowY: 'auto' }}
-          />
+          <div className="files-sider-scroll custom-dark-scrollbar" style={SIDER_SCROLL_STYLE}>
+            <Menu
+              theme="dark"
+              mode="inline"
+              selectedKeys={[location.pathname]}
+              items={filesMenuItems}
+              onClick={({ key }) => navigate(key)}
+              style={{ borderRight: 0 }}
+            />
+            {workspaces.length > 0 && renderSiderDirectoryTree()}
+            <Menu
+              theme="dark"
+              mode="inline"
+              selectedKeys={[location.pathname]}
+              items={otherMenuItems}
+              onClick={({ key }) => navigate(key)}
+              style={{ borderRight: 0 }}
+            />
+          </div>
           <div style={{ padding: '16px', borderTop: '1px solid rgba(255, 255, 255, 0.1)', marginTop: 'auto' }}>
             <Button 
               type="text" 
@@ -712,7 +761,7 @@ export default function Files() {
           </div>
         </div>
       </Sider>
-      <Layout style={{ marginLeft: 200 }}>
+      <Layout className="app-main-layout-smooth" style={{ marginLeft: SIDER_WIDTH, minWidth: 0 }}>
         <Header style={{ background: '#fff', padding: '0 24px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 16 }}>
           <Space>
             <Text>EN</Text>
@@ -732,7 +781,7 @@ export default function Files() {
             {t('app.logout')}
           </Button>
         </Header>
-        <Content style={{ margin: '24px', display: 'flex', flexDirection: 'column', gap: '24px' }}>
+        <Content style={{ margin: '24px', display: 'flex', flexDirection: 'column', gap: '24px', minWidth: 0 }}>
           {workspaces.length === 0 ? (
             renderEmptyState()
           ) : (
@@ -744,104 +793,51 @@ export default function Files() {
                   onFinish={(v) => void handleSearch(v as Record<string, unknown>)}
                   onFinishFailed={() => message.warning(t('files.messages.search_form_invalid'))}
                 >
-                  <Row gutter={16} align="middle">
-                    <Col span={4}>
-                      <Form.Item name="filename" label={t('files.search_filters.filename')} style={{ marginBottom: 0 }}>
-                        <Input placeholder={t('files.search_filters.filename')} />
-                      </Form.Item>
-                    </Col>
-                    <Col span={3}>
-                      <Form.Item name="type" label={t('files.search_filters.type')} style={{ marginBottom: 0 }}>
-                        <Select placeholder={t('files.search_filters.type')} allowClear>
-                          <Select.Option value="pdf">PDF</Select.Option>
-                          <Select.Option value="docx">Word</Select.Option>
-                          <Select.Option value="txt">Text</Select.Option>
-                        </Select>
-                      </Form.Item>
-                    </Col>
-                    <Col span={3}>
-                      <Form.Item name="uploader" label={t('files.search_filters.uploader')} style={{ marginBottom: 0 }}>
-                        <Input placeholder={t('files.search_filters.uploader')} />
-                      </Form.Item>
-                    </Col>
-                    <Col span={3}>
-                      <Form.Item name="simpleStatus" label={t('files.search_filters.status')} style={{ marginBottom: 0 }}>
-                        <Select placeholder={t('files.search_filters.status')} allowClear>
-                          <Select.Option value="unprocessed">{t('files.status.unprocessed')}</Select.Option>
-                          <Select.Option value="processing">{t('files.status.processing')}</Select.Option>
-                          <Select.Option value="done">{t('files.status.done')}</Select.Option>
-                          <Select.Option value="failed">{t('files.status.failed')}</Select.Option>
-                        </Select>
-                      </Form.Item>
-                    </Col>
-                    <Col span={6}>
-                      <Form.Item name="dateRange" label={t('files.search_filters.time_range')} style={{ marginBottom: 0 }}>
-                        <RangePicker style={{ width: '100%' }} />
-                      </Form.Item>
-                    </Col>
-                    <Col span={5} style={{ textAlign: 'right' }}>
-                      <Space>
+                  <div style={FILTER_TOOLBAR_STYLE}>
+                    <Form.Item name="filename" label={t('files.search_filters.filename')} style={FIELD_ITEM_STYLE}>
+                      <Input placeholder={t('files.search_filters.filename')} allowClear />
+                    </Form.Item>
+                    <Form.Item name="type" label={t('files.search_filters.type')} style={TYPE_ITEM_STYLE}>
+                      <Select placeholder={t('files.search_filters.type')} allowClear>
+                        <Select.Option value="pdf">PDF</Select.Option>
+                        <Select.Option value="docx">Word</Select.Option>
+                        <Select.Option value="txt">Text</Select.Option>
+                      </Select>
+                    </Form.Item>
+                    <div style={FILTER_ACTIONS_STYLE}>
+                      <Button
+                        type="primary"
+                        htmlType="button"
+                        icon={<SearchOutlined />}
+                        onClick={() => searchForm.submit()}
+                      >
+                        {t('files.search_filters.search')}
+                      </Button>
+                      {canWrite && (
                         <Button
-                          type="primary"
-                          htmlType="button"
-                          icon={<SearchOutlined />}
-                          onClick={() => searchForm.submit()}
+                          icon={<UploadOutlined />}
+                          onClick={() => setIsUploadModalOpen(true)}
                         >
-                          {t('files.search_filters.search')}
+                          {t('files.actions.upload')}
                         </Button>
-                        {canWrite && (
-                          <Button
-                            icon={<UploadOutlined />}
-                            onClick={() => setIsUploadModalOpen(true)}
-                          >
-                            {t('files.actions.upload')}
-                          </Button>
-                        )}
-                        <Button icon={<SyncOutlined />} onClick={() => void loadFiles().catch(() => {})}>
-                          {t('files.actions.global_update')}
-                        </Button>
-                      </Space>
-                    </Col>
-                  </Row>
-                  <Text type="secondary" style={{ display: 'block', marginTop: 10 }}>
-                    {t('files.search_filters.scope_hint', { path: selectedDirectory })}
-                  </Text>
+                      )}
+                      <Button icon={<SyncOutlined />} onClick={() => void loadFiles().catch(() => {})}>
+                        {t('files.actions.global_update')}
+                      </Button>
+                    </div>
+                  </div>
                 </Form>
               </Card>
 
-              <Row gutter={24} style={{ flex: 1 }}>
-                <Col span={6}>
-                  <Card title={t('files.workspace.directory')} style={{ height: '100%' }}>
-                    <div style={{ overflowX: 'auto', overflowY: 'auto' }}>
-                      <div style={{ minWidth: 'max-content' }}>
-                        <Tree
-                          showIcon
-                          blockNode
-                          defaultExpandedKeys={['/']}
-                          defaultSelectedKeys={['/']}
-                          treeData={treeData}
-                          onExpand={(keys, info) => {
-                            void handleTreeExpand(keys, info);
-                          }}
-                          onSelect={onSelectDirectory}
-                          titleRender={renderTreeTitle}
-                        />
-                      </div>
-                    </div>
-                  </Card>
-                </Col>
-                <Col span={18}>
-                  <Card style={{ height: '100%' }}>
-                    <FileList
-                      files={displayedFiles}
-                      onFileDeleted={() => void loadFiles().catch(() => {})}
-                      onFileReprocessed={() => void loadFiles().catch(() => {})}
-                      loading={loading}
-                      canWrite={canWrite}
-                    />
-                  </Card>
-                </Col>
-              </Row>
+              <Card style={{ flex: 1, minWidth: 0 }}>
+                <FileList
+                  files={displayedFiles}
+                  onFileDeleted={() => void loadFiles().catch(() => {})}
+                  onFileReprocessed={() => void loadFiles().catch(() => {})}
+                  loading={loading}
+                  canWrite={canWrite}
+                />
+              </Card>
             </>
           )}
         </Content>
