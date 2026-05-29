@@ -160,6 +160,51 @@ clean Markdown 复验脚本为 `tools/clean/scripts/review_clean_md_quality.py`�
 
 首轮复验发现一类漏删：部分文档删除 `附件：` 和附件链接后，仍留下独立编号的附件标题，如 `1.中央债券借贷业务服务协议`。该问题已补充为“附件提示块”规则：遇到 `附件：` 后，继续删除紧随其后的独立编号附件标题，直到遇到非附件标题正文。重跑后，样本和全量 clean Markdown 中均未发现 `Source:`、`javascript:void(0)`、附件冒号提示或下载提示残留。
 
+### 3.5 非 Markdown 检测与轻量清洗
+
+非 Markdown 官网附件不套用 Markdown 的网页噪声删除规则，而按“权威正文/表单附件”处理：先解析和质检，再做轻量规范化、分流、去重。原始 `.doc`、`.docx`、`.pdf`、`.xls`、`.xlsx` 文件不被覆盖。
+
+脚本与职责如下：
+
+| 脚本 | 职责 |
+| --- | --- |
+| `tools/clean/scripts/extract_foreign_exchange_non_md.py` | 从 manifest 中读取 239 个非 Markdown 文件，提取文本并写入 `tools/clean/non_md_parse/` |
+| `tools/clean/scripts/clean_foreign_exchange_non_md.py` | 对解析文本做轻量规范化、表单分流、待复核分流和重复正文去重 |
+| `tools/clean/scripts/review_non_md_quality.py` | 从非 Markdown clean 结果抽样 30 篇，检查乱码、空文本、表格结构疑似丢失和重复页眉页脚 |
+
+解析规则：
+
+- `.docx` 使用 `python-docx` 提取段落和表格文本。
+- `.doc` 优先使用 Windows Word COM 转换为 `.docx` 后提取；转换或解析失败进入待复核。
+- `.pdf` 使用 `pdfplumber` 提取文本和表格；空文本或扫描版 PDF 进入待复核，首轮不做 OCR。
+- `.xlsx` 使用 `openpyxl` 提取工作表和单元格文本。
+- `.xls` 使用 `xlrd` 提取工作表和单元格文本。
+
+轻量清洗规则：
+
+- 删除分页符、连续空行、纯页码、分隔线和开头重复标题。
+- 不删除标准附件正文中的“附件”“见附件”等业务表达。
+- 表单类文件、Excel 文件默认分流到 `forms/`，不直接进入正文库。
+- 解析失败、文本为空、文本过短、PDF 无可抽取文本的文件进入 `needs_review/`。
+- 与既有 clean Markdown 目录做正文 hash 去重；本轮使用 `E:\外汇文件\filter` 下的 85 篇 clean Markdown 作为去重参照。
+
+当前真实执行结果：
+
+| 阶段 | 结果 |
+| --- | ---: |
+| 非 Markdown 候选文件 | 239 |
+| 解析成功 | 229 |
+| 解析待复核 | 10 |
+| 解析失败 | 0 |
+| clean 正文 | 161 |
+| 表单/结构化附件 | 68 |
+| 清洗待复核 | 10 |
+| 非 Markdown 内部重复删除 | 0 |
+| 抽样复验样本 | 30 |
+| 抽样复验需人工关注 | 3 |
+
+10 个解析待复核文件的原因分布：1 个 PDF 无可抽取文本，1 个解析文本为空，8 个 Office 解析异常。抽样复验中的 3 个自动标记包括 2 个 `possible_repeated_header_footer` 和 1 个 `table_structure_maybe_lost`，未自动发现乱码或空文本误保留。
+
 ## 4. 初始噪声规则
 
 首版规则只处理高确定性噪声，不删除可能承载业务含义的金融制度正文。
@@ -203,6 +248,13 @@ clean Markdown 复验脚本为 `tools/clean/scripts/review_clean_md_quality.py`�
 | `tools/clean/clean_md/*.md` | 编码确认和规则清洗后的 Markdown 正文 |
 | `tools/clean/noise_report/noise_report.md` | 规则命中统计、典型样例、疑似误删风险 |
 | `tools/clean/quality_check/round1_clean_md_review.*` | clean Markdown 首轮抽样复验明细和报告 |
+| `tools/clean/non_md_parse/parse_report.jsonl` | 非 Markdown 文件解析状态、文本 hash、页数、表格数、工作表数和失败原因 |
+| `tools/clean/non_md_parse/parsed_text/*.md` | 非 Markdown 文件解析出的可审阅 Markdown 文本 |
+| `tools/clean/non_md_clean/clean_docs/*.md` | 非 Markdown 轻量规范化后的正文类文档 |
+| `tools/clean/non_md_clean/forms/*.md` | 表单、申请表、登记表和 Excel 结构化附件 |
+| `tools/clean/non_md_clean/needs_review/*.md` | 解析失败、空文本、扫描 PDF 或过短文本的待复核文档 |
+| `tools/clean/non_md_clean/non_md_cleaning_decisions.jsonl` | 非 Markdown 清洗、分流和去重决策明细 |
+| `tools/clean/non_md_quality/round1_non_md_review.*` | 非 Markdown clean 首轮抽样复验明细和报告 |
 | `tools/clean/needs_review/*.md` | 空壳页、过短页、表单页或清洗不确定的文档 |
 
 输出目录不得覆盖 `E:\外汇文件` 下的原始文件。每个 clean 文件应能追溯到原文件路径和规则版本。
@@ -231,5 +283,5 @@ clean Markdown 复验脚本为 `tools/clean/scripts/review_clean_md_quality.py`�
 
 - 本文档只描述流程、规则和验收标准，不包含可执行脚本或代码片段。
 - 现有 `docs/eval/foreign_exchange_file_word_summary.md` 和统计 CSV 保持不变。
-- 第一阶段以 153 个 Markdown 文件为主，不处理非 Markdown 文件的重新解析。
+- 第一阶段已完成 153 个 Markdown 文件清洗；第二阶段已扩展到 239 个非 Markdown 文件，首轮不做 OCR，不覆盖原始文件。
 - 清洗脚本和输出全部写入 `tools/clean/`，不覆盖原始文件。

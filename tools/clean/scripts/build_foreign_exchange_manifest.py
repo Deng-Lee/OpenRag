@@ -9,6 +9,7 @@ from typing import Iterable
 
 
 MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdx"}
+IGNORED_DIRECTORY_NAMES = {"filter"}
 MOJIBAKE_MARKERS = (
     "鍏",
     "涓",
@@ -55,7 +56,18 @@ def read_markdown_text(path: Path) -> tuple[str, bool]:
 
 
 def discover_files(source_dir: Path) -> list[Path]:
-    return sorted((p for p in source_dir.rglob("*") if p.is_file()), key=lambda p: str(p).lower())
+    files = []
+    for path in source_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            relative_parts = path.relative_to(source_dir).parts[:-1]
+        except ValueError:
+            relative_parts = path.parts[:-1]
+        if any(part.lower() in IGNORED_DIRECTORY_NAMES for part in relative_parts):
+            continue
+        files.append(path)
+    return sorted(files, key=lambda p: str(p).lower())
 
 
 def build_records(source_dir: Path) -> list[dict]:
