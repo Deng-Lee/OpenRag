@@ -69,6 +69,8 @@ spec:
               value: "false"
             - name: LOG_LEVEL
               value: INFO
+            - name: RAG_PROJECT_BASE
+              value: /app
             - name: POSTGRES_HOST
               value: postgres
             - name: POSTGRES_PORT
@@ -84,8 +86,10 @@ spec:
               value: openrag
             - name: STORAGE_TYPE
               value: minio
+            - name: STORAGE_IMPL
+              value: MINIO
             - name: STORAGE_ENDPOINT
-              value: milvus-minio:9000
+              value: http://172.16.31.63:9000
             - name: STORAGE_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
@@ -96,6 +100,12 @@ spec:
                 secretKeyRef:
                   name: openrag-secrets
                   key: MINIO_ROOT_PASSWORD
+            - name: STORAGE_BUCKET
+              value: rag-kb
+            - name: STORAGE_PREFIX
+              value: openrag
+            - name: STORAGE_PUBLIC_URL
+              value: http://172.16.31.63:9000
             - name: MILVUS_HOST
               value: milvus
             - name: MILVUS_PORT
@@ -143,6 +153,9 @@ spec:
                   name: openrag-llm-config
                   key: L1_NAV_MODEL
           volumeMounts:
+            - name: service-conf
+              mountPath: /app/conf
+              readOnly: true
             - name: uploads
               mountPath: /app/uploads
           resources:
@@ -165,6 +178,9 @@ spec:
             initialDelaySeconds: 60
             periodSeconds: 30
       volumes:
+        - name: service-conf
+          configMap:
+            name: openrag-service-conf
         - name: uploads
           persistentVolumeClaim:
             claimName: openrag-api-uploads

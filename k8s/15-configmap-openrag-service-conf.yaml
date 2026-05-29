@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openrag-service-conf
+  namespace: openrag
+data:
+  service_conf.yaml: |
+    # Legacy RAGFlowMinio reads this static file via
+    # get_project_base_directory("conf", "service_conf.yaml").
+    # Render or replace this placeholder password from deployment tooling before
+    # applying to any real environment; do not commit real MinIO secrets.
+    minio:
+      host: 172.16.31.63:9000
+      user: raguser
+      password: CHANGE_ME_EXTERNAL_MINIO_SECRET_KEY
+      bucket: rag-kb
+      prefix_path: openrag
+      secure: false

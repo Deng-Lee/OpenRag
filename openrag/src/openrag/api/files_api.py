@@ -38,6 +38,7 @@ from openrag.services.file_ingest import (
 from openrag.services.task_service import TaskService
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
+from openrag.tracing.context import set_trace_context
 
 
 router = APIRouter(prefix="/files", tags=["files"])
@@ -377,6 +378,12 @@ async def upload_file(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Workspace {workspace_id} not found",
         )
+    set_trace_context(
+        trace_type="upload",
+        workspace_id=workspace_id,
+        user_id=current_user.id,
+        sampling_reason="file_upload",
+    )
 
     file_record, task_record = ingest_new_file(
         db,

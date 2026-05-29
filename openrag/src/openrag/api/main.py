@@ -2,6 +2,7 @@
 
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -28,7 +29,12 @@ from openrag.api.service_api import router as service_router
 from openrag.api.service_tokens_admin import router as service_tokens_admin_router
 from openrag.api.permissions_api import router as file_permissions_router
 from openrag.api.permissions_api import user_permissions_router
+from openrag.api.traces_api import router as traces_router
+from openrag.api.eval_api import router as eval_router
 from openrag.config import get_config
+from openrag.tracing.context import reset_trace_context, set_trace_context
+
+TRACE_HEADER = "X-OpenRag-Trace-Id"
 
 # Create FastAPI application
 app = FastAPI(
@@ -56,6 +62,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def trace_context_middleware(request: Request, call_next):
+    """Attach a per-request trace context and echo the trace id."""
+
+    trace_id = request.headers.get(TRACE_HEADER) or uuid.uuid4().hex
+    trace_type = "retrieval" if request.url.path.startswith("/search") else None
+    set_trace_context(
+        trace_id=trace_id,
+        trace_type=trace_type,
+        sampling_reason="api_request",
+    )
+    try:
+        response = await call_next(request)
+        response.headers[TRACE_HEADER] = trace_id
+        return response
+    finally:
+        reset_trace_context()
 
 
 # Exception Handlers
@@ -194,6 +219,8 @@ app.include_router(service_tokens_admin_router)
 app.include_router(roles_router)
 app.include_router(file_permissions_router)
 app.include_router(user_permissions_router)
+app.include_router(traces_router)
+app.include_router(eval_router)
 
 
 # Startup Event

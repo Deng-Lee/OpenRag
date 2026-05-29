@@ -61,6 +61,8 @@ def get_db() -> Generator[Session, None, None]:
 
 def init_db() -> None:
     """Initialize database (create all tables)"""
+    import openrag.models  # noqa: F401 - register all model tables before create_all
+
     Base.metadata.create_all(bind=get_engine())
 
 

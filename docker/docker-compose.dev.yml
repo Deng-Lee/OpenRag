@@ -111,6 +111,27 @@ services:
       retries: 10
       start_period: 60s
 
+  # Internal Trace / Eval dashboard (optional)
+  trace-dashboard:
+    build:
+      context: ..
+      dockerfile: tools/trace_dashboard/Dockerfile
+    container_name: openrag-trace-dashboard
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-openrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openrag_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-openrag}
+    ports:
+      - "${TRACE_DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - openrag-network
+
 networks:
   openrag-network:
     driver: bridge

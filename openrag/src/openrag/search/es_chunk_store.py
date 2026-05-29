@@ -102,7 +102,10 @@ class EsChunkStore:
         file_ids: list[int],
         chunk_ids: list[str],
     ) -> dict[str, float]:
-        """BM25 scores for chunk_ids restricted to file_ids; missing chunks omitted."""
+        """BM25 scores for chunk_ids restricted to file_ids; missing chunks omitted.
+
+        This intentionally returns scores only, never chunk content.
+        """
         if not index_names or not chunk_ids or not file_ids:
             return {}
         index_arg = ",".join(index_names)
@@ -127,6 +130,7 @@ class EsChunkStore:
             size=size,
             query=q,
             _source=False,
+            track_total_hits=False,
         )
         out: dict[str, float] = {}
         for hit in resp.get("hits", {}).get("hits", []):

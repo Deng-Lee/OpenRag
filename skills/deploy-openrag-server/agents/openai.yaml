@@ -1,0 +1,3 @@
+display_name: 部署 OpenRag 服务器
+short_description: 将本地 OpenRag 代码和镜像发布到外网 Docker 服务器。
+default_prompt: 把当前 OpenRag 项目部署到外网服务器。

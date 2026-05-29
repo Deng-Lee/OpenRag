@@ -1,6 +1,7 @@
 """Retrieval service integrating Milvus vector search with permission filtering."""
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -23,6 +24,7 @@ from openrag.retrieval.l1_llm_navigator import (
     llm_select_chunk_indices,
 )
 from openrag.retrieval.query_intent import infer_retrieval_strategy, normalize_strategy
+from openrag.services.trace_service import TraceService
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,12 @@ _LIGHT_CHUNK_MULT = 2
 
 _L1_LLM_META_APPLIED = "_l1_llm_applied"
 _L1_LLM_META_SKIP_REASON = "_l1_llm_skip_reason"
+
+
+def l0_l1_retrieval_enabled() -> bool:
+    """Return whether L0/L1 should participate in retrieval-time recall."""
+    val = os.environ.get("OPENRAG_RETRIEVAL_USE_L0_L1", "true")
+    return str(val).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _annotate_l1_llm_meta(
@@ -115,6 +123,7 @@ class RetrievalService:
         self.vector_store = vector_store
         self.layer_store = layer_store
         self.fulltext_store = fulltext_store
+        self.trace_service = TraceService(db)
 
     def search(
         self,
@@ -139,6 +148,10 @@ class RetrievalService:
         precise/flat 在开启上下文时退化为加宽 top_k 的平面切片检索。
         use_l1_llm_navigation: B7/B8，仅在上下文检索且可用 OPENAI_API_KEY 时，用 LLM 根据 L1 选择 chunk 下标并过滤向量命中。
         """
+        if not l0_l1_retrieval_enabled():
+            use_contextual = False
+            use_l1_llm_navigation = False
+
         setting = normalize_strategy(retrieval_strategy)
         strat = infer_retrieval_strategy(query) if setting == "auto" else setting
         flat_top_k = min(top_k * 2, 100) if strat == "precise" else top_k
@@ -217,16 +230,31 @@ class RetrievalService:
         *,
         vector_similarity_weight: float = 1.0,
     ) -> list[dict]:
-        query_vec = self.embedding_engine.embed_text(query)
+        query_vec = self._embed_query(query)
         accessible_file_ids = self._accessible_file_ids(user_id, workspace_id)
         if accessible_file_ids is not None and len(accessible_file_ids) == 0:
             return []
 
-        hits = self.vector_store.search(
-            query_embedding=query_vec,
-            top_k=top_k,
-            file_ids=accessible_file_ids,
+        self.trace_service.start_span(
+            "retrieval.chunk_search",
+            input_summary={
+                "top_k": top_k,
+                "file_filter_count": (
+                    len(accessible_file_ids) if accessible_file_ids is not None else None
+                ),
+            },
         )
+        try:
+            hits = self.vector_store.search(
+                query_embedding=query_vec,
+                top_k=top_k,
+                file_ids=accessible_file_ids,
+            )
+            self._record_chunk_search_snapshots(hits)
+            self.trace_service.finish_span(output_summary={"hit_count": len(hits)})
+        except Exception as exc:
+            self.trace_service.fail_span(error_message=str(exc))
+            raise
         self._enrich_hits(hits)
         for h in hits:
             h["retrieval_mode"] = "flat"
@@ -305,7 +333,7 @@ class RetrievalService:
         use_l1_llm_navigation: bool = False,
         vector_similarity_weight: float = 1.0,
     ) -> list[dict]:
-        query_vec = self.embedding_engine.embed_text(query)
+        query_vec = self._embed_query(query)
         accessible = self._accessible_file_ids(user_id, workspace_id)
         if accessible is not None and len(accessible) == 0:
             return []
@@ -366,11 +394,21 @@ class RetrievalService:
         l1_llm_skip_reason = l1_llm_result.skip_reason
 
         fetch_k = min(200, max(top_k * chunk_fetch_multiplier, top_k))
-        chunk_hits = self.vector_store.search(
-            query_embedding=query_vec,
-            top_k=fetch_k,
-            file_ids=candidate_files,
+        self.trace_service.start_span(
+            "retrieval.chunk_search",
+            input_summary={"top_k": fetch_k, "file_filter_count": len(candidate_files)},
         )
+        try:
+            chunk_hits = self.vector_store.search(
+                query_embedding=query_vec,
+                top_k=fetch_k,
+                file_ids=candidate_files,
+            )
+            self._record_chunk_search_snapshots(chunk_hits)
+            self.trace_service.finish_span(output_summary={"hit_count": len(chunk_hits)})
+        except Exception as exc:
+            self.trace_service.fail_span(error_message=str(exc))
+            raise
         self._enrich_hits(chunk_hits)
 
         if restrictions:
@@ -476,6 +514,14 @@ class RetrievalService:
         w = float(vector_similarity_weight)
         if w >= 1.0 - 1e-12:
             return
+        self.trace_service.start_span(
+            "retrieval.es_fusion",
+            input_summary={
+                "vector_similarity_weight": w,
+                "bm25_weight": 1.0 - w,
+                "candidate_count": len(hits),
+            },
+        )
         if self.fulltext_store is None:
             logger.info(
                 "retrieval_es skip reason=no_fulltext_store w_vector=%.4f w_text=%.4f "
@@ -484,6 +530,9 @@ class RetrievalService:
                 1.0 - w,
                 _preview_query(query),
                 len(hits),
+            )
+            self.trace_service.finish_span(
+                output_summary={"skip_reason": "no_fulltext_store"}
             )
             return
         if not hits or not filter_file_ids:
@@ -494,6 +543,9 @@ class RetrievalService:
                 len(hits),
                 len(filter_file_ids),
             )
+            self.trace_service.finish_span(
+                output_summary={"skip_reason": "no_hits_or_no_file_filter"}
+            )
             return
         chunk_ids = [str(h.get("chunk_id") or "") for h in hits if h.get("chunk_id")]
         if not chunk_ids:
@@ -502,6 +554,7 @@ class RetrievalService:
                 w,
                 len(hits),
             )
+            self.trace_service.finish_span(output_summary={"skip_reason": "no_chunk_ids"})
             return
         index_names = self._resolve_es_index_names(workspace_id, filter_file_ids)
         if not index_names:
@@ -512,6 +565,7 @@ class RetrievalService:
                 w,
                 len(filter_file_ids),
             )
+            self.trace_service.finish_span(output_summary={"skip_reason": "no_index_names"})
             return
         t0 = time.perf_counter()
         try:
@@ -528,6 +582,9 @@ class RetrievalService:
                 index_names,
                 exc,
             )
+            self.trace_service.finish_span(
+                output_summary={"skip_reason": "error", "error": str(exc)}
+            )
             return
         es_ms = (time.perf_counter() - t0) * 1000.0
         raw = [float(es_scores.get(str(h.get("chunk_id") or ""), 0.0)) for h in hits]
@@ -538,17 +595,25 @@ class RetrievalService:
         else:
             norm_t = [0.5] * len(raw)
 
+        self._record_fusion_snapshots(hits, norm_t, phase="input")
         fusion_rows: list[tuple[float, float, float, str, object]] = []
         for i, hit in enumerate(hits):
             s_v = float(hit.get("fused_score", hit.get("score", 0.0)))
             s_t = norm_t[i] if i < len(norm_t) else 0.5
             fused = w * s_v + (1.0 - w) * s_t
+            hit["bm25_score"] = s_t
             hit["fused_score"] = fused
             hit["reranked_score"] = fused
             cid = str(hit.get("chunk_id") or "")
             fusion_rows.append((fused, s_v, s_t, cid, hit.get("file_id")))
 
         fusion_rows.sort(key=lambda r: r[0], reverse=True)
+        ranked_hits = sorted(
+            hits,
+            key=lambda h: float(h.get("fused_score", h.get("reranked_score", 0.0))),
+            reverse=True,
+        )
+        self._record_fusion_snapshots(ranked_hits, None, phase="output")
         top5 = fusion_rows[:5]
         top5_s = "; ".join(
             "cid=%s fid=%s S=%.4f(Sv=%.4f,St=%.4f)" % (cid, fid, fs, sv, st)
@@ -574,6 +639,14 @@ class RetrievalService:
             w,
             1.0 - w,
             top5_s or "-",
+        )
+        self.trace_service.finish_span(
+            output_summary={
+                "candidate_count": len(hits),
+                "es_returned_scores": len(es_scores),
+                "skip_reason": None,
+            },
+            metrics={"took_ms": es_ms},
         )
 
     def _enrich_hits(self, hits: list[dict]) -> None:
@@ -669,3 +742,100 @@ class RetrievalService:
                 "Could not resolve workspace permissions; searching all files"
             )
             return None
+
+    def _embed_query(self, query: str) -> list[float]:
+        model_name = (
+            getattr(self.embedding_engine, "model_name", None)
+            or getattr(self.embedding_engine, "model", None)
+            or self.embedding_engine.__class__.__name__
+        )
+        self.trace_service.start_span(
+            "retrieval.embed_query",
+            input_summary={"embedding_model": str(model_name)},
+        )
+        try:
+            query_vec = self.embedding_engine.embed_text(query)
+            try:
+                dimension = len(query_vec)
+            except TypeError:
+                dimension = getattr(self.embedding_engine, "dimension", None)
+            self.trace_service.finish_span(
+                output_summary={
+                    "embedding_model": str(model_name),
+                    "dimension": dimension,
+                    "success": True,
+                }
+            )
+            return query_vec
+        except Exception as exc:
+            self.trace_service.fail_span(
+                error_message=str(exc),
+                metrics={"embedding_model": str(model_name), "success": False},
+            )
+            raise
+
+    def _record_chunk_search_snapshots(self, hits: list[dict]) -> None:
+        for rank, hit in enumerate(hits[:50], start=1):
+            self.trace_service.record_snapshot(
+                stage="retrieval.chunk_search",
+                rank=rank,
+                chunk_id=_safe_chunk_id(hit),
+                file_id=_safe_int(hit.get("file_id")),
+                score=_safe_float(hit.get("score")),
+                score_parts={"vector_score": _safe_float(hit.get("score"))},
+                metadata={"phase": "output"},
+            )
+
+    def _record_fusion_snapshots(
+        self,
+        hits: list[dict],
+        bm25_scores: Optional[list[float]],
+        *,
+        phase: str,
+    ) -> None:
+        for rank, hit in enumerate(hits[:50], start=1):
+            bm25_score = (
+                bm25_scores[rank - 1]
+                if bm25_scores is not None and rank - 1 < len(bm25_scores)
+                else _safe_float(hit.get("bm25_score"))
+            )
+            vector_score = _safe_float(hit.get("fused_score", hit.get("score")))
+            fused_score = _safe_float(hit.get("fused_score", vector_score))
+            self.trace_service.record_snapshot(
+                stage="retrieval.es_fusion",
+                rank=rank,
+                chunk_id=_safe_chunk_id(hit),
+                file_id=_safe_int(hit.get("file_id")),
+                score=fused_score,
+                score_parts={
+                    "vector_score": vector_score,
+                    "bm25_score": bm25_score,
+                    "fused_score": fused_score,
+                },
+                metadata={"phase": phase},
+            )
+
+
+def _safe_chunk_id(hit: dict) -> Optional[str]:
+    chunk_id = hit.get("chunk_id")
+    if chunk_id is None:
+        return None
+    return str(chunk_id)
+
+
+def _safe_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

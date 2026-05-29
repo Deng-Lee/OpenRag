@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: milvus-data
+  name: milvus-data-external-minio
   namespace: openrag
 spec:
   accessModes:
@@ -60,7 +60,7 @@ spec:
             - name: ETCD_ENDPOINTS
               value: milvus-etcd:2379
             - name: MINIO_ADDRESS
-              value: milvus-minio:9000
+              value: 172.16.31.63:9000
             - name: MINIO_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -70,7 +70,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: openrag-secrets
-                  key: MINIO_ROOT_PASSWORD
+                  key: MILVUS_SECRET_KEY
           ports:
             - containerPort: 19530
               name: grpc
@@ -79,6 +79,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/milvus
+            # Milvus v2.4.x expects Docker config at /milvus/configs/milvus.yaml.
+            # Test/preprod must verify the container loads this file before production use.
+            - name: milvus-config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+              readOnly: true
           resources:
             requests:
               memory: "2Gi"
@@ -103,4 +109,10 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: milvus-data
+            claimName: milvus-data-external-minio
+        - name: milvus-config
+          configMap:
+            name: milvus-config
+            items:
+              - key: milvus.yaml
+                path: milvus.yaml
