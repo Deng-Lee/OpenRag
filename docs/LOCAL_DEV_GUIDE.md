@@ -27,6 +27,7 @@ OpenRag 依赖于多个外部服务。我们提供了 `docker-compose.dev.yml` �
 3. 启动开发环境的 Docker 容器：
    ```bash
    docker-compose -f docker-compose.dev.yml up -d
+   docker compose -f docker-compose.dev.yml up -d postgres etcd minio milvus elasticsearch
    ```
 4. 检查服务是否全部正常运行（看到 `Up` 状态即可）：
    ```bash
@@ -191,5 +192,96 @@ python -m pytest tests/parity tests/test_chunk_engine.py -q
 # 契约子集（与 pytest.ini 中 python_files 一致；用于 CI/稳定接口）
 python -m pytest tests/test_service_api.py -v
 ```
+
+---
+
+## Windows 本地启动速查
+
+下面这组命令适合在 Windows PowerShell 中启动当前本地开发环境。
+
+### 1. 启动 Docker 依赖
+
+先启动后端依赖的基础服务。至少需要 PostgreSQL 和 MinIO；如果要跑完整文档处理、向量检索或全文检索，也一起启动 Milvus、Etcd、Elasticsearch。
+
+```powershell
+cd E:\project\OpenRag\docker
+docker compose -f docker-compose.dev.yml up -d postgres etcd minio milvus elasticsearch
+docker compose -f docker-compose.dev.yml ps
+```
+
+如果只是验证页面和基础文件接口，PostgreSQL + MinIO 通常是最低要求：
+
+```powershell
+cd E:\project\OpenRag\docker
+docker compose -f docker-compose.dev.yml up -d postgres minio
+```
+
+### 2. 迁移真实数据库
+
+在后端目录执行 Alembic 迁移。看到 `Context impl PostgresqlImpl` 且命令正常返回，通常表示已经迁移到最新；也可以用 `current` 确认版本。
+
+```powershell
+cd E:\project\OpenRag\openrag
+python -c "from alembic.config import main; main(argv=['upgrade','head'])"
+python -c "from alembic.config import main; main(argv=['current'])"
+```
+
+### 3. 启动后端 API
+
+```powershell
+cd E:\project\OpenRag\openrag
+$env:PYTHONPATH = "src;."
+$env:PORT = "8001"
+python run_api.py
+```
+
+后端健康检查：
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8001/health
+```
+
+### 4. 启动前端
+
+另开一个 PowerShell 窗口：
+
+```powershell
+cd E:\project\OpenRag\web
+$env:VITE_API_URL = "http://127.0.0.1:8001"
+npm run dev -- --host 127.0.0.1 --port 3000
+```
+
+然后访问：
+
+```text
+http://127.0.0.1:3000
+```
+
+### 5. 可选：启动 Task Worker
+
+上传文档后，如果希望文档自动解析、切块和入库，需要额外启动 worker。
+
+```powershell
+cd E:\project\OpenRag\openrag
+$env:PYTHONPATH = "src;."
+python -m openrag.worker.task_worker --num-workers 1 --api-url http://127.0.0.1:8001
+```
+
+### 6. 端口占用处理
+
+如果 `8001` 或 `3000` 已被占用，先找正在监听的 PID：
+
+```powershell
+netstat -ano | Select-String ":8001" | Select-String "LISTENING"
+netstat -ano | Select-String ":3000" | Select-String "LISTENING"
+```
+
+停止对应进程：
+
+```powershell
+Stop-Process -Id <PID> -Force
+```
+
+注意：`TIME_WAIT` 且 PID 为 `0` 的行不是正在运行的服务，不需要停止。
 
 Parity 用例依赖 `pytest` 的 `pythonpath`（已配置为仓库根目录与 `src/`），以便加载 `openrag` 与 `common`。可选黄金样本说明见 `openrag/tests/parity/fixtures/README.md`。

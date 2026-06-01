@@ -9,6 +9,7 @@ import AdminPermissions from './pages/AdminPermissions';
 import ServiceTokens from './pages/ServiceTokens';
 import Settings from './pages/Settings';
 import SearchPage from './pages/Search';
+import DocumentChunks from './pages/DocumentChunks';
 import { authAPI } from './services/api';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -61,6 +62,14 @@ function App() {
           element={
             <ProtectedRoute>
               <SearchPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/workspaces/:workspaceId/files/:fileId/chunks"
+          element={
+            <ProtectedRoute>
+              <DocumentChunks />
             </ProtectedRoute>
           }
         />

@@ -2,7 +2,7 @@
 
 import logging
 import time
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -123,6 +123,40 @@ def _chunk_token_stats(chunks) -> dict:
         "token_min": min(token_counts),
         "token_max": max(token_counts),
         "token_mean": round(sum(token_counts) / len(token_counts), 2),
+    }
+
+
+def _coerce_int_list(value: Any) -> Optional[list[int]]:
+    if value is None or not isinstance(value, (list, tuple)):
+        return None
+    try:
+        return [int(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_position_int(value: Any) -> Optional[list[list[int]]]:
+    if value is None or not isinstance(value, (list, tuple)):
+        return None
+    positions: list[list[int]] = []
+    try:
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) != 5:
+                return None
+            positions.append([int(part) for part in item])
+    except (TypeError, ValueError):
+        return None
+    return positions
+
+
+def _extract_chunk_position_fields(chunk) -> dict:
+    metadata = getattr(chunk, "metadata", None) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "page_num_int": _coerce_int_list(metadata.get("page_num_int")),
+        "position_int": _coerce_position_int(metadata.get("position_int")),
+        "top_int": _coerce_int_list(metadata.get("top_int")),
     }
 
 
@@ -702,6 +736,7 @@ class DocumentProcessor:
             self.db.add(
                 DocumentChunk(
                     **chunk_kwargs,
+                    **_extract_chunk_position_fields(chunk),
                     file_id=file_id,
                     workspace_id=file_record.workspace_id,
                     chunk_id=cid,

@@ -248,6 +248,38 @@
   "common": {
     "delete": "删除"
   },
+  "documentChunks": {
+    "title": "文档切块详情",
+    "back": "返回",
+    "fileFallback": "文件 #{{fileId}}",
+    "workspaceId": "工作区 {{workspaceId}}",
+    "fileId": "文件 {{fileId}}",
+    "previewLabel": "原文预览",
+    "listLabel": "切块列表",
+    "searchPlaceholder": "搜索切块内容",
+    "stats": "共 {{total}} 个切块",
+    "chunk": {
+      "index": "切块 {{index}}",
+      "page": "第 {{page}} 页",
+      "truncated": "已截断",
+      "noText": "无文本内容"
+    },
+    "position": {
+      "page": "第 {{page}} 页",
+      "textRange": "文本区间",
+      "visual": "视觉定位",
+      "none": "无定位元数据"
+    },
+    "empty": {
+      "noChunks": "该文件暂无切块",
+      "search": "没有匹配搜索条件的切块",
+      "selectChunk": "选择右侧切块后预览原文"
+    },
+    "errors": {
+      "invalidRoute": "工作区或文件路由无效",
+      "loadFailed": "加载文档切块失败"
+    }
+  },
   "searchPage": {
     "title": "语义检索",
     "query": "问题 / 关键词",

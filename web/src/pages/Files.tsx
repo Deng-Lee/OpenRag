@@ -836,6 +836,7 @@ export default function Files() {
                   onFileReprocessed={() => void loadFiles().catch(() => {})}
                   loading={loading}
                   canWrite={canWrite}
+                  workspaceId={currentWorkspace?.id}
                 />
               </Card>
             </>

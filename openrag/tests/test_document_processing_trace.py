@@ -11,6 +11,11 @@ from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.workspace import Workspace
 from openrag.parsers.base import DocumentBlock
+from openrag.processors.document_processor import (
+    _coerce_int_list,
+    _coerce_position_int,
+    _extract_chunk_position_fields,
+)
 from openrag.services import file_ingest
 from openrag.tracing.context import reset_trace_context, set_trace_context
 from openrag.worker import task_worker
@@ -88,7 +93,18 @@ class FakeParserRegistry:
 class FakeChunkEngine:
     def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
         return [
-            Chunk(text="Heading body", chunk_id="chunk-1", page=1, level=1, block_type="heading"),
+            Chunk(
+                text="Heading body",
+                chunk_id="chunk-1",
+                page=1,
+                level=1,
+                block_type="heading",
+                metadata={
+                    "page_num_int": [1],
+                    "position_int": [[1, 10, 120, 30, 58]],
+                    "top_int": [30],
+                },
+            ),
             Chunk(text="tiny", chunk_id="chunk-2", page=2, block_type="text"),
             Chunk(text="", chunk_id="chunk-3", page=2, block_type="text"),
         ]
@@ -162,6 +178,26 @@ def _seed_file(db):
 
 def teardown_function():
     reset_trace_context()
+
+
+def test_extract_chunk_position_fields_coerces_ragflow_metadata():
+    chunk = Chunk(
+        text="positioned",
+        chunk_id="chunk-positioned",
+        metadata={
+            "page_num_int": ("1",),
+            "position_int": [(1, "10", 120, 30.0, 58)],
+            "top_int": ["30"],
+        },
+    )
+
+    assert _coerce_int_list(chunk.metadata["page_num_int"]) == [1]
+    assert _coerce_position_int(chunk.metadata["position_int"]) == [[1, 10, 120, 30, 58]]
+    assert _extract_chunk_position_fields(chunk) == {
+        "page_num_int": [1],
+        "position_int": [[1, 10, 120, 30, 58]],
+        "top_int": [30],
+    }
 
 
 def test_upload_ingest_records_upload_trace_spans(monkeypatch):
@@ -322,6 +358,10 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             assert stages["fulltext.es_index"].output_summary["upsert_count"] == 3
             assert stages["metadata.persist_chunks"].output_summary["document_chunks_written"] == 3
             assert db2.query(DocumentChunk).count() == 3
+            first_chunk = db2.query(DocumentChunk).filter_by(chunk_id="chunk-1").one()
+            assert first_chunk.page_num_int == [1]
+            assert first_chunk.position_int == [[1, 10, 120, 30, 58]]
+            assert first_chunk.top_int == [30]
             assert db2.query(DocumentParseArtifact).count() == 1
             keys = [key for (_bucket, key) in processing_minio.objects]
             assert any(key.endswith("/canonical.json") for key in keys)

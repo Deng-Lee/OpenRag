@@ -1,0 +1,6 @@
+interface:
+  display_name: "Subagent 模块化开发流程"
+  short_description: "用编码、验证、评审闸门推进模块开发。"
+  default_prompt: "使用 $subagent-module-workflow 按编码、验证、评审三个 subagent 闸门执行当前模块。"
+policy:
+  allow_implicit_invocation: true

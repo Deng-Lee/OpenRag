@@ -248,6 +248,38 @@
   "common": {
     "delete": "Delete"
   },
+  "documentChunks": {
+    "title": "Document chunks",
+    "back": "Back",
+    "fileFallback": "File #{{fileId}}",
+    "workspaceId": "Workspace {{workspaceId}}",
+    "fileId": "File {{fileId}}",
+    "previewLabel": "Source preview",
+    "listLabel": "Chunk list",
+    "searchPlaceholder": "Search chunks",
+    "stats": "{{total}} chunk(s)",
+    "chunk": {
+      "index": "Chunk {{index}}",
+      "page": "Page {{page}}",
+      "truncated": "Truncated",
+      "noText": "No text content"
+    },
+    "position": {
+      "page": "Page {{page}}",
+      "textRange": "Text range",
+      "visual": "Visual position",
+      "none": "No positioning metadata"
+    },
+    "empty": {
+      "noChunks": "No chunks found for this file",
+      "search": "No chunks match this search",
+      "selectChunk": "Select a chunk to preview the source"
+    },
+    "errors": {
+      "invalidRoute": "Invalid workspace or file route",
+      "loadFailed": "Failed to load document chunks"
+    }
+  },
   "searchPage": {
     "title": "Semantic search",
     "query": "Query",

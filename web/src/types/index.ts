@@ -46,6 +46,44 @@ export interface File {
   error_message?: string | null;
 }
 
+export interface WorkspaceFileSummary {
+  id: number;
+  workspace_id: number;
+  name: string;
+  uri: string;
+  mime_type?: string | null;
+  processing_status?: string | null;
+  simple_status?: SimpleStatus | string | null;
+  total_chunks: number;
+}
+
+export interface DocumentChunkItem {
+  file_id: number;
+  workspace_id: number;
+  filename: string;
+  chunk_id: string;
+  chunk_index: number;
+  text: string;
+  is_truncated: boolean;
+  page?: number | null;
+  bbox_x0?: number | null;
+  bbox_y0?: number | null;
+  bbox_x1?: number | null;
+  bbox_y1?: number | null;
+  source_char_start?: number | null;
+  source_char_end?: number | null;
+  position_int?: number[][] | null;
+  positions?: number[][] | null;
+}
+
+export interface DocumentChunkListResponse {
+  file: WorkspaceFileSummary;
+  items: DocumentChunkItem[];
+  total: number;
+  skip: number;
+  limit: number;
+}
+
 export interface SearchRequest {
   query: string;
   top_k?: number;

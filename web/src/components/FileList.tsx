@@ -5,6 +5,7 @@ import type { File, SimpleStatus } from '../types';
 import { filesAPI } from '../services/api';
 import FilePreviewModal from './FilePreviewModal';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
 
 const { Text } = Typography;
 
@@ -24,8 +25,9 @@ interface FileListProps {
   workspaceId?: number;
 }
 
-export default function FileList({ files, onFileDeleted, onFileReprocessed, loading, canWrite = false }: FileListProps) {
+export default function FileList({ files, onFileDeleted, onFileReprocessed, loading, canWrite = false, workspaceId }: FileListProps) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
 
   const [isReprocessModalOpen, setIsReprocessModalOpen] = useState(false);
   const [reprocessingFile, setReprocessingFile] = useState<File | null>(null);
@@ -77,6 +79,16 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
     }
   };
 
+  const openDocumentChunks = (record: File) => {
+    if (record.simple_status === 'done' && workspaceId && !record.is_directory) {
+      navigate(`/workspaces/${workspaceId}/files/${record.id}/chunks`);
+      return;
+    }
+    if (!record.is_directory) {
+      setPreviewFile(record);
+    }
+  };
+
   const columns = [
     {
       title: t('files.columns.name'),
@@ -92,7 +104,7 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
           ) : (
             <Button
               type="link"
-              onClick={() => setPreviewFile(record)}
+              onClick={() => openDocumentChunks(record)}
               style={{ padding: 0, height: 'auto', fontWeight: 600 }}
             >
               {text || record.uri?.split('/').pop()}

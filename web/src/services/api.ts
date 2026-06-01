@@ -16,6 +16,7 @@ import type {
   ServiceTokenCreated,
   WorkspaceBindingRequest,
   BindingPatchRequest,
+  DocumentChunkListResponse,
   Role,
   RoleCreate,
   RoleUpdate,
@@ -183,6 +184,25 @@ export const filesAPI = {
   /** Office / 部分文本的后端结构化预览 */
   fetchPreview: async (id: number): Promise<{ format: 'html' | 'text'; content: string }> => {
     const response = await api.get(`/files/${id}/preview`);
+    return response.data as { format: 'html' | 'text'; content: string };
+  },
+  listChunks: async (
+    workspaceId: number,
+    fileId: number,
+    params?: { skip?: number; limit?: number; q?: string }
+  ): Promise<DocumentChunkListResponse> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/chunks`, { params });
+    return response.data as DocumentChunkListResponse;
+  },
+  fetchWorkspaceContentBlob: async (workspaceId: number, fileId: number): Promise<Blob> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/content`, { responseType: 'blob' });
+    return response.data as Blob;
+  },
+  fetchWorkspacePreview: async (
+    workspaceId: number,
+    fileId: number
+  ): Promise<{ format: 'html' | 'text'; content: string }> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/preview`);
     return response.data as { format: 'html' | 'text'; content: string };
   },
 };
