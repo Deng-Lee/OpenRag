@@ -11,10 +11,7 @@ import { filesAPI } from '../../services/api';
 import { classifyPreviewFile } from '../../utils/file-preview-kind';
 import {
   chunkDomId,
-  scrollByRatio,
-  scrollContainerToChildCenter,
   scrollElementIntoScrollParent,
-  scrollToSnippetInElement,
 } from '../../utils/chunk-preview-navigation';
 
 import '../file-preview.css';
@@ -105,15 +102,6 @@ function chunkAnchorAttrs(chunk: SourcePreviewChunk, instanceId?: string) {
     id: chunkAnchorDomId(chunk, instanceId),
     'data-chunk-anchor': chunkAnchorId(chunk),
   };
-}
-
-function findChunkAnchor(root: HTMLElement, chunk: SourcePreviewChunk): HTMLElement | null {
-  const aid = chunkAnchorId(chunk);
-  const anchors = root.querySelectorAll<HTMLElement>('[data-chunk-anchor]');
-  for (const anchor of anchors) {
-    if (anchor.dataset.chunkAnchor === aid) return anchor;
-  }
-  return null;
 }
 
 function findPdfPage(root: HTMLElement, pageNumber: number): HTMLElement | null {
@@ -568,91 +556,6 @@ export function DocumentSourcePreview({
     };
   }, [active, kind, numPages, highlightPdfPage, pdfScale, scrollPdfToTarget]);
 
-  const runTextNav = useCallback(() => {
-    if (!active || !chunk || !scrollRef.current) return;
-    const root = scrollRef.current;
-    const anchor = findChunkAnchor(root, chunk);
-    if (anchor) {
-      scrollContainerToChildCenter(root, anchor, 'auto');
-      anchor.classList.add('chunk-highlight-pulse');
-      window.setTimeout(() => anchor.classList.remove('chunk-highlight-pulse'), 2000);
-      return;
-    }
-    if (!['text', 'markdown', 'html', 'office'].includes(kind)) return;
-    const startOffset = getChunkStartOffset(chunk);
-    if (kind === 'text' && textBody && textBody.length > 0 && startOffset != null) {
-      scrollByRatio(root, Math.min(1, startOffset / Math.max(textBody.length, 1)));
-      return;
-    }
-    if (kind === 'office' && officeText != null && officeText.length > 0 && startOffset != null) {
-      scrollByRatio(root, Math.min(1, startOffset / Math.max(officeText.length, 1)));
-      return;
-    }
-    if (kind === 'markdown' && markdownBody && markdownBody.length > 0 && startOffset != null) {
-      scrollByRatio(root, Math.min(1, startOffset / markdownBody.length));
-      return;
-    }
-    if (kind === 'html' && htmlBody) {
-      const el = root.querySelector<HTMLElement>('.file-preview-html');
-      if (el) {
-        const found = scrollToSnippetInElement(el, root, chunk.text || '', {
-          flashClass: 'chunk-text-highlight',
-        });
-        if (!found && startOffset != null) {
-          scrollByRatio(root, Math.min(1, startOffset / Math.max(htmlBody.length, 1)));
-        }
-      }
-    }
-  }, [active, kind, chunkLoadKey, textBody, markdownBody, htmlBody, officeText]);
-
-  useLayoutEffect(() => {
-    if (!active || loading) return;
-    if (!['text', 'markdown', 'html', 'office'].includes(kind)) return;
-    if (kind === 'text' && textBody == null) return;
-    if (kind === 'markdown' && markdownBody == null) return;
-    if (kind === 'html' && htmlBody == null) return;
-    if (kind === 'office' && officeText == null && officeHtml == null) return;
-    requestAnimationFrame(() => {
-      requestAnimationFrame(runTextNav);
-    });
-    const t1 = window.setTimeout(runTextNav, 180);
-    const t2 = window.setTimeout(runTextNav, 450);
-    const t3 = window.setTimeout(runTextNav, 900);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-      clearTimeout(t3);
-    };
-  }, [
-    active,
-    loading,
-    kind,
-    textBody,
-    markdownBody,
-    htmlBody,
-    officeText,
-    officeHtml,
-    chunkLoadKey,
-    runTextNav,
-  ]);
-
-  useLayoutEffect(() => {
-    if (!active || loading || kind !== 'office' || !officeHtml || !chunk) return;
-    const root = scrollRef.current;
-    const run = () => {
-      const host = officeHostRef.current;
-      if (!root || !host) return;
-      scrollToSnippetInElement(host, root, chunk.text || '', { flashClass: 'chunk-text-highlight' });
-    };
-    requestAnimationFrame(() => requestAnimationFrame(run));
-    const t1 = window.setTimeout(run, 150);
-    const t2 = window.setTimeout(run, 450);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, [active, loading, kind, officeHtml, chunkLoadKey]);
-
   const title = file && !file.is_directory ? file.name || file.uri?.split('/').pop() || '' : '';
 
   return (
@@ -721,8 +624,10 @@ export function DocumentSourcePreview({
             <div style={{ textAlign: 'center' }}>
               <img src={imageUrl} alt={title} style={{ maxWidth: '100%', height: 'auto' }} />
             </div>
-          ) : kind === 'markdown' && markdownBody != null && chunk ? (
-            <div className="file-preview-markdown">{renderMarkdownWithAnchor(markdownBody, chunk, instanceDomId)}</div>
+          ) : kind === 'markdown' && markdownBody != null ? (
+            <div className="file-preview-markdown">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownBody}</ReactMarkdown>
+            </div>
           ) : kind === 'html' && htmlBody != null ? (
             <div
               className="file-preview-html"
@@ -730,7 +635,7 @@ export function DocumentSourcePreview({
                 __html: DOMPurify.sanitize(htmlBody, { USE_PROFILES: { html: true } }),
               }}
             />
-          ) : kind === 'text' && textBody != null && chunk ? (
+          ) : kind === 'text' && textBody != null ? (
             <pre
               style={{
                 whiteSpace: 'pre-wrap',
@@ -740,7 +645,7 @@ export function DocumentSourcePreview({
                 margin: 0,
               }}
             >
-              {renderTextWithNav(textBody, chunk, instanceDomId)}
+              {textBody}
             </pre>
           ) : kind === 'office' && officeHtml != null ? (
             <div
@@ -750,9 +655,9 @@ export function DocumentSourcePreview({
                 __html: DOMPurify.sanitize(officeHtml, { USE_PROFILES: { html: true } }),
               }}
             />
-          ) : kind === 'office' && officeText != null && chunk ? (
+          ) : kind === 'office' && officeText != null ? (
             <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>
-              {renderTextWithNav(officeText, chunk, instanceDomId)}
+              {officeText}
             </pre>
           ) : !loading && kind === 'unsupported' ? (
             <Alert type="info" message={t('files.preview.unsupported')} showIcon />
