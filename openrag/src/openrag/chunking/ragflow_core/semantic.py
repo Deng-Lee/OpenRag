@@ -207,6 +207,74 @@ def find_chunk_pos_robust(full_text: str, chunk_text: str, search_from: int) -> 
     return full_map[n_pos]
 
 
+def _range_overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    """Return whether half-open ranges [a_start,a_end) and [b_start,b_end) overlap."""
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+def _line_positions_for_span(
+    blocks: list[DocumentBlock], start: int, end: int
+) -> list[tuple[int, float, float, float, float]]:
+    """Return line positions whose character spans intersect the chunk span."""
+    positions: list[tuple[int, float, float, float, float]] = []
+    for block in blocks:
+        line_positions = (block.metadata or {}).get("line_positions")
+        if not isinstance(line_positions, list):
+            continue
+        for line in line_positions:
+            if not _range_overlaps(start, end, line["char_start"], line["char_end"]):
+                continue
+            positions.append(
+                (
+                    int(line["page"]) - 1,
+                    float(line["x0"]),
+                    float(line["x1"]),
+                    float(line["top"]),
+                    float(line["bottom"]),
+                )
+            )
+    positions.sort(key=lambda pos: (pos[0], pos[3], pos[4], pos[1]))
+    return positions
+
+
+def _block_positions_for_covered_blocks(
+    covered: list[DocumentBlock],
+) -> list[tuple[int, float, float, float, float]]:
+    """Return legacy block bbox positions for covered blocks."""
+    positions: list[tuple[int, float, float, float, float]] = []
+    seen_pages: set[int] = set()
+    for cb in covered:
+        if cb.bbox is None or len(cb.bbox) != 4:
+            continue
+        x0, y0, x1, y1 = cb.bbox
+        positions.append((max(0, cb.page - 1), x0, x1, y0, y1))
+        seen_pages.add(cb.page)
+        page_bboxes = (cb.metadata or {}).get("page_bboxes")
+        if isinstance(page_bboxes, dict):
+            for pg_str, bb in page_bboxes.items():
+                pg_1b = int(pg_str)
+                if pg_1b in seen_pages:
+                    continue
+                seen_pages.add(pg_1b)
+                positions.append((pg_1b - 1, bb[0], bb[2], bb[1], bb[3]))
+    return positions
+
+
+def _bbox_union_for_positions(
+    positions: list[tuple], page_1based: int
+) -> tuple[float, float, float, float] | None:
+    """Return bbox union for positions on the requested 1-based page."""
+    page_0based = page_1based - 1
+    page_positions = [pos for pos in positions if pos[0] == page_0based]
+    if not page_positions:
+        return None
+    x0s = [float(pos[1]) for pos in page_positions]
+    x1s = [float(pos[2]) for pos in page_positions]
+    tops = [float(pos[3]) for pos in page_positions]
+    bottoms = [float(pos[4]) for pos in page_positions]
+    return (min(x0s), min(tops), max(x1s), max(bottoms))
+
+
 def _overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
     """Return overlap length of [a0,a1) and [b0,b1)."""
     return max(0, min(a1, b1) - max(a0, b0))
@@ -592,22 +660,10 @@ def chunk_semantic_ragflow(
             if child_split_pattern:
                 part_meta["mom_with_weight"] = chunk_text
             part_meta.update(ragflow_tokenize_fields(part_text))
-            poss: list[tuple[float, float, float, float, float]] = []
-            seen_pages: set[int] = set()
-            for cb in covered:
-                if cb.bbox is None or len(cb.bbox) != 4:
-                    continue
-                x0, y0, x1, y1 = cb.bbox
-                poss.append((max(0, cb.page - 1), x0, x1, y0, y1))
-                seen_pages.add(cb.page)
-                page_bboxes = (cb.metadata or {}).get("page_bboxes")
-                if isinstance(page_bboxes, dict):
-                    for pg_str, bb in page_bboxes.items():
-                        pg_1b = int(pg_str)
-                        if pg_1b in seen_pages:
-                            continue
-                        seen_pages.add(pg_1b)
-                        poss.append((pg_1b - 1, bb[0], bb[2], bb[1], bb[3]))
+            line_positions = _line_positions_for_span(covered, ps, pe)
+            poss = line_positions
+            if not poss:
+                poss = _block_positions_for_covered_blocks(covered)
             if not poss:
                 ii = generated_idx
                 poss = [(ii, ii, ii, ii, ii)]
@@ -615,15 +671,21 @@ def chunk_semantic_ragflow(
 
             page_for_chunk = owner.page
             bbox_for_chunk = owner.bbox
-            same_page_boxes = [
-                cb.bbox for cb in covered if cb.page == page_for_chunk and cb.bbox is not None
-            ]
-            if same_page_boxes:
-                xs0 = [float(bb[0]) for bb in same_page_boxes]
-                ys0 = [float(bb[1]) for bb in same_page_boxes]
-                xs1 = [float(bb[2]) for bb in same_page_boxes]
-                ys1 = [float(bb[3]) for bb in same_page_boxes]
-                bbox_for_chunk = (min(xs0), min(ys0), max(xs1), max(ys1))
+            line_bbox = _bbox_union_for_positions(line_positions, page_for_chunk)
+            if line_bbox is not None:
+                bbox_for_chunk = line_bbox
+            else:
+                same_page_boxes = [
+                    cb.bbox
+                    for cb in covered
+                    if cb.page == page_for_chunk and cb.bbox is not None
+                ]
+                if same_page_boxes:
+                    xs0 = [float(bb[0]) for bb in same_page_boxes]
+                    ys0 = [float(bb[1]) for bb in same_page_boxes]
+                    xs1 = [float(bb[2]) for bb in same_page_boxes]
+                    ys1 = [float(bb[3]) for bb in same_page_boxes]
+                    bbox_for_chunk = (min(xs0), min(ys0), max(xs1), max(ys1))
             chunks.append(
                 Chunk(
                     text=part_text,

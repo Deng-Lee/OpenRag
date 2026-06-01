@@ -3,6 +3,12 @@
 import pytest
 from src.openrag.parsers.base import DocumentBlock
 from src.openrag.chunking.chunk_models import Chunk
+from src.openrag.chunking.ragflow_core import semantic as semantic_core
+from src.openrag.chunking.ragflow_core.semantic import (
+    _bbox_union_for_positions,
+    _line_positions_for_span,
+    _range_overlaps,
+)
 from src.openrag.chunking.chunk_engine import (
     ChunkEngine,
     ChunkStrategy,
@@ -290,8 +296,8 @@ class TestSemanticChunking:
         assert "content_sm_ltks" in md
         assert md["content_with_weight"].startswith("hello")
 
-    def test_semantic_adds_ragflow_position_fields(self):
-        """Semantic chunk metadata includes RagFlow add_positions fields."""
+    def test_semantic_adds_ragflow_position_fields_from_block_bbox_without_lines(self):
+        """Semantic chunk metadata falls back to block bbox positions without lines."""
         engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
         text_blocks = [
             DocumentBlock(
@@ -308,7 +314,175 @@ class TestSemanticChunking:
         md = chunks[0].metadata
         assert md["page_num_int"] == [3]
         assert md["top_int"] == [20]
+        assert len(md["position_int"]) == 1
         assert md["position_int"][0] == (3, 10, 30, 20, 40)
+
+    def test_semantic_position_fields_use_line_positions_when_available(self):
+        """Semantic chunk metadata uses line-level positions instead of block bbox."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="first\nsecond\nthird",
+                page=1,
+                offset=0,
+                bbox=(10.0, 100.0, 90.0, 160.0),
+                block_type="text",
+                level=0,
+                metadata={
+                    "line_positions": [
+                        {
+                            "page": 1,
+                            "x0": 10.0,
+                            "x1": 20.0,
+                            "top": 10.0,
+                            "bottom": 15.0,
+                            "char_start": 0,
+                            "char_end": 5,
+                            "text": "first",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 10.0,
+                            "x1": 30.0,
+                            "top": 20.0,
+                            "bottom": 25.0,
+                            "char_start": 6,
+                            "char_end": 12,
+                            "text": "second",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 10.0,
+                            "x1": 25.0,
+                            "top": 30.0,
+                            "bottom": 35.0,
+                            "char_start": 13,
+                            "char_end": 18,
+                            "text": "third",
+                        },
+                    ]
+                },
+            )
+        ]
+
+        chunks = engine.chunk(text_blocks, chunk_size=512, chunk_overlap=0)
+
+        md = chunks[0].metadata
+        assert md["position_int"] == [
+            (1, 10, 20, 10, 15),
+            (1, 10, 30, 20, 25),
+            (1, 10, 25, 30, 35),
+        ]
+        assert md["position_int"] != [(1, 10, 90, 100, 160)]
+        assert md["page_num_int"] == [1, 1, 1]
+        assert md["top_int"] == [10, 20, 30]
+
+    def test_semantic_bbox_uses_line_position_union_for_split_part(self, monkeypatch):
+        """Chunk bbox follows matched line positions instead of the full source block."""
+        monkeypatch.setenv("OPENRAG_CHILDREN_DELIMITER", "`|`")
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="first|second\nthird",
+                page=1,
+                offset=0,
+                bbox=(0.0, 0.0, 500.0, 500.0),
+                block_type="text",
+                level=0,
+                metadata={
+                    "line_positions": [
+                        {
+                            "page": 1,
+                            "x0": 10.0,
+                            "x1": 30.0,
+                            "top": 10.0,
+                            "bottom": 20.0,
+                            "char_start": 0,
+                            "char_end": 5,
+                            "text": "first",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 40.0,
+                            "x1": 80.0,
+                            "top": 30.0,
+                            "bottom": 40.0,
+                            "char_start": 6,
+                            "char_end": 12,
+                            "text": "second",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 35.0,
+                            "x1": 75.0,
+                            "top": 45.0,
+                            "bottom": 55.0,
+                            "char_start": 13,
+                            "char_end": 18,
+                            "text": "third",
+                        },
+                    ]
+                },
+            )
+        ]
+
+        chunks = engine.chunk(text_blocks, chunk_size=512, chunk_overlap=0)
+
+        assert len(chunks) == 2
+        assert chunks[1].text == "second\nthird"
+        assert chunks[1].metadata["position_int"] == [
+            (1, 40, 80, 30, 40),
+            (1, 35, 75, 45, 55),
+        ]
+        assert chunks[1].bbox == (35.0, 30.0, 80.0, 55.0)
+        assert chunks[1].bbox != (0.0, 0.0, 500.0, 500.0)
+
+    def test_semantic_bbox_keeps_block_union_without_line_positions(self):
+        """Chunk bbox keeps covered block union when no line positions are present."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="left block",
+                page=1,
+                offset=0,
+                bbox=(10.0, 20.0, 40.0, 60.0),
+                block_type="text",
+                level=0,
+            ),
+            DocumentBlock(
+                text="right block",
+                page=1,
+                offset=20,
+                bbox=(50.0, 15.0, 90.0, 70.0),
+                block_type="text",
+                level=0,
+            ),
+        ]
+
+        chunks = engine.chunk(text_blocks, chunk_size=512, chunk_overlap=0)
+
+        assert len(chunks) >= 1
+        assert chunks[0].bbox == (10.0, 15.0, 90.0, 70.0)
+
+    def test_semantic_dummy_position_metadata_without_bbox_or_lines(self):
+        """Semantic chunks keep dummy position metadata when no geometry exists."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="no geometry",
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+            )
+        ]
+
+        chunks = engine.chunk(text_blocks, chunk_size=512, chunk_overlap=0)
+
+        md = chunks[0].metadata
+        assert md["page_num_int"] == [1]
+        assert md["top_int"] == [0]
+        assert md["position_int"] == [(1, 0, 0, 0, 0)]
 
     def test_semantic_children_split_sets_mom_with_weight(self, monkeypatch):
         """Children split chunk should carry mom_with_weight like RagFlow."""
@@ -549,6 +723,205 @@ class TestChunkSearchRobustness:
         chunk = "alpha beta gamma"
         pos = _find_chunk_pos_robust(full, chunk, 0)
         assert pos == 0
+
+
+class TestSemanticLinePositions:
+    """Tests for semantic line-position helpers."""
+
+    def test_range_overlaps_uses_half_open_intervals(self):
+        assert _range_overlaps(0, 5, 4, 8) is True
+        assert _range_overlaps(0, 5, 5, 8) is False
+        assert _range_overlaps(5, 8, 0, 5) is False
+        assert _range_overlaps(0, 10, 2, 3) is True
+
+    def test_line_positions_for_span_matches_second_and_third_lines(self):
+        block = DocumentBlock(
+            text="first\nsecond\nthird",
+            page=1,
+            offset=0,
+            block_type="text",
+            level=0,
+            metadata={
+                "line_positions": [
+                    {
+                        "page": 1,
+                        "x0": 10.0,
+                        "x1": 20.0,
+                        "top": 10.0,
+                        "bottom": 15.0,
+                        "char_start": 0,
+                        "char_end": 5,
+                        "text": "first",
+                    },
+                    {
+                        "page": 1,
+                        "x0": 10.0,
+                        "x1": 30.0,
+                        "top": 20.0,
+                        "bottom": 25.0,
+                        "char_start": 6,
+                        "char_end": 12,
+                        "text": "second",
+                    },
+                    {
+                        "page": 1,
+                        "x0": 10.0,
+                        "x1": 25.0,
+                        "top": 30.0,
+                        "bottom": 35.0,
+                        "char_start": 13,
+                        "char_end": 18,
+                        "text": "third",
+                    },
+                ]
+            },
+        )
+
+        positions = _line_positions_for_span([block], 11, 18)
+
+        assert positions == [
+            (0, 10.0, 30.0, 20.0, 25.0),
+            (0, 10.0, 25.0, 30.0, 35.0),
+        ]
+        assert all(isinstance(pos[0], int) for pos in positions)
+
+    def test_line_positions_for_span_returns_empty_when_no_lines_overlap(self):
+        block = DocumentBlock(
+            text="first\nsecond",
+            page=1,
+            offset=0,
+            block_type="text",
+            level=0,
+            metadata={
+                "line_positions": [
+                    {
+                        "page": 1,
+                        "x0": 10.0,
+                        "x1": 20.0,
+                        "top": 10.0,
+                        "bottom": 15.0,
+                        "char_start": 0,
+                        "char_end": 5,
+                        "text": "first",
+                    }
+                ]
+            },
+        )
+
+        assert _line_positions_for_span([block], 6, 12) == []
+
+    def test_block_positions_for_covered_blocks_keeps_old_bbox_positions(self):
+        assert hasattr(semantic_core, "_block_positions_for_covered_blocks")
+        block = DocumentBlock(
+            text="with extra page",
+            page=2,
+            offset=0,
+            bbox=(10.0, 20.0, 30.0, 40.0),
+            block_type="text",
+            level=0,
+            metadata={"page_bboxes": {"3": (50.0, 60.0, 70.0, 80.0)}},
+        )
+
+        assert semantic_core._block_positions_for_covered_blocks([block]) == [
+            (1, 10.0, 30.0, 20.0, 40.0),
+            (2, 50.0, 70.0, 60.0, 80.0),
+        ]
+
+    def test_line_positions_for_span_sorts_multiple_blocks_and_pages(self):
+        blocks = [
+            DocumentBlock(
+                text="page two",
+                page=2,
+                offset=0,
+                block_type="text",
+                level=0,
+                metadata={
+                    "line_positions": [
+                        {
+                            "page": 2,
+                            "x0": 40.0,
+                            "x1": 50.0,
+                            "top": 20.0,
+                            "bottom": 30.0,
+                            "char_start": 20,
+                            "char_end": 28,
+                            "text": "page two",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 25.0,
+                            "x1": 35.0,
+                            "top": 10.0,
+                            "bottom": 15.0,
+                            "char_start": 10,
+                            "char_end": 18,
+                            "text": "late line",
+                        },
+                    ]
+                },
+            ),
+            DocumentBlock(
+                text="page one",
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+                metadata={
+                    "line_positions": [
+                        {
+                            "page": 1,
+                            "x0": 5.0,
+                            "x1": 15.0,
+                            "top": 10.0,
+                            "bottom": 15.0,
+                            "char_start": 0,
+                            "char_end": 8,
+                            "text": "page one",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 1.0,
+                            "x1": 12.0,
+                            "top": 3.0,
+                            "bottom": 8.0,
+                            "char_start": 30,
+                            "char_end": 38,
+                            "text": "earlier",
+                        },
+                    ]
+                },
+            ),
+        ]
+
+        positions = _line_positions_for_span(blocks, 0, 40)
+
+        assert positions == [
+            (0, 1.0, 12.0, 3.0, 8.0),
+            (0, 5.0, 15.0, 10.0, 15.0),
+            (0, 25.0, 35.0, 10.0, 15.0),
+            (1, 40.0, 50.0, 20.0, 30.0),
+        ]
+
+    def test_bbox_union_for_positions_only_uses_requested_page(self):
+        positions = [
+            (0, 10.0, 20.0, 5.0, 15.0),
+            (0, 5.0, 25.0, 12.0, 30.0),
+            (1, 100.0, 200.0, 50.0, 60.0),
+        ]
+
+        assert _bbox_union_for_positions(positions, page_1based=1) == (
+            5.0,
+            5.0,
+            25.0,
+            30.0,
+        )
+        assert _bbox_union_for_positions(positions, page_1based=2) == (
+            100.0,
+            50.0,
+            200.0,
+            60.0,
+        )
+        assert _bbox_union_for_positions(positions, page_1based=3) is None
 
 
 class TestChunkMethodSplit:

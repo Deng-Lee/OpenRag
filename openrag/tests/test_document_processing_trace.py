@@ -100,9 +100,12 @@ class FakeChunkEngine:
                 level=1,
                 block_type="heading",
                 metadata={
-                    "page_num_int": [1],
-                    "position_int": [[1, 10, 120, 30, 58]],
-                    "top_int": [30],
+                    "page_num_int": [1, 1],
+                    "position_int": [
+                        [1, 10, 100, 20, 40],
+                        [1, 10, 100, 45, 65],
+                    ],
+                    "top_int": [20, 45],
                 },
             ),
             Chunk(text="tiny", chunk_id="chunk-2", page=2, block_type="text"),
@@ -359,9 +362,12 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             assert stages["metadata.persist_chunks"].output_summary["document_chunks_written"] == 3
             assert db2.query(DocumentChunk).count() == 3
             first_chunk = db2.query(DocumentChunk).filter_by(chunk_id="chunk-1").one()
-            assert first_chunk.page_num_int == [1]
-            assert first_chunk.position_int == [[1, 10, 120, 30, 58]]
-            assert first_chunk.top_int == [30]
+            assert first_chunk.page_num_int == [1, 1]
+            assert first_chunk.position_int == [
+                [1, 10, 100, 20, 40],
+                [1, 10, 100, 45, 65],
+            ]
+            assert first_chunk.top_int == [20, 45]
             assert db2.query(DocumentParseArtifact).count() == 1
             keys = [key for (_bucket, key) in processing_minio.objects]
             assert any(key.endswith("/canonical.json") for key in keys)

@@ -302,6 +302,41 @@ def test_list_workspace_file_chunks_q_filters_text_and_escapes_like_special_char
     assert data["items"][0]["text"] == r"literal 100%_\ marker"
 
 
+def test_list_workspace_file_chunks_returns_multiple_position_int_entries(
+    workspace_file_client: TestClient,
+    db_session: Session,
+    workspace: Workspace,
+    owner: User,
+) -> None:
+    file = _file(db_session, workspace, owner, "/docs/report.pdf", total_chunks=1)
+    position_int = [
+        [1, 10, 120, 30, 58],
+        [1, 10, 121, 60, 88],
+        [2, 12, 130, 32, 70],
+    ]
+    _chunk(
+        db_session,
+        file,
+        chunk_index=0,
+        text="multi-line position chunk",
+        chunk_id="multi-line-position",
+        position_int=position_int,
+    )
+
+    response = workspace_file_client.get(
+        f"/workspaces/{workspace.id}/files/{file.id}/chunks"
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    item = data["items"][0]
+    assert item["workspace_id"] == workspace.id
+    assert item["file_id"] == file.id
+    assert item["position_int"] == position_int
+    assert item["positions"] == position_int
+
+
 def test_list_workspace_file_chunks_filters_invalid_positions_and_uses_bbox_fallback(
     workspace_file_client: TestClient,
     db_session: Session,
