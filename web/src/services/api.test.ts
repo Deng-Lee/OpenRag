@@ -94,4 +94,36 @@ describe('API Client', () => {
     expect(mocks.mockAxiosInstance.get).toHaveBeenCalledWith('/workspaces/7/files/9/preview');
     expect(result).toBe(data);
   });
+
+  it('uploads files with document type in FormData', async () => {
+    const data = { id: 1, name: 'manual.pdf' };
+    mocks.mockAxiosInstance.post.mockResolvedValueOnce({ data });
+
+    const { filesAPI } = await import('./api');
+    const file = new File(['hello'], 'manual.pdf', { type: 'application/pdf' });
+    const result = await filesAPI.upload(file, 'pdf', 7, '/docs', 'manual');
+
+    const [url, formData] = mocks.mockAxiosInstance.post.mock.calls[0];
+    expect(url).toBe('/files/upload');
+    expect(formData.get('file')).toBe(file);
+    expect(formData.get('parser_type')).toBe('pdf');
+    expect(formData.get('workspace_id')).toBe('7');
+    expect(formData.get('path')).toBe('/docs');
+    expect(formData.get('document_type')).toBe('manual');
+    expect(result).toBe(data);
+  });
+
+  it('reprocesses files with document type in request body', async () => {
+    const data = { id: 1, name: 'laws.pdf' };
+    mocks.mockAxiosInstance.post.mockResolvedValueOnce({ data });
+
+    const { filesAPI } = await import('./api');
+    const result = await filesAPI.reprocess(1, 'pdf', 'laws');
+
+    expect(mocks.mockAxiosInstance.post).toHaveBeenCalledWith(
+      '/files/1/reprocess',
+      { parser_type: 'pdf', document_type: 'laws' }
+    );
+    expect(result).toBe(data);
+  });
 });

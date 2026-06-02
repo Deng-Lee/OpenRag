@@ -29,6 +29,8 @@ export interface RegisterRequest {
 
 export type SimpleStatus = 'unprocessed' | 'processing' | 'done' | 'failed';
 
+export type DocumentType = 'general' | 'manual' | 'laws';
+
 export interface File {
   id: number;
   uri: string;
@@ -43,6 +45,7 @@ export interface File {
   updated_at: string;
   processing_status?: string | null;
   simple_status?: SimpleStatus | null;
+  document_type?: DocumentType;
   error_message?: string | null;
 }
 

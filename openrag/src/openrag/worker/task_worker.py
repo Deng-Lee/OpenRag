@@ -22,6 +22,7 @@ from datetime import datetime
 from openrag.processors.document_processor import DocumentProcessor
 from openrag.parsers.parser_registry import ParserRegistry
 from openrag.chunking.chunk_engine import ChunkEngine
+from openrag.chunking.document_type import normalize_document_type
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
 from openrag.storage.minio_storage import MinioStorage
@@ -264,6 +265,9 @@ class TaskWorker:
 
             # Get parser type from file record
             parser_type = file.parser_type if file.parser_type else "auto"
+            document_type = normalize_document_type(
+                getattr(file, "document_type", None)
+            )
 
             # Get workspace
             ws_service = WorkspaceService(db)
@@ -365,6 +369,7 @@ class TaskWorker:
                 file_id=file_id,
                 user_id=user_id,
                 parser_type=parser_type,
+                document_type=document_type,
                 progress_callback=_on_progress,
             )
             print(f"  [DEBUG] Processing result: {processing_result}")
@@ -408,6 +413,9 @@ class TaskWorker:
                 "file_id": file_id,
                 "status": "success",
                 "parser_type": processing_result.get("parser_type", parser_type),
+                "document_type": processing_result.get(
+                    "document_type", document_type
+                ),
                 "l0_path": file.l0_path,
                 "l1_path": file.l1_path,
                 "l2_path": file.l2_path,

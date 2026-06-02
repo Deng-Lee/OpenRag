@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from openrag.api.deps import get_current_user, get_db
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
 from openrag.config import get_config
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel, ProcessingStatus
@@ -136,6 +137,7 @@ class FileResponse(BaseModel):
     is_directory: bool
     size: int
     mime_type: Optional[str]
+    document_type: str
     created_at: str
     updated_at: str
     processing_status: Optional[str] = None
@@ -192,6 +194,10 @@ class ReprocessRequest(BaseModel):
     parser_type: Optional[str] = Field(
         default=None,
         description=f"Parser type: {', '.join(SUPPORTED_PARSER_TYPES)}. If not provided, uses the original parser_type."
+    )
+    document_type: Optional[str] = Field(
+        default=None,
+        description="Document type: general, manual, laws. If not provided, keeps the original document_type.",
     )
 
     @field_validator('parser_type')
@@ -272,6 +278,7 @@ def _file_to_response(file: FileModel, owner_name_map: Optional[dict[int, str]] 
         is_directory=file.is_directory,
         size=file.size,
         mime_type=file.mime_type,
+        document_type=getattr(file, "document_type", None) or DEFAULT_DOCUMENT_TYPE,
         created_at=file.created_at.isoformat(),
         updated_at=file.updated_at.isoformat(),
         processing_status=ps,
@@ -345,6 +352,10 @@ async def upload_file(
     parser_type: str = Form(
         default="auto", description=f"Parser type: {', '.join(SUPPORTED_PARSER_TYPES)}"
     ),
+    document_type: str = Form(
+        default=DEFAULT_DOCUMENT_TYPE,
+        description="Document type: general, manual, laws",
+    ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -394,6 +405,7 @@ async def upload_file(
         file_content=file_content,
         content_type=file.content_type,
         parser_type=parser_type,
+        document_type=document_type,
         require_parent_dir=False,
         duplicate_status_code=status.HTTP_400_BAD_REQUEST,
     )
@@ -1139,7 +1151,20 @@ async def reprocess_file(
     if not parser_type:
         parser_type = "auto"
 
-    # Update file record with new parser type FIRST
+    if request.document_type is not None:
+        try:
+            file.document_type = normalize_document_type(request.document_type)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+    else:
+        file.document_type = normalize_document_type(
+            getattr(file, "document_type", None)
+        )
+
+    # Update file record with new parser/document type FIRST
     file.parser_type = parser_type if parser_type != "auto" else None
 
     # Cleanup existing processing data (modifies file status)

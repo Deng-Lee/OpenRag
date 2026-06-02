@@ -1,15 +1,15 @@
 """Tests for chunking engine."""
 
 import pytest
-from src.openrag.parsers.base import DocumentBlock
-from src.openrag.chunking.chunk_models import Chunk
-from src.openrag.chunking.ragflow_core import semantic as semantic_core
-from src.openrag.chunking.ragflow_core.semantic import (
+from openrag.parsers.base import DocumentBlock
+from openrag.chunking.chunk_models import Chunk
+from openrag.chunking.ragflow_core import semantic as semantic_core
+from openrag.chunking.ragflow_core.semantic import (
     _bbox_union_for_positions,
     _line_positions_for_span,
     _range_overlaps,
 )
-from src.openrag.chunking.chunk_engine import (
+from openrag.chunking.chunk_engine import (
     ChunkEngine,
     ChunkStrategy,
     _find_chunk_pos_robust,
@@ -502,6 +502,91 @@ class TestSemanticChunking:
         assert chunks[0].metadata.get("mom_with_weight") == "alpha##beta"
         assert chunks[1].metadata.get("mom_with_weight") == "alpha##beta"
 
+    def test_semantic_manual_children_split_maps_child_to_source_block(self, monkeypatch):
+        """Profile children should map child text back to the covered source block."""
+        monkeypatch.setenv("OPENRAG_CHILDREN_DELIMITER", "`##`")
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="Setup:",
+                page=1,
+                offset=0,
+                char_start=0,
+                char_end=6,
+                bbox=(10.0, 10.0, 60.0, 20.0),
+                block_type="text",
+                level=0,
+                block_id="heading",
+                metadata={
+                    "line_positions": [
+                        {
+                            "page": 1,
+                            "x0": 10.0,
+                            "x1": 60.0,
+                            "top": 10.0,
+                            "bottom": 20.0,
+                            "char_start": 0,
+                            "char_end": 6,
+                            "text": "Setup:",
+                        }
+                    ]
+                },
+            ),
+            DocumentBlock(
+                text="alpha##beta",
+                page=1,
+                offset=100,
+                char_start=100,
+                char_end=111,
+                bbox=(100.0, 100.0, 180.0, 120.0),
+                block_type="text",
+                level=0,
+                block_id="body",
+                metadata={
+                    "line_positions": [
+                        {
+                            "page": 1,
+                            "x0": 100.0,
+                            "x1": 140.0,
+                            "top": 100.0,
+                            "bottom": 110.0,
+                            "char_start": 100,
+                            "char_end": 107,
+                            "text": "alpha##",
+                        },
+                        {
+                            "page": 1,
+                            "x0": 140.0,
+                            "x1": 180.0,
+                            "top": 110.0,
+                            "bottom": 120.0,
+                            "char_start": 107,
+                            "char_end": 111,
+                            "text": "beta",
+                        },
+                    ]
+                },
+            ),
+        ]
+
+        chunks = engine.chunk(
+            text_blocks,
+            chunk_size=512,
+            chunk_overlap=0,
+            document_type="manual",
+        )
+
+        beta = next(chunk for chunk in chunks if chunk.text == "beta")
+        assert beta.source_block_id == "body"
+        assert beta.source_char_start == 107
+        assert beta.source_char_end == 111
+        assert beta.start_offset == 107
+        assert beta.end_offset == 111
+        assert beta.bbox == (140.0, 110.0, 180.0, 120.0)
+        assert beta.metadata["position_int"] == [(1, 140, 180, 110, 120)]
+        assert (1, 10, 60, 10, 20) not in beta.metadata["position_int"]
+        assert beta.metadata.get("mom_with_weight") == "Setup:\nalpha##beta"
+
     def test_semantic_owner_bbox_follows_source_block(self, monkeypatch):
         """Different semantic chunks should map to their own source bbox."""
         monkeypatch.setenv("OPENRAG_CHUNK_DELIMITER", "`@@@`")
@@ -554,6 +639,226 @@ class TestSemanticChunking:
         assert len(chunks) >= 1
         # Usually one merged chunk: "aaa\nbbb"; bbox should cover both.
         assert chunks[0].bbox == (10.0, 10.0, 40.0, 40.0)
+
+    def test_semantic_manual_uses_section_profile_items(self):
+        """Manual document_type keeps section title, body, and steps together."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="安装流程：",
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+                block_id="m-1",
+            ),
+            DocumentBlock(
+                text="说明：按顺序执行。",
+                page=1,
+                offset=10,
+                block_type="text",
+                level=0,
+                block_id="m-2",
+            ),
+            DocumentBlock(
+                text="步骤 1：打开控制台。",
+                page=1,
+                offset=20,
+                block_type="text",
+                level=0,
+                block_id="m-3",
+            ),
+        ]
+
+        chunks = engine.chunk(
+            text_blocks,
+            chunk_size=512,
+            chunk_overlap=0,
+            document_type="manual",
+        )
+
+        assert len(chunks) == 1
+        assert "安装流程：" in chunks[0].text
+        assert "说明：按顺序执行。" in chunks[0].text
+        assert "步骤 1：打开控制台。" in chunks[0].text
+        assert chunks[0].metadata["document_type"] == "manual"
+        assert chunks[0].metadata["section_path"] == ["安装流程："]
+
+    def test_semantic_laws_keeps_articles_separate(self):
+        """Laws document_type does not merge content across articles."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="第一章 总则",
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+                block_id="l-1",
+            ),
+            DocumentBlock(
+                text="第一条 为了规范事项，制定本法。",
+                page=1,
+                offset=10,
+                block_type="text",
+                level=0,
+                block_id="l-2",
+            ),
+            DocumentBlock(
+                text="（一）适用范围。",
+                page=1,
+                offset=20,
+                block_type="text",
+                level=0,
+                block_id="l-3",
+            ),
+            DocumentBlock(
+                text="第二条 本法适用于相关活动。",
+                page=1,
+                offset=30,
+                block_type="text",
+                level=0,
+                block_id="l-4",
+            ),
+        ]
+
+        chunks = engine.chunk(
+            text_blocks,
+            chunk_size=512,
+            chunk_overlap=0,
+            document_type="laws",
+        )
+        first_article_heading = text_blocks[1].text
+        second_article_heading = text_blocks[3].text
+
+        assert len(chunks) == 2
+        assert chunks[0].text.count(first_article_heading) == 1
+        assert chunks[1].text.count(second_article_heading) == 1
+        assert "第一条 为了规范事项，制定本法。" in chunks[0].text
+        assert "（一）适用范围。" in chunks[0].text
+        assert "第二条 本法适用于相关活动。" in chunks[1].text
+        assert "（一）适用范围。" not in chunks[1].text
+        assert chunks[0].metadata["document_type"] == "laws"
+        assert chunks[0].metadata["structure_node_type"] == "article"
+
+    def test_semantic_manual_table_and_image_metadata_has_section_path(self):
+        """Manual profile items propagate section metadata to table and image chunks."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="材料清单：",
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+                block_id="mi-1",
+            ),
+            DocumentBlock(
+                text="名称 | 数量",
+                page=1,
+                offset=10,
+                block_type="table",
+                level=0,
+                block_id="mi-2",
+            ),
+            DocumentBlock(
+                text="示意图",
+                page=1,
+                offset=20,
+                block_type="image",
+                level=0,
+                block_id="mi-3",
+                image=b"mock",
+            ),
+        ]
+
+        chunks = engine.chunk(
+            text_blocks,
+            chunk_size=512,
+            chunk_overlap=0,
+            document_type="manual",
+        )
+
+        assert any("table" in c.metadata.get("contains_block_types", []) for c in chunks)
+        assert any("image" in c.metadata.get("contains_block_types", []) for c in chunks)
+        for chunk in chunks:
+            assert chunk.metadata["document_type"] == "manual"
+            assert chunk.metadata["section_path"] == ["材料清单："]
+
+    def test_semantic_manual_plain_text_matches_general_fallback(self):
+        """Manual without structure signals falls back like general."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        plain_text = " ".join(f"plain sentence {i}" for i in range(120))
+        text_blocks = [
+            DocumentBlock(
+                text=plain_text,
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+                block_id="plain-manual",
+            ),
+        ]
+
+        general_chunks = engine.chunk(
+            text_blocks,
+            chunk_size=120,
+            chunk_overlap=10,
+            document_type="general",
+        )
+        manual_chunks = engine.chunk(
+            text_blocks,
+            chunk_size=120,
+            chunk_overlap=10,
+            document_type="manual",
+        )
+
+        assert len(general_chunks) > 1
+        assert [chunk.text for chunk in manual_chunks] == [
+            chunk.text for chunk in general_chunks
+        ]
+        assert all(chunk.metadata["document_type"] == "manual" for chunk in manual_chunks)
+
+    def test_semantic_laws_plain_text_matches_general_fallback(self):
+        """Laws without numbering signals falls back like general."""
+        engine = ChunkEngine(strategy=ChunkStrategy.SEMANTIC)
+        text_blocks = [
+            DocumentBlock(
+                text="ordinary policy paragraph " * 40,
+                page=1,
+                offset=0,
+                block_type="text",
+                level=0,
+                block_id="plain-laws-1",
+            ),
+            DocumentBlock(
+                text="another ordinary paragraph " * 40,
+                page=1,
+                offset=1000,
+                block_type="text",
+                level=0,
+                block_id="plain-laws-2",
+            ),
+        ]
+
+        general_chunks = engine.chunk(
+            text_blocks,
+            chunk_size=120,
+            chunk_overlap=10,
+            document_type="general",
+        )
+        laws_chunks = engine.chunk(
+            text_blocks,
+            chunk_size=120,
+            chunk_overlap=10,
+            document_type="laws",
+        )
+
+        assert len(general_chunks) > 1
+        assert [chunk.text for chunk in laws_chunks] == [
+            chunk.text for chunk in general_chunks
+        ]
+        assert all(chunk.metadata["document_type"] == "laws" for chunk in laws_chunks)
 
 
 class TestEdgeCases:

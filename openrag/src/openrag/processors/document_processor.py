@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
 
 from openrag.chunking.chunk_engine import ChunkEngine
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
 from openrag.chunking.chunk_params import chunk_size_overlap_from_env, min_chunk_tokens_from_env, resolve_chunk_method
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.document_hierarchy_builder import DocumentHierarchyBuilder
@@ -199,6 +200,7 @@ class DocumentProcessor:
         file_id: int,
         user_id: int,
         parser_type: str = "auto",
+        document_type: str = DEFAULT_DOCUMENT_TYPE,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> dict:
         """Process a document through the complete pipeline.
@@ -215,6 +217,8 @@ class DocumentProcessor:
         file_record = self.db.query(File).filter(File.id == file_id).first()
         if not file_record:
             raise ValueError(f"File not found: {file_id}")
+        normalized_document_type = normalize_document_type(document_type)
+        file_record.document_type = normalized_document_type
         trace_service = TraceService(self.db)
 
         # Step 1: Parse（策略仅在 ParserRegistry / Factory；此处只编排）
@@ -362,6 +366,7 @@ class DocumentProcessor:
             "chunk.build",
             input_summary={
                 "chunk_method": chunk_method,
+                "document_type": normalized_document_type,
                 "chunk_size": chunk_size,
                 "overlap": chunk_overlap,
                 "min_chunk_tokens": min_chunk_tokens,
@@ -369,13 +374,25 @@ class DocumentProcessor:
             },
         )
         try:
-            chunks = self.chunk_engine.chunk(
-                text_blocks,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                chunk_method=chunk_method,
-                min_chunk_tokens=min_chunk_tokens,
-            )
+            try:
+                chunks = self.chunk_engine.chunk(
+                    text_blocks,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    chunk_method=chunk_method,
+                    min_chunk_tokens=min_chunk_tokens,
+                    document_type=normalized_document_type,
+                )
+            except TypeError as exc:
+                if "document_type" not in str(exc):
+                    raise
+                chunks = self.chunk_engine.chunk(
+                    text_blocks,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    chunk_method=chunk_method,
+                    min_chunk_tokens=min_chunk_tokens,
+                )
         except Exception as exc:
             _safe_fail_span(trace_service, chunk_span, str(exc))
             raise
@@ -784,6 +801,7 @@ class DocumentProcessor:
             "file_id": file_id,
             "file_path": file_path,
             "parser_type": parser_type,
+            "document_type": normalized_document_type,
             "text_blocks": len(text_blocks),
             "chunks": len(chunks),
             "embeddings": len(chunk_embeddings),

@@ -6,6 +6,7 @@ import uuid
 
 from openrag.parsers.base import DocumentBlock
 from openrag.chunking.chunk_models import Chunk
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
 from openrag.parsers.char_spans import paragraph_absolute_spans
 from openrag.chunking.ragflow_core.semantic import (
     chunk_semantic_ragflow,
@@ -47,6 +48,7 @@ class ChunkEngine:
         chunk_overlap: int = 50,
         chunk_method: str | None = None,
         min_chunk_tokens: int = 0,
+        document_type: str = DEFAULT_DOCUMENT_TYPE,
     ) -> list[Chunk]:
         """Chunk text blocks using configured strategy.
 
@@ -69,6 +71,8 @@ class ChunkEngine:
         if not text_blocks:
             return []
 
+        normalized_document_type = normalize_document_type(document_type)
+
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be greater than 0, got {chunk_size}")
 
@@ -83,7 +87,14 @@ class ChunkEngine:
         if self.strategy == ChunkStrategy.PARAGRAPH:
             return self._chunk_by_paragraph(text_blocks, min_chunk_tokens)
         elif self.strategy == ChunkStrategy.SEMANTIC:
-            return self._chunk_semantic(text_blocks, chunk_size, chunk_overlap, chunk_method, min_chunk_tokens)
+            return self._chunk_semantic(
+                text_blocks,
+                chunk_size,
+                chunk_overlap,
+                chunk_method,
+                min_chunk_tokens,
+                normalized_document_type,
+            )
         elif self.strategy == ChunkStrategy.FIXED_SIZE:
             return self._chunk_fixed_size(text_blocks, chunk_size, chunk_overlap)
         else:
@@ -154,6 +165,7 @@ class ChunkEngine:
         chunk_overlap: int,
         chunk_method: str | None = None,
         min_chunk_tokens: int = 0,
+        document_type: str = DEFAULT_DOCUMENT_TYPE,
     ) -> list[Chunk]:
         """Semantic chunking with RAGFlow-like naive merge (delegates to ragflow_core)."""
         return chunk_semantic_ragflow(
@@ -163,6 +175,7 @@ class ChunkEngine:
             chunk_method,
             fixed_size_fallback=self._chunk_fixed_size,
             min_chunk_tokens=min_chunk_tokens,
+            document_type=document_type,
         )
 
     def _chunk_fixed_size(

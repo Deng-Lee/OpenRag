@@ -1,7 +1,7 @@
 import { Table, Button, Space, Popconfirm, message, Typography, Modal, Form, Select, Tag, Popover } from 'antd';
 import { DeleteOutlined, FolderOutlined, FileOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useState } from 'react';
-import type { File, SimpleStatus } from '../types';
+import type { DocumentType, File, SimpleStatus } from '../types';
 import { filesAPI } from '../services/api';
 import FilePreviewModal from './FilePreviewModal';
 import { useTranslation } from 'react-i18next';
@@ -15,6 +15,8 @@ const STATUS_CFG: Record<SimpleStatus, { color: string; labelKey: string }> = {
   done: { color: 'success', labelKey: 'files.status.done' },
   failed: { color: 'error', labelKey: 'files.status.failed' },
 };
+
+const DOCUMENT_TYPES: DocumentType[] = ['general', 'manual', 'laws'];
 
 interface FileListProps {
   files: File[];
@@ -54,17 +56,18 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
     setReprocessingFile(record);
     reprocessForm.setFieldsValue({
       parser_type: 'auto',
+      document_type: record.document_type || 'general',
     });
     setIsReprocessModalOpen(true);
   };
 
-  const confirmReprocess = async (values: { parser_type: string }) => {
+  const confirmReprocess = async (values: { parser_type: string; document_type: DocumentType }) => {
     if (!reprocessingFile) return;
 
     setReprocessing(true);
     try {
       const parserType = values.parser_type === 'auto' ? undefined : values.parser_type;
-      await filesAPI.reprocess(reprocessingFile.id, parserType);
+      await filesAPI.reprocess(reprocessingFile.id, parserType, values.document_type || 'general');
       message.success(t('files.messages.reprocess_success'));
       setIsReprocessModalOpen(false);
       reprocessForm.resetFields();
@@ -278,6 +281,18 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
                 { value: 'csv', label: t('files.parser_types.csv') },
                 { value: 'epub', label: t('files.parser_types.epub') },
               ]}
+            />
+          </Form.Item>
+          <Form.Item
+            name="document_type"
+            label={t('files.fields.document_type')}
+            initialValue="general"
+          >
+            <Select
+              options={DOCUMENT_TYPES.map((type) => ({
+                value: type,
+                label: t(`files.document_types.${type}`),
+              }))}
             />
           </Form.Item>
           <Text type="secondary">{t('files.messages.reprocess_hint')}</Text>

@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from openrag.models.base import Base, TimestampMixin
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE
 from openrag.utils.pg_text import strip_pg_nul_bytes
 
 
@@ -70,6 +71,12 @@ class File(Base, TimestampMixin):
     mime_type: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True, comment="MIME type"
     )
+    document_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=DEFAULT_DOCUMENT_TYPE,
+        comment="Document type for chunking pipeline",
+    )
     workspace_id: Mapped[int] = mapped_column(
         ForeignKey("workspaces.id"), nullable=False, comment="Workspace ID"
     )
@@ -78,6 +85,7 @@ class File(Base, TimestampMixin):
         "uri",
         "name",
         "mime_type",
+        "document_type",
         "l0_path",
         "l1_path",
         "l2_path",

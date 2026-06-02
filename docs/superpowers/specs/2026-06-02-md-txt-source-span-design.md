@@ -1,91 +1,93 @@
-# MD/TXT Source Span Mapping Design
+# MD/TXT 原文位置映射设计
 
-## Status
+## 状态
 
-Design for review. No implementation has been applied in this spec.
+设计稿，等待评审。本 spec 只描述方案，不包含实现改动。
 
-## Goal
+## 目标
 
-Make Markdown and plain text chunks map accurately back to the uploaded original document content.
+让 Markdown 和纯文本文件生成的 chunk 能准确映射回用户上传的原始文档内容。
 
-For MD/TXT files, every parser-produced `DocumentBlock` with position metadata must satisfy:
+对于 MD/TXT 文件，parser 产出的每个带位置信息的 `DocumentBlock` 都必须满足：
 
 ```python
 block.text == raw_text[block.char_start:block.char_end]
 ```
 
-Here `raw_text` means the user-uploaded file decoded into the same text coordinate system used by source preview. The coordinate system is Python string character index after UTF-8 decoding, not byte offset and not rendered Markdown DOM position.
+这里的 `raw_text` 指用户上传文件解码后的原文字符流，且必须和前端原文预览使用同一个坐标系。这个坐标系是 UTF-8 解码后的 Python 字符串下标，不是字节偏移，也不是 Markdown 渲染后的 DOM 或可视文本位置。
 
-## Current Problem
+## 当前问题
 
-TXT currently reads the uploaded file and splits it into paragraph blocks, so its position model is close to the uploaded source. The main mismatch risk is that the parser uses `errors="ignore"`, while preview uses replacement on invalid UTF-8. If invalid bytes exist, parser and preview can produce different character streams.
+TXT 当前会读取上传文件并按段落切成 block，所以位置模型已经比较接近上传原文。主要风险是 TXT parser 使用 `errors="ignore"` 解码，而前端预览在遇到非法 UTF-8 时会使用替换字符。如果文件里存在非法字节，parser 和预览看到的字符流就可能不同，进而导致偏移不一致。
 
-Markdown currently reads the uploaded source but then calls `RAGFlowMarkdownParser.extract_tables_and_remainder(md_text)`. It splits the processed `remainder`, strips each paragraph, and uses `md_text.find(...)` to locate the processed text back in the original source. Tables are extracted separately and appended after normal paragraphs. This causes several mapping risks:
+Markdown 当前虽然先读取上传原文，但随后调用 `RAGFlowMarkdownParser.extract_tables_and_remainder(md_text)`。后续逻辑会拆分处理后的 `remainder`，对段落做 `strip()`，再用 `md_text.find(...)` 把处理后的文本反查回原始 Markdown。表格还会被单独抽出并追加到普通段落之后。
 
-- processed text can differ from uploaded source text;
-- table order can differ from source order;
-- `strip()` changes block boundaries;
-- repeated text can match the wrong occurrence;
-- `find()` fallback can create approximate positions.
+这会带来几个位置映射风险：
 
-## Scope
+- 处理后的文本可能已经不同于上传原文；
+- 表格顺序可能不同于原文顺序；
+- `strip()` 会改变 block 边界；
+- 重复文本可能匹配到错误位置；
+- `find()` 失败后的兜底逻辑会制造近似位置。
 
-In scope:
+## 范围
 
-- MD parser source-span accuracy.
-- TXT parser source-span accuracy.
-- Parser-level helper functions for source text decoding, line spans, trimming, and block span creation.
-- Focused backend tests for parser spans and chunk propagation.
+本轮包含：
 
-Out of scope:
+- 修正 MD parser 的原文 span 准确性。
+- 修正 TXT parser 的原文 span 准确性。
+- 增加 parser 层辅助函数，用于原文解码、行 span、边界裁剪和 block span 生成。
+- 增加聚焦的后端测试，覆盖 parser span 和 chunk span 传播。
 
-- DOC/DOCX mapping fixes.
-- PDF position mapping changes.
-- Frontend rendering changes.
-- Search result navigation changes.
-- New external parser dependencies.
-- Mapping to rendered Markdown visual positions.
+本轮不包含：
 
-## Recommended Approach
+- DOC/DOCX 映射修复。
+- PDF 位置映射变更。
+- 前端渲染逻辑变更。
+- 搜索结果跳转逻辑变更。
+- 新增外部 parser 依赖。
+- 映射到 Markdown 渲染后的视觉位置。
 
-Use a source scanner in the parser layer.
+## 推荐方案
 
-The parser should scan the uploaded decoded source directly and produce `DocumentBlock` objects whose text is a direct slice of that source. The parser must not generate block positions by searching processed text back into the original document.
+在 parser 层使用源码扫描器。
 
-This keeps the mapping simple and verifiable: if the block text is always a direct source slice, chunk positions derived from the block spans remain in the uploaded source coordinate system.
+parser 应该直接扫描上传文件解码后的原文，并生成 `DocumentBlock`。每个 block 的 `text` 都必须是原文中的直接切片。parser 不应该先生成处理后的文本，再用搜索或模糊匹配回推原文位置。
 
-## Alternative Approaches Considered
+这个方案简单且可验证：只要 block 文本始终是原文切片，chunk 从 block 继承或合并得到的位置就仍然处在上传原文坐标系中。
 
-### AST Parser With Source Ranges
+## 备选方案
 
-Use a Markdown parser such as tree-sitter-markdown that exposes source ranges.
+### 方案一：使用带源码范围的 AST Parser
 
-This can produce more semantically precise Markdown blocks, but it adds dependency and build risk, especially on Windows. It also returns byte ranges, requiring careful byte-to-character conversion. This is not recommended for the first fix.
+可以引入类似 tree-sitter-markdown 的 Markdown parser，由它输出语法节点和源码范围。
 
-### Processed Text Alignment
+优点是 Markdown 语义边界更标准；缺点是依赖和构建复杂度更高，尤其在 Windows 环境下风险较大。另外这类工具通常返回 byte range，还需要额外做字节偏移到 Python 字符下标的转换。因此不建议作为第一版方案。
 
-Keep the RAGFlow Markdown output and align it back to the source using diff or fuzzy matching.
+### 方案二：保留 RAGFlow 输出，再做文本对齐
 
-This preserves existing parser output, but repeated text, stripped whitespace, reordered tables, and normalized syntax make the mapping inherently fragile. This is not recommended for source-accurate highlighting.
+可以继续使用 RAGFlow Markdown 处理结果，然后用 diff 或 fuzzy matching 把处理后文本对齐回原文。
 
-## Design
+优点是能保留现有 RAGFlow Markdown 输出；缺点是重复文本、空白裁剪、表格重排、语法归一化都会让对齐不稳定。这个方案很难保证源码级准确高亮，因此不推荐。
 
-### Source Text Helper
+## 设计
 
-Add a small helper module, proposed path:
+### 原文 Span 辅助模块
+
+新增一个轻量 helper，建议路径：
 
 ```text
 openrag/src/openrag/parsers/source_spans.py
 ```
 
-Responsibilities:
+职责：
 
-- Read uploaded text bytes.
-- Decode with UTF-8. If strict decoding fails, decode with `errors="replace"` so parser coordinates match preview behavior.
-- Build line spans using `splitlines(keepends=True)` so every line has a stable `[start, end)` range in the decoded source.
-- Trim only block outer whitespace when needed, while preserving the invariant that `text == raw[start:end]`.
+- 读取上传文本文件的 bytes。
+- 优先使用严格 UTF-8 解码；如果失败，则用 `errors="replace"` 解码，保证 parser 坐标和前端预览行为一致。
+- 使用 `splitlines(keepends=True)` 构建行 span，让每一行在解码后原文中都有稳定的 `[start, end)` 范围。
+- 在需要裁剪 block 外侧空白时，同步调整 start/end，并保持 `text == raw[start:end]`。
 
-Expected helper concepts:
+建议提供的概念：
 
 - `read_source_text(file_path: str) -> str`
 - `LineSpan(text: str, start: int, end: int)`
@@ -93,21 +95,21 @@ Expected helper concepts:
 - `trim_span(raw: str, start: int, end: int) -> tuple[int, int]`
 - `iter_plain_paragraph_spans(raw: str) -> Iterator[tuple[int, int]]`
 
-The helper should not know about Markdown semantics. Markdown block detection stays in the Markdown adapter.
+该 helper 不负责 Markdown 语义识别。Markdown block 检测仍放在 Markdown adapter 中。
 
 ### TXT Parser
 
-Modify:
+修改文件：
 
 ```text
 openrag/src/openrag/parsers/adapters/txt_adapter.py
 ```
 
-Behavior:
+行为：
 
-- Use `read_source_text(file_path)`.
-- Split plain text into paragraph spans using `iter_plain_paragraph_spans(raw)`.
-- For each paragraph span, create a `DocumentBlock` where:
+- 使用 `read_source_text(file_path)` 读取原文。
+- 使用 `iter_plain_paragraph_spans(raw)` 将纯文本拆成段落 span。
+- 每个段落生成一个 `DocumentBlock`，字段满足：
   - `text = raw[start:end]`
   - `char_start = start`
   - `char_end = end`
@@ -115,129 +117,129 @@ Behavior:
   - `layout_type = "text"`
   - `block_id = "txt:p:{idx}"`
 
-Paragraph splitting should treat one or more blank lines as paragraph separators. CRLF and LF inputs must both produce source offsets against the original decoded string.
+段落拆分应把一个或多个空行视为分隔符。无论输入是 CRLF 还是 LF，输出位置都必须对应原始解码字符串中的真实下标。
 
 ### Markdown Parser
 
-Modify:
+修改文件：
 
 ```text
 openrag/src/openrag/parsers/adapters/markdown_adapter.py
 ```
 
-Behavior:
+行为：
 
-- Use `read_source_text(file_path)`.
-- Stop using `extract_tables_and_remainder()` for MD block construction.
-- Scan the original Markdown source line by line.
-- Emit blocks in source order.
-- Every emitted block must use `raw[start:end]` as its text.
+- 使用 `read_source_text(file_path)` 读取原文。
+- 停止使用 `extract_tables_and_remainder()` 构造 MD block。
+- 逐行扫描原始 Markdown。
+- 按原文顺序输出 block。
+- 每个输出 block 都必须使用 `raw[start:end]` 作为 `text`。
 
-Markdown block rules for the first implementation:
+第一版 Markdown block 规则：
 
-- Blank lines separate normal paragraph/list blocks.
-- ATX headings (`#` through `######` followed by whitespace) become one heading block.
-- Fenced code blocks starting with triple backticks or tildes become one `code` block from opening fence through closing fence if present; if not closed, the block runs to EOF.
-- GFM-style pipe tables become one `table` block when a header line is followed by a separator line such as `| --- | --- |`; subsequent pipe-like rows remain in the same table block.
-- Other consecutive nonblank lines become a `text` block.
+- 空行分隔普通段落或列表 block。
+- ATX 标题，也就是以 `#` 到 `######` 加空白开头的行，作为单独 heading block。
+- 以三个反引号或三个波浪线开头的 fenced code block，从开始 fence 到结束 fence 作为一个 `code` block；如果没有结束 fence，则一直延伸到 EOF。
+- GFM 风格管道表格：当某行后面紧跟合法 separator 行，例如 `| --- | --- |`，则把表头、separator 和后续管道行作为一个 `table` block。
+- 其他连续非空行作为 `text` block。
 
-Heading level:
+标题层级：
 
-- ATX heading level is the number of leading `#` characters.
-- Other blocks use level `0`.
+- ATX 标题层级等于开头 `#` 的数量。
+- 其他 block 的层级为 `0`。
 
-Block metadata:
+block 元数据：
 
-- `page = 1` for MD/TXT.
-- `offset` remains the sequential parser block index for compatibility.
-- `block_id` uses stable parser-local IDs:
-  - `md:heading:{idx}` for headings
-  - `md:p:{idx}` for text/list paragraphs
-  - `md:table:{idx}` for tables
-  - `md:code:{idx}` for fenced code
+- MD/TXT 的 `page = 1`。
+- `offset` 继续作为 parser block 的顺序编号，保持兼容。
+- `block_id` 使用稳定的 parser 内 ID：
+  - `md:heading:{idx}` 表示标题；
+  - `md:p:{idx}` 表示普通段落或列表；
+  - `md:table:{idx}` 表示表格；
+  - `md:code:{idx}` 表示 fenced code block。
 
-### Chunk Propagation
+### Chunk Span 传播
 
-The existing chunking path should continue to consume `DocumentBlock.char_start/char_end`.
+现有 chunking 链路继续消费 `DocumentBlock.char_start/char_end`。
 
-For a chunk that covers one parser block, the chunk source span should stay inside that block span.
+如果一个 chunk 只覆盖一个 parser block，则 chunk 的 source span 应位于该 block span 内。
 
-For a chunk that merges multiple adjacent parser blocks, the chunk source span may cover from the first source block start to the last source block end. This can include blank lines or Markdown syntax between blocks. That is acceptable because the target coordinate system is uploaded source text.
+如果一个 chunk 合并多个相邻 parser block，则 chunk 的 source span 可以覆盖从第一个 block 起点到最后一个 block 终点的连续原文范围。这个范围可能包含空行或 Markdown 语法标记，这是可以接受的，因为目标坐标系就是上传源码文本。
 
-The implementation should avoid broad changes to chunking unless tests show the existing propagation violates the source-span invariant for MD/TXT. If a chunking change is required, keep it limited to using existing `source_blocks` or covered block spans instead of text search fallback.
+实现时应避免大范围修改 chunking。只有当测试证明现有 chunk span 传播无法满足 MD/TXT 原文坐标时，才做局部调整。若必须调整，应优先使用已有的 `source_blocks` 或覆盖 block span，而不是依赖文本搜索 fallback。
 
-## Data Flow
+## 数据流
 
-1. Upload stores original MD/TXT bytes in MinIO.
-2. Worker downloads the original file to a temporary local path.
-3. Parser reads and decodes the original file into `raw_text`.
-4. Parser scans `raw_text` and emits source-sliced `DocumentBlock` objects.
-5. Chunk engine builds chunks and propagates source spans.
-6. `DocumentProcessor` writes `source_char_start/source_char_end` into `document_chunks`.
-7. Search and document chunk detail APIs return those fields unchanged.
-8. Frontend source preview highlights `raw_text[source_char_start:source_char_end]`.
+1. 上传接口把 MD/TXT 原始 bytes 存入 MinIO。
+2. Worker 从 MinIO 下载原始文件到临时本地路径。
+3. Parser 读取并解码原始文件，得到 `raw_text`。
+4. Parser 扫描 `raw_text`，输出原文切片型 `DocumentBlock`。
+5. Chunk engine 根据 block 生成 chunks，并传播 source span。
+6. `DocumentProcessor` 将 `source_char_start/source_char_end` 写入 `document_chunks`。
+7. 搜索接口和文档切块详情接口原样返回这些字段。
+8. 前端原文预览使用 `raw_text[source_char_start:source_char_end]` 高亮目标内容。
 
-## Error Handling
+## 错误处理
 
-- Invalid UTF-8 should not fail parsing by default. Parser should decode with replacement if strict UTF-8 fails, matching preview behavior.
-- Empty files should return an empty block list.
-- Markdown fenced code blocks without a closing fence should produce one code block through EOF.
-- Malformed table-like lines should fall back to normal text blocks unless a valid GFM separator line is present.
+- 非法 UTF-8 不应默认导致解析失败。严格 UTF-8 解码失败时，parser 使用 replacement 解码，以匹配前端预览行为。
+- 空文件返回空 block 列表。
+- Markdown fenced code block 如果没有闭合 fence，则从开始 fence 一直作为 code block 延伸到 EOF。
+- 不合法的表格形态不强行识别为 table，回退为普通 text block。
 
-## Testing Plan
+## 测试计划
 
-Add or update focused backend tests.
+增加或更新聚焦的后端测试。
 
-Suggested test files:
+建议测试文件：
 
 - `openrag/tests/test_char_spans_chunk.py`
-- `openrag/tests/test_parser_integration.py` or a new focused parser test file such as `openrag/tests/test_md_txt_source_spans.py`
-- `openrag/tests/test_chunk_engine.py` only if chunk propagation needs adjustment
+- `openrag/tests/test_parser_integration.py`，或新增更聚焦的 `openrag/tests/test_md_txt_source_spans.py`
+- 只有在 chunk span 传播需要调整时，才修改 `openrag/tests/test_chunk_engine.py`
 
-Required test cases:
+必须覆盖的测试场景：
 
-- TXT parser preserves source spans for LF paragraphs.
-- TXT parser preserves source spans for CRLF paragraphs.
-- TXT parser handles leading/trailing blank lines without shifting spans.
-- Markdown heading block satisfies `raw[start:end] == block.text` and has the expected heading level.
-- Markdown paragraph/list block satisfies the source slice invariant.
-- Markdown fenced code block includes fence lines and satisfies the source slice invariant.
-- Markdown table block remains in source order and satisfies the source slice invariant.
-- Markdown repeated text does not rely on `find()` and maps to the correct source occurrence.
-- Semantic chunking persists `source_char_start/source_char_end` that can slice the original raw text.
+- TXT parser 对 LF 段落保留准确 source span。
+- TXT parser 对 CRLF 段落保留准确 source span。
+- TXT parser 处理首尾空行时不产生偏移漂移。
+- Markdown heading block 满足 `raw[start:end] == block.text`，且 heading level 正确。
+- Markdown 普通段落或列表 block 满足 source slice invariant。
+- Markdown fenced code block 包含 fence 行，并满足 source slice invariant。
+- Markdown table block 保持原文顺序，并满足 source slice invariant。
+- Markdown 重复文本不依赖 `find()`，能映射到正确的原文出现位置。
+- Semantic chunking 写出的 `source_char_start/source_char_end` 可以用于切回原始 raw text。
 
-Targeted verification command:
+定向校验命令：
 
 ```powershell
 python -m pytest openrag/tests/test_char_spans_chunk.py openrag/tests/test_parser_integration.py openrag/tests/test_chunk_engine.py -q
 ```
 
-If a new focused test file is created, include it in the targeted command.
+如果新增了聚焦测试文件，需要把该文件加入定向校验命令。
 
-## Acceptance Criteria
+## 验收标准
 
-- For every MD/TXT parser block with source metadata, `raw[char_start:char_end] == block.text`.
-- Markdown tables are not moved after paragraphs during parser output.
-- Markdown parser does not use `md_text.find(...)` to recover positions from processed text.
-- TXT parser no longer uses `errors="ignore"`.
-- Existing upload, worker, search, and frontend APIs do not need contract changes.
-- Existing PDF mapping behavior is unchanged.
-- New tests cover source span accuracy for MD and TXT.
+- 每个带 source metadata 的 MD/TXT parser block 都满足 `raw[char_start:char_end] == block.text`。
+- Markdown 表格不会在 parser 输出中被移动到段落之后。
+- Markdown parser 不再使用 `md_text.find(...)` 从处理后文本恢复位置。
+- TXT parser 不再使用 `errors="ignore"`。
+- 上传、worker、搜索和前端 API 契约不需要变化。
+- 现有 PDF 映射行为不变。
+- 新测试覆盖 MD/TXT 的原文 span 准确性。
 
-## Risks
+## 风险
 
-- The Markdown scanner will be less semantically rich than a full Markdown AST parser. This is acceptable because the current goal is accurate source mapping, not complete Markdown rendering semantics.
-- Chunk text may include Markdown syntax such as heading markers, table pipes, and code fences. This is intentional for source-coordinate mapping.
-- If downstream retrieval quality depended on RAGFlow Markdown table extraction, removing it from the MD adapter may alter chunk text shape. If this becomes an issue, a later enhancement can add normalized retrieval text in metadata while keeping `DocumentBlock.text` source-sliced.
+- Markdown 源码扫描器的语义精度会低于完整 Markdown AST parser。这个取舍可以接受，因为当前目标是准确映射回源码，而不是完整 Markdown 语法解析。
+- Chunk 文本可能包含 Markdown 语法字符，例如标题 `#`、表格管道符、代码块 fence。这是预期行为，因为本轮目标是源码坐标映射。
+- 如果下游检索质量依赖 RAGFlow Markdown 表格抽取，移除 MD adapter 中的表格抽离逻辑可能改变 chunk 文本形态。若后续发现检索质量受影响，可以再添加用于检索的 normalized text metadata，但 `DocumentBlock.text` 仍应保持原文切片。
 
-## Implementation Notes
+## 实施约束
 
-Keep the implementation surgical:
+实现时保持改动克制：
 
-- Do not modify upload APIs.
-- Do not modify frontend preview.
-- Do not add external dependencies.
-- Do not change DOC/DOCX behavior in this round.
-- Do not change chunking broadly unless parser-source spans alone are insufficient.
+- 不修改上传 API。
+- 不修改前端预览。
+- 不新增外部依赖。
+- 本轮不修改 DOC/DOCX 行为。
+- 除非 parser source span 不足以满足测试，否则不大范围修改 chunking。
 
-The most important invariant is source-slice equality. It should be asserted in tests because it is the simplest guard against future drift.
+最重要的约束是 source-slice equality，也就是 `text == raw[start:end]`。后续测试必须显式断言这一点，作为防止位置漂移复发的最小保护网。

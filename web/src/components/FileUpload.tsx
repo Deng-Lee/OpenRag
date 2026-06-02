@@ -5,7 +5,7 @@ import type { UploadProps } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { useTranslation } from 'react-i18next';
 import { filesAPI } from '../services/api';
-import type { File } from '../types';
+import type { DocumentType, File } from '../types';
 
 const { Dragger } = Upload;
 const { Option } = Select;
@@ -23,6 +23,8 @@ const PARSER_TYPES = [
   { value: 'csv', label: 'CSV 表格' },
   { value: 'epub', label: 'EPUB 电子书' },
 ];
+
+const DOCUMENT_TYPES: DocumentType[] = ['general', 'manual', 'laws'];
 
 /** 与 Files 页目录树一致：仅文件夹节点，用于上传目标路径选择。 */
 function buildDirectoryOnlyTree(files: File[], rootTitle: string): DataNode[] {
@@ -96,6 +98,7 @@ export default function FileUpload({
 }: FileUploadProps) {
   const { t } = useTranslation();
   const [parserType, setParserType] = useState<string>('auto');
+  const [documentType, setDocumentType] = useState<DocumentType>('general');
   const [uploadPath, setUploadPath] = useState<string>(selectedPath);
   const [uploading, setUploading] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
@@ -135,11 +138,12 @@ export default function FileUpload({
     customRequest: async ({ file, onSuccess, onError }) => {
       setUploading(true);
       try {
-        await filesAPI.upload(file as globalThis.File, parserType, workspaceId, uploadPath);
+        await filesAPI.upload(file as globalThis.File, parserType, workspaceId, uploadPath, documentType);
         message.success('文件上传成功');
         onSuccess?.({});
         onUploadSuccess();
         setParserType('auto');
+        setDocumentType('general');
         setUploadPath(selectedPath);
       } catch (error: unknown) {
         const err = error as { response?: { data?: { detail?: string } } };
@@ -178,6 +182,21 @@ export default function FileUpload({
             <div style={{ marginTop: 4, fontSize: 12, color: '#666' }}>
               提示：如果自动检测无法正确识别文档类型，请手动选择
             </div>
+          </Form.Item>
+
+          <Form.Item label={t('files.fields.document_type')}>
+            <Select
+              value={documentType}
+              onChange={setDocumentType}
+              style={{ width: '100%' }}
+              disabled={uploading}
+            >
+              {DOCUMENT_TYPES.map((type) => (
+                <Option key={type} value={type}>
+                  {t(`files.document_types.${type}`)}
+                </Option>
+              ))}
+            </Select>
           </Form.Item>
 
           <Form.Item
