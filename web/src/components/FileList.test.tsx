@@ -135,7 +135,9 @@ describe('FileList', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'a.pdf' }));
 
-    expect(navigateMock).toHaveBeenCalledWith('/workspaces/7/files/1/chunks');
+    expect(navigateMock).toHaveBeenCalledWith('/workspaces/7/files/1/chunks', {
+      state: { from: 'files' },
+    });
   });
 
   it('does not navigate non-done document names to the chunk page', () => {

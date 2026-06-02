@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import '../i18n';
 import i18n from '../i18n';
 import SearchPage from './Search';
@@ -60,11 +60,41 @@ const workspace = {
   created_at: '2026-01-01T00:00:00Z',
 };
 
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location-probe">
+      {`${location.pathname}${location.search}|from=${(location.state as { from?: string } | null)?.from ?? ''}`}
+    </div>
+  );
+}
+
 async function renderSearchPage() {
   await i18n.changeLanguage('en');
   render(
     <MemoryRouter initialEntries={['/search']}>
       <SearchPage />
+    </MemoryRouter>
+  );
+  await screen.findByText('Workspace A');
+}
+
+async function renderSearchRoute() {
+  await i18n.changeLanguage('en');
+  render(
+    <MemoryRouter initialEntries={['/search']}>
+      <Routes>
+        <Route
+          path="/search"
+          element={
+            <>
+              <SearchPage />
+              <LocationProbe />
+            </>
+          }
+        />
+        <Route path="/workspaces/:workspaceId/files/:fileId/chunks" element={<LocationProbe />} />
+      </Routes>
     </MemoryRouter>
   );
   await screen.findByText('Workspace A');
@@ -83,6 +113,7 @@ describe('SearchPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    sessionStorage.clear();
     apiMocks.listWorkspaces.mockResolvedValue([workspace]);
     apiMocks.getCurrentUser.mockResolvedValue({
       id: 1,
@@ -125,5 +156,119 @@ describe('SearchPage', () => {
       workspace_id: 7,
       vector_similarity_weight: 0.3,
     }));
+  });
+
+  it('navigates to the target chunk detail route when result text is clicked', async () => {
+    apiMocks.search.mockResolvedValueOnce({
+      results: [
+        {
+          text: 'target result text',
+          score: 0.9,
+          file_id: 9,
+          chunk_id: 'chunk-42',
+          chunk_index: 42,
+          filename: 'report.pdf',
+        },
+      ],
+      total: 1,
+      query_time_ms: 12,
+    });
+    await renderSearchRoute();
+
+    fireEvent.change(screen.getByLabelText('Query'), {
+      target: { value: 'target' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Search/i }));
+
+    const resultLink = await screen.findByRole('button', { name: /target result text/i });
+    fireEvent.click(resultLink);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location-probe')).toHaveTextContent(
+        '/workspaces/7/files/9/chunks?chunkId=chunk-42&chunkIndex=42|from=search'
+      );
+    });
+  });
+
+  it('stores the successful search snapshot in sessionStorage', async () => {
+    const response = {
+      results: [
+        {
+          text: 'cached result text',
+          score: 0.8,
+          file_id: 11,
+          chunk_id: 'chunk-11',
+          chunk_index: 3,
+          filename: 'cached.pdf',
+        },
+      ],
+      total: 1,
+      query_time_ms: 9,
+    };
+    apiMocks.search.mockResolvedValueOnce(response);
+    await renderSearchPage();
+
+    fireEvent.change(screen.getByLabelText('Query'), {
+      target: { value: 'cache me' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Search/i }));
+
+    await screen.findByRole('button', { name: /cached result text/i });
+    const cached = JSON.parse(sessionStorage.getItem('openrag.search.snapshot') || '{}');
+
+    expect(cached).toEqual({
+      workspaceId: 7,
+      formValues: expect.objectContaining({
+        query: 'cache me',
+        top_k: 10,
+        vector_similarity_weight: 0.7,
+        search_mode: 'semantic',
+      }),
+      response,
+    });
+  });
+
+  it('restores the matching workspace snapshot without searching again', async () => {
+    sessionStorage.setItem(
+      'openrag.search.snapshot',
+      JSON.stringify({
+        workspaceId: 7,
+        formValues: {
+          query: 'restored query',
+          top_k: 6,
+          vector_similarity_weight: 0.4,
+          search_mode: 'semantic',
+          use_rerank: true,
+          use_contextual_retrieval: false,
+          use_l1_llm_navigation: false,
+          retrieval_strategy: 'auto',
+          contextual_l0_top_n: 40,
+          contextual_l1_top_n: 30,
+          contextual_chunk_fetch_multiplier: 4,
+        },
+        response: {
+          results: [
+            {
+              text: 'restored result text',
+              score: 0.7,
+              file_id: 12,
+              chunk_id: 'chunk-12',
+              chunk_index: 4,
+              filename: 'restored.pdf',
+            },
+          ],
+          total: 1,
+          query_time_ms: 5,
+        },
+      })
+    );
+
+    await renderSearchPage();
+
+    await screen.findByRole('button', { name: /restored result text/i });
+    expect(screen.getByLabelText('Query')).toHaveValue('restored query');
+    expect(screen.getByLabelText('Top K')).toHaveValue('6');
+    expect(apiMocks.search).not.toHaveBeenCalled();
+    expect(apiMocks.hierarchical).not.toHaveBeenCalled();
   });
 });

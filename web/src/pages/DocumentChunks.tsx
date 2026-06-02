@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Empty, Input, Pagination, Space, Spin, Tag, Typography } from 'antd';
 import { ArrowLeftOutlined, FileTextOutlined, SearchOutlined } from '@ant-design/icons';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { filesAPI } from '../services/api';
 import type { DocumentChunkItem, File as OpenRagFile, SimpleStatus, WorkspaceFileSummary } from '../types';
 import { DocumentSourcePreview } from '../components/document-source-preview';
+import { chunkDomId, scrollElementIntoScrollParent } from '../utils/chunk-preview-navigation';
 import './DocumentChunks.css';
 
 const { Paragraph, Text, Title } = Typography;
@@ -47,7 +48,9 @@ function hasTextPosition(chunk: DocumentChunkItem): boolean {
 export default function DocumentChunks() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
   const params = useParams();
+  const [searchParams] = useSearchParams();
   const [file, setFile] = useState<OpenRagFile | null>(null);
   const [chunks, setChunks] = useState<DocumentChunkItem[]>([]);
   const [selectedChunk, setSelectedChunk] = useState<DocumentChunkItem | null>(null);
@@ -58,6 +61,7 @@ export default function DocumentChunks() {
   const [limit] = useState(DEFAULT_LIMIT);
   const [total, setTotal] = useState(0);
   const requestSeqRef = useRef(0);
+  const listRef = useRef<HTMLDivElement>(null);
 
   function parseRouteIds(): { workspaceId: number; fileId: number } | null {
     const workspaceId = Number(params.workspaceId);
@@ -72,6 +76,14 @@ export default function DocumentChunks() {
   const workspaceId = routeIds?.workspaceId ?? 0;
   const fileId = routeIds?.fileId ?? 0;
   const routeKey = routeIds ? `${routeIds.workspaceId}:${routeIds.fileId}` : 'invalid';
+  const targetChunkId = searchParams.get('chunkId')?.trim() || '';
+  const targetChunkIndexRaw = searchParams.get('chunkIndex');
+  const targetChunkIndex = useMemo(() => {
+    const n = Number(targetChunkIndexRaw);
+    return Number.isInteger(n) && n >= 0 ? n : null;
+  }, [targetChunkIndexRaw]);
+  const targetInitialPage =
+    targetChunkIndex != null ? Math.floor(targetChunkIndex / limit) + 1 : 1;
 
   const loadChunks = useCallback(
     async (page: number, nextQ: string) => {
@@ -103,6 +115,12 @@ export default function DocumentChunks() {
         setSkip(response.skip ?? nextSkip);
         setTotal(response.total ?? sortedItems.length);
         setSelectedChunk((current) => {
+          const targetChunk = targetChunkId
+            ? sortedItems.find((chunk) => chunk.chunk_id === targetChunkId)
+            : null;
+          if (targetChunk) {
+            return targetChunk;
+          }
           if (
             current &&
             current.file_id === requestFileId &&
@@ -131,7 +149,7 @@ export default function DocumentChunks() {
         }
       }
     },
-    [fileId, limit, t, workspaceId]
+    [fileId, limit, t, targetChunkId, workspaceId]
   );
 
   useEffect(() => {
@@ -150,12 +168,12 @@ export default function DocumentChunks() {
       return;
     }
 
-    void loadChunks(1, '');
+    void loadChunks(targetInitialPage, '');
 
     return () => {
       requestSeqRef.current += 1;
     };
-  }, [loadChunks, routeIds, routeKey, t]);
+  }, [loadChunks, routeIds, routeKey, t, targetInitialPage]);
 
   const handleSelectChunk = (chunk: DocumentChunkItem) => {
     if (chunk.file_id !== fileId || chunk.workspace_id !== workspaceId) {
@@ -168,6 +186,10 @@ export default function DocumentChunks() {
     const nextQ = value.trim();
     setQ(nextQ);
     void loadChunks(1, nextQ);
+  };
+
+  const handleBack = () => {
+    navigate(location.state?.from === 'search' ? '/search' : '/files');
   };
 
   const renderEmptyState = () => (
@@ -191,6 +213,7 @@ export default function DocumentChunks() {
       <button
         type="button"
         key={chunk.chunk_id}
+        id={`document-chunks-card-${chunkDomId(chunk.chunk_id)}`}
         className={`document-chunks-card${selected ? ' document-chunks-card--selected' : ''}`}
         onClick={() => handleSelectChunk(chunk)}
         aria-pressed={selected}
@@ -231,12 +254,21 @@ export default function DocumentChunks() {
     (file == null || file.id === fileId);
   const currentTotal = hasOnlyCurrentRouteChunks ? total : 0;
   const currentPage = hasOnlyCurrentRouteChunks ? Math.floor(skip / limit) + 1 : 1;
+  const selectedCardId = currentSelectedChunk
+    ? `document-chunks-card-${chunkDomId(currentSelectedChunk.chunk_id)}`
+    : null;
+
+  useLayoutEffect(() => {
+    if (!selectedCardId) return;
+    const card = document.getElementById(selectedCardId);
+    scrollElementIntoScrollParent(listRef.current, card, 'auto');
+  }, [selectedCardId]);
 
   return (
     <div className="document-chunks-page">
       <header className="document-chunks-header">
         <div className="document-chunks-title-block">
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/files')}>
+          <Button icon={<ArrowLeftOutlined />} onClick={handleBack}>
             {t('documentChunks.back')}
           </Button>
           <div className="document-chunks-title-text">
@@ -284,7 +316,7 @@ export default function DocumentChunks() {
           </div>
 
           <Spin spinning={loading}>
-            <div className="document-chunks-list">
+            <div className="document-chunks-list" ref={listRef}>
               {routeBoundChunks.length ? routeBoundChunks.map(renderChunkCard) : renderEmptyState()}
             </div>
           </Spin>

@@ -81,7 +81,7 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
 
   const openDocumentChunks = (record: File) => {
     if (record.simple_status === 'done' && workspaceId && !record.is_directory) {
-      navigate(`/workspaces/${workspaceId}/files/${record.id}/chunks`);
+      navigate(`/workspaces/${workspaceId}/files/${record.id}/chunks`, { state: { from: 'files' } });
       return;
     }
     if (!record.is_directory) {
