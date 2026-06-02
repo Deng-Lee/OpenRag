@@ -287,6 +287,7 @@
     "query_required": "请输入检索内容",
     "run": "检索",
     "top_k": "返回条数",
+    "vector_weight": "向量权重",
     "mode": "检索接口",
     "mode_semantic": "语义",
     "mode_hierarchical": "层级",

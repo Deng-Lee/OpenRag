@@ -287,6 +287,7 @@
     "query_required": "Please enter a query",
     "run": "Search",
     "top_k": "Top K",
+    "vector_weight": "Vector weight",
     "mode": "Endpoint",
     "mode_semantic": "Semantic",
     "mode_hierarchical": "Hierarchical",

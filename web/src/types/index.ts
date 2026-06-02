@@ -90,6 +90,7 @@ export interface SearchRequest {
   workspace_id?: number;
   use_rerank?: boolean;
   use_contextual_retrieval?: boolean;
+  vector_similarity_weight?: number;
   contextual_l0_top_n?: number;
   contextual_l1_top_n?: number;
   contextual_chunk_fetch_multiplier?: number;

@@ -138,6 +138,7 @@ export default function SearchPage() {
         query,
         top_k: Number(values.top_k) || 10,
         workspace_id: currentWorkspace.id,
+        vector_similarity_weight: Number(values.vector_similarity_weight ?? 0.7),
         use_rerank: Boolean(values.use_rerank),
         use_contextual_retrieval: Boolean(values.use_contextual_retrieval),
         use_l1_llm_navigation: Boolean(values.use_l1_llm_navigation),
@@ -340,6 +341,7 @@ export default function SearchPage() {
               onFinish={onFinish}
               initialValues={{
                 top_k: 10,
+                vector_similarity_weight: 0.7,
                 search_mode: 'semantic' as SearchMode,
                 use_rerank: true,
                 use_contextual_retrieval: false,
@@ -360,6 +362,9 @@ export default function SearchPage() {
               <Space wrap size="large" style={{ marginBottom: 16 }}>
                 <Form.Item name="top_k" label={t('searchPage.top_k')} style={{ marginBottom: 0 }}>
                   <InputNumber min={1} max={100} />
+                </Form.Item>
+                <Form.Item name="vector_similarity_weight" label={t('searchPage.vector_weight')} style={{ marginBottom: 0 }}>
+                  <InputNumber min={0} max={1} step={0.1} precision={2} />
                 </Form.Item>
                 <Form.Item name="search_mode" label={t('searchPage.mode')} style={{ marginBottom: 0 }}>
                   <Radio.Group optionType="button" buttonStyle="solid">
