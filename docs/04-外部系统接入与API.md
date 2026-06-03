@@ -78,7 +78,7 @@ flowchart LR
 
 1. **获取令牌** — 系统管理员在 OpenRag Web 端「服务令牌」页面创建令牌，并授权绑定一个或多个工作区（每个工作区独立设置 `read` 或 `write` 权限）。
 2. **保存密钥** — 将完整密钥字符串（`sk-...`）存入 Secret 管理工具（环境变量、Vault、K8s Secret），禁止写入前端代码或版本库。
-3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 9 个机读接口。
+3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 10 个机读接口。
 
 ```bash
 # 示例：列根目录树
@@ -110,7 +110,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 | 属性 | 说明 |
 |------|------|
-| **绑定工作区** | 令牌可授权绑定多个工作区，每个工作区拥有独立权限等级。可通过「管理绑定」接口增删改绑定。调用 `/workspaces/{workspace_name}` 接口时，令牌须已绑定该工作区，否则 **403**。 |
+| **绑定工作区** | 令牌可授权绑定多个工作区，每个工作区拥有独立权限等级。可通过「管理绑定」接口增删改绑定。调用单工作区 `/workspaces/{workspace_name}` 接口时，令牌须已绑定该工作区，否则 **403**；调用多工作区检索时，无权限工作区会进入 `skipped_workspaces`。 |
 | **权限等级** | 每个绑定独立设置 `read`（只读）或 `write`（读写）。`write` 包含 `read`。可在「管理绑定」接口修改。 |
 | **吊销** | 吊销后立即对所有 `/service/v1` 接口失效。 |
 
@@ -122,6 +122,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 上传新文件、覆盖已有文件 | **write** |
 
 只读令牌调用写接口 → **403**，`detail`：`Write permission required`。
+多工作区检索中，`write` 绑定同样视为具备读取权限。
 
 ### 2.3 前置概念
 
@@ -160,6 +161,18 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `POST` | `/workspaces/{workspace_name}/search` | 语义检索（JSON body） | read |
 | `POST` | `/workspaces/multi_space/search` | 多工作区语义检索（JSON body） | read |
 | `GET` | `/workspaces/{workspace_name}/documents/search-by-name` | 按文件名子串模糊搜索 | read |
+
+**外部系统可用能力汇总：**
+
+| 能力 | 对应端点 | 说明 |
+|------|----------|------|
+| 工作区发现 | `GET /workspaces` | 查询当前服务令牌可访问的工作区、权限和基础信息 |
+| 目录浏览 | `GET /workspaces/{workspace_name}/tree`、`children`、`entries/by-prefix` | 获取嵌套目录树、一级子项或按前缀展开的扁平列表 |
+| 文件元数据查询 | `GET /workspaces/{workspace_name}/documents/by-path`、`documents/search-by-name` | 按逻辑路径精确查询文件，或按文件名子串搜索 |
+| 文件写入 | `POST /workspaces/{workspace_name}/documents`、`PUT /workspaces/{workspace_name}/documents/by-path` | 上传新文件或覆盖已有文件，需要 `write` 权限 |
+| 单工作区语义检索 | `POST /workspaces/{workspace_name}/search` | 在一个指定工作区中检索，需要 `read` 或 `write` 权限 |
+| 多工作区语义检索 | `POST /workspaces/multi_space/search` | 在请求体指定的多个工作区中检索，可访问工作区正常执行，不可访问工作区写入 `skipped_workspaces` |
+| 服务令牌管理 | `/service-tokens` 系列管理端点 | 由用户 JWT 鉴权，用于创建令牌、列出令牌、管理绑定、吊销令牌和查看密钥 |
 
 ### 2.5 管理端点详情
 
@@ -260,27 +273,51 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 ```json
 {
-  "workspaces": [
+  "items": [
     {
+      "id": 3,
       "name": "MyWorkspace",
       "slug": "my-workspace",
+      "description": "法务资料库",
       "permission": "read"
     },
     {
+      "id": 5,
       "name": "AnotherWS",
       "slug": "another-ws",
+      "description": null,
+      "permission": "write"
+    }
+  ],
+  "workspaces": [
+    {
+      "id": 3,
+      "name": "MyWorkspace",
+      "slug": "my-workspace",
+      "description": "法务资料库",
+      "permission": "read"
+    },
+    {
+      "id": 5,
+      "name": "AnotherWS",
+      "slug": "another-ws",
+      "description": null,
       "permission": "write"
     }
   ]
 }
 ```
 
+`items` 为推荐读取字段；`workspaces` 为兼容字段，内容与 `items` 相同。
+
 **响应字段：**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `id` | int | 工作区 ID |
 | `name` | string | 工作区名称（全局唯一） |
 | `slug` | string | URL 友好的工作区标识 |
+| `description` | string/null | 工作区描述 |
 | `permission` | string | 令牌对该工作区的权限（`read` 或 `write`） |
 
 ---
@@ -637,11 +674,13 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 `multi_space` 是保留的虚拟工作区名，用于表示“本次请求由请求体中的 `workspace_names` 指定多个真实工作区”。它不会按真实 `Workspace.name` 查询。
 
+该接口采用**部分成功**策略：请求中的可访问工作区正常检索；不存在或当前 service token 无权限读取的工作区不会中止整次请求，而是记录到响应的 `skipped_workspaces` 中。缺少 token 或 token 无效仍返回 **401**。
+
 **请求体 `ServiceMultiWorkspaceSearchRequest`：**
 
 | 字段 | 类型 | 必填 | 默认 | 约束 | 说明 |
 |------|------|------|------|------|------|
-| `workspace_names` | array[string] | **是** | — | min_length=1, max_length=20 | 要检索的真实工作区名称列表；每个工作区均需当前 service token 具备 read 权限 |
+| `workspace_names` | array[string] | **是** | — | min_length=1, max_length=20 | 要检索的真实工作区名称列表，使用 `Workspace.name`；后端会 trim、去空并按首次出现顺序去重 |
 | `query` | string | **是** | — | min_length=1 | 检索语句 |
 | `path_prefix` | string/null | 否 | `null` | — | 非 `/` 时仅保留 `uri` 在该前缀下的命中；同一前缀应用于所有目标工作区 |
 | `top_k` | int | 否 | `10` | gt=0, le=100 | 全局返回结果数；多工作区结果合并后按分数截断 |
@@ -655,11 +694,12 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 **行为规则：**
 
-- `workspace_names` 为空或缺失 → **400**。
-- `workspace_names` 中任一工作区不存在 → **404**。
-- 当前 service token 对任一工作区无 read/write 权限 → **403**。
-- 只传 1 个工作区时，行为等价于单工作区 `/workspaces/{workspace_name}/search`。
-- 传多个工作区时，后端分别在这些工作区内检索，结果补充 `workspace_id` / `workspace_name` 后合并排序。
+- `workspace_names` 缺失、为空或去重后为空 → **400**，`detail` 为 `workspace_names is required for multi_space search`。
+- 请求中的工作区不存在时，该工作区进入 `skipped_workspaces`，`reason` 为 `not_found`。
+- 当前 service token 对某工作区无 read/write 权限时，该工作区进入 `skipped_workspaces`，`reason` 为 `permission_denied`。
+- 只传 1 个可访问工作区时，检索行为与单工作区 `/workspaces/{workspace_name}/search` 一致，但响应仍包含多工作区接口的顶层字段。
+- 传多个可访问工作区时，后端分别在这些工作区内检索，结果补充 `workspace_id` / `workspace_name` 后合并排序。
+- 如果所有请求工作区都不可检索，仍返回 **200**，`results=[]`、`total=0`、`workspace_count=0`，并通过 `skipped_workspaces` 说明原因。
 - 为避免误用，真实工作区不应命名为 `multi_space`。
 
 **请求示例：**
@@ -671,7 +711,12 @@ X-OpenRag-Token: sk-<完整密钥字符串>
   "top_k": 5,
   "path_prefix": "/法务",
   "use_rerank": true,
-  "use_contextual_retrieval": false
+  "use_contextual_retrieval": false,
+  "contextual_l0_top_n": 40,
+  "contextual_l1_top_n": 30,
+  "contextual_chunk_fetch_multiplier": 4,
+  "retrieval_strategy": "auto",
+  "use_l1_llm_navigation": false
 }
 ```
 
@@ -708,44 +753,42 @@ X-OpenRag-Token: sk-<完整密钥字符串>
       "text_preview": "...",
       "retrieval_strategy": "auto",
       "l1_llm_filtered": null
-    },
-    {
-      "workspace_id": 5,
-      "workspace_name": "AnotherWS",
-      "text": "补充协议中约定...",
-      "score": 0.88,
-      "file_id": 456,
-      "chunk_id": "def-789",
-      "chunk_index": 2,
-      "page": 3,
-      "level": 0,
-      "block_type": "text",
-      "start_offset": 120,
-      "end_offset": 420,
-      "bbox_x0": null,
-      "bbox_y0": null,
-      "bbox_x1": null,
-      "bbox_y1": null,
-      "source_block_id": null,
-      "source_char_start": null,
-      "source_char_end": null,
-      "filename": "agreement.pdf",
-      "uri": "/法务/agreement.pdf",
-      "object_key": "...",
-      "object_url": "...",
-      "local_chunk_path": "...",
-      "text_preview": "...",
-      "retrieval_strategy": "auto",
-      "l1_llm_filtered": null
     }
   ],
-  "total": 2,
+  "total": 1,
   "query_time_ms": 245.67,
-  "workspace_count": 2,
+  "workspace_count": 1,
   "l1_llm_applied": null,
-  "l1_llm_skip_reason": null
+  "l1_llm_skip_reason": null,
+  "skipped_workspaces": [
+    {
+      "workspace_name": "AnotherWS",
+      "reason": "permission_denied",
+      "message": "Token does not have read permission for this workspace"
+    }
+  ]
 }
 ```
+
+**`MultiWorkspaceSearchResponse` 顶层字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `results` | array | 合并、排序、截断后的检索命中列表 |
+| `total` | int | 最终返回的命中条数，即 `results.length` |
+| `query_time_ms` | float | 所有实际参与检索工作区的查询耗时汇总（毫秒） |
+| `workspace_count` | int | 去重后实际参与检索的工作区数量；被跳过的工作区不计入 |
+| `l1_llm_applied` | bool/null | 任一工作区实际应用 L1 LLM 导航时为 `true`；全部为空时为 `null` |
+| `l1_llm_skip_reason` | string/null | 未应用 L1 LLM 的原因；多种原因混合时为 `"mixed"` |
+| `skipped_workspaces` | array | 被跳过的工作区列表，可能为空数组 |
+
+**`skipped_workspaces[]` 字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `workspace_name` | string | 请求中被跳过的工作区名称 |
+| `reason` | string | 跳过原因：`not_found` 或 `permission_denied` |
+| `message` | string | 面向调用方的原因说明 |
 
 **多工作区命中字段补充：**
 
@@ -754,7 +797,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `workspace_id` | int | 命中所属工作区 ID |
 | `workspace_name` | string | 命中所属工作区名称 |
 
-其余命中字段与单工作区 `SearchResult` 一致。`total` 为多工作区合并、过滤、截断后的返回条数；`workspace_count` 为本次请求参与检索的工作区数量。
+其余命中字段与单工作区 `SearchResult` 一致。
 
 ---
 
@@ -965,15 +1008,17 @@ print(r.json())
 | **400** | `File type ... is not supported for processing` | 覆盖时文件 MIME 不在支持列表 |
 | **400** | `workspace_names is required for multi_space search` | 多工作区检索缺少目标工作区数组 |
 | **401** | `Invalid or missing service token` | 缺头、密钥错、已吊销 |
-| **403** | `Token not authorized for this workspace` | 令牌未绑定该工作区 |
+| **403** | `Token not authorized for this workspace` | 单工作区接口中，令牌未绑定该工作区 |
 | **403** | `Token permission insufficient` | 令牌对绑定的工作区权限不足 |
-| **404** | `Workspace not found` | 工作区名不存在 |
+| **404** | `Workspace not found` | 单工作区接口中，工作区名不存在 |
 | **404** | `Directory not found` | 目录路径不存在 |
 | **404** | `File not found` | 文件路径不存在 |
 | **409** | `File already exists at <uri>` | 上传时目标路径已有文件 |
 | **409** | `Binding already exists` | 添加已存在的绑定 |
 | **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过 100 MB |
 | **500** | — | 内部错误或检索执行失败 |
+
+多工作区检索是例外：请求中某个工作区不存在或无读取权限时，整体仍返回 **200**，该工作区会出现在 `skipped_workspaces`，`reason` 分别为 `not_found` 或 `permission_denied`。
 
 ### 2.9 排障指南
 
@@ -982,6 +1027,7 @@ print(r.json())
 | 401 `Invalid or missing service token` | 头缺失、密钥错误、令牌已吊销 | 检查 `X-OpenRag-Token` 头是否设置、密钥是否完整、是否已被吊销 |
 | 403 `Token not authorized for this workspace` | 令牌未绑定该工作区 | 在「管理绑定」中为令牌添加该工作区的绑定 |
 | 403 `Token permission insufficient` | 令牌对绑定的工作区权限不足（read 调用 write 接口） | 将绑定权限升级为 write |
+| 多工作区检索返回 200，但某些工作区没有结果 | 工作区不存在，或当前 service token 没有该工作区 read/write 权限 | 查看 `skipped_workspaces` 中的 `reason` 和 `message`，补齐绑定或修正工作区名称 |
 | 404 `Directory not found` | `path_prefix` 或 `path` 在库中不存在 | 确认目录路径已通过上传或 Web 端创建 |
 | 409 `File already exists` | 上传路径已有同名文件 | 改用 PUT 覆盖 |
 | 400 `Parent directory does not exist` | 上传时父目录未创建 | 先通过 Web 端或 POST `/files/directories`（JWT）创建目录 |
