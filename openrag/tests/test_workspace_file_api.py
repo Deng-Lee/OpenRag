@@ -7,7 +7,15 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from openrag.api.deps import get_current_active_user, get_db
-from openrag.models import Base, DocumentChunk, File, User, Workspace, WorkspaceMember
+from openrag.models import (
+    Base,
+    DocumentChunk,
+    DocumentParseArtifact,
+    File,
+    User,
+    Workspace,
+    WorkspaceMember,
+)
 from openrag.models.file import ProcessingStatus
 from openrag.api.workspace_file_api import (
     _content_disposition_inline,
@@ -616,6 +624,96 @@ def test_get_workspace_file_preview_maps_unexpected_error_to_500(
 
     assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
     assert response.json()["detail"] == "Failed to generate preview"
+
+
+def test_get_workspace_file_chunk_source_returns_latest_completed_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_file_client: TestClient,
+    db_session: Session,
+    workspace: Workspace,
+    owner: User,
+) -> None:
+    file = _file(db_session, workspace, owner, "/docs/report.txt")
+    old_artifact = DocumentParseArtifact(
+        artifact_id="old-artifact",
+        file_id=file.id,
+        workspace_id=workspace.id,
+        source_doc_hash="hash-old",
+        parser_name="TxtParserAdapter",
+        parser_version="1.0",
+        canonical_json_bucket=workspace.slug,
+        canonical_json_object_key="old/canonical.json",
+        canonical_json_size_bytes=2,
+        canonical_md_bucket=workspace.slug,
+        canonical_md_object_key="old/canonical.md",
+        canonical_md_size_bytes=3,
+        status="completed",
+    )
+    latest_artifact = DocumentParseArtifact(
+        artifact_id="latest-artifact",
+        file_id=file.id,
+        workspace_id=workspace.id,
+        source_doc_hash="hash-new",
+        parser_name="TxtParserAdapter",
+        parser_version="1.0",
+        canonical_json_bucket=workspace.slug,
+        canonical_json_object_key="latest/canonical.json",
+        canonical_json_size_bytes=2,
+        canonical_md_bucket=workspace.slug,
+        canonical_md_object_key="latest/canonical.md",
+        canonical_md_size_bytes=16,
+        status="completed",
+    )
+    db_session.add_all([old_artifact, latest_artifact])
+    db_session.commit()
+
+    calls: list[tuple[str, str]] = []
+
+    class FakeStorage:
+        def read_object_bytes(self, bucket: str, object_key: str) -> bytes:
+            calls.append((bucket, object_key))
+            return "Alpha\nBeta".encode("utf-8")
+
+    monkeypatch.setattr("openrag.api.workspace_file_api.MinioStorage", FakeStorage)
+
+    response = workspace_file_client.get(
+        f"/workspaces/{workspace.id}/files/{file.id}/chunk-source"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"format": "text", "content": "Alpha\nBeta"}
+    assert calls == [(workspace.slug, "latest/canonical.md")]
+
+
+def test_get_workspace_file_chunk_source_returns_404_without_artifact(
+    workspace_file_client: TestClient,
+    db_session: Session,
+    workspace: Workspace,
+    owner: User,
+) -> None:
+    file = _file(db_session, workspace, owner, "/docs/report.txt")
+
+    response = workspace_file_client.get(
+        f"/workspaces/{workspace.id}/files/{file.id}/chunk-source"
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["detail"] == "Canonical chunk source not found"
+
+
+def test_get_workspace_file_chunk_source_returns_400_for_directory(
+    workspace_file_client: TestClient,
+    db_session: Session,
+    workspace: Workspace,
+    owner: User,
+) -> None:
+    directory = _file(db_session, workspace, owner, "/docs", is_directory=True)
+
+    response = workspace_file_client.get(
+        f"/workspaces/{workspace.id}/files/{directory.id}/chunk-source"
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
 @pytest.mark.parametrize(

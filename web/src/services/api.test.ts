@@ -94,4 +94,15 @@ describe('API Client', () => {
     expect(mocks.mockAxiosInstance.get).toHaveBeenCalledWith('/workspaces/7/files/9/preview');
     expect(result).toBe(data);
   });
+
+  it('fetches workspace file chunk source', async () => {
+    const data = { format: 'text' as const, content: 'canonical text' };
+    mocks.mockAxiosInstance.get.mockResolvedValueOnce({ data });
+
+    const { filesAPI } = await import('./api');
+    const result = await filesAPI.fetchWorkspaceChunkSource(7, 9);
+
+    expect(mocks.mockAxiosInstance.get).toHaveBeenCalledWith('/workspaces/7/files/9/chunk-source');
+    expect(result).toBe(data);
+  });
 });
