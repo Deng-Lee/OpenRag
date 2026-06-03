@@ -346,6 +346,266 @@ def test_service_search_path_prefix_filter(
     assert call_kw[0][2].workspace_id == workspace.id
 
 
+def test_service_multi_workspace_search_requires_token(
+    client: TestClient,
+    workspace: Workspace,
+) -> None:
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={"workspace_names": [workspace.name], "query": "hello"},
+    )
+    assert r.status_code == 401
+
+
+def test_service_multi_workspace_search_empty_workspace_names(
+    client: TestClient,
+    service_token_headers,
+) -> None:
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={"workspace_names": [" ", ""], "query": "hello"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "workspace_names is required for multi_space search"
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_search_unknown_workspace_skipped(
+    mock_search: MagicMock,
+    client: TestClient,
+    service_token_headers,
+) -> None:
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={"workspace_names": ["MissingWS"], "query": "hello"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["results"] == []
+    assert data["workspace_count"] == 0
+    assert data["skipped_workspaces"] == [
+        {
+            "workspace_name": "MissingWS",
+            "reason": "not_found",
+            "message": "Workspace not found",
+        }
+    ]
+    mock_search.assert_not_called()
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_search_skips_workspace_without_permission(
+    mock_search: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    other = Workspace(name="SvcApiWSB", slug="svc-api-ws-b", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    mock_search.return_value = SearchResponse(results=[], total=0, query_time_ms=1.0)
+
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={"workspace_names": [workspace.name, other.name], "query": "hello"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["workspace_count"] == 1
+    assert data["skipped_workspaces"][0]["workspace_name"] == other.name
+    assert data["skipped_workspaces"][0]["reason"] == "permission_denied"
+    mock_search.assert_called_once()
+    assert mock_search.call_args[0][2].workspace_id == workspace.id
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_search_read_and_write_bindings_can_search(
+    mock_search: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+) -> None:
+    other = Workspace(name="SvcApiWSB", slug="svc-api-ws-b", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    tok = ServiceToken(secret="sk-read-write", name="rw", created_by_user_id=owner.id)
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=workspace.id, permission="read"))
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=other.id, permission="write"))
+    db.commit()
+    mock_search.return_value = SearchResponse(results=[], total=0, query_time_ms=1.0)
+
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={"workspace_names": [workspace.name, other.name], "query": "hello"},
+        headers={"X-OpenRag-Token": "sk-read-write"},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["workspace_count"] == 2
+    assert r.json()["skipped_workspaces"] == []
+    assert [call[0][2].workspace_id for call in mock_search.call_args_list] == [
+        workspace.id,
+        other.id,
+    ]
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_search_merges_workspace_fields_sorts_and_limits(
+    mock_search: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+) -> None:
+    other = Workspace(name="SvcApiWSB", slug="svc-api-ws-b", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    tok = ServiceToken(secret="sk-merge", name="merge", created_by_user_id=owner.id)
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=workspace.id, permission="read"))
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=other.id, permission="read"))
+    db.commit()
+    mock_search.side_effect = [
+        SearchResponse(
+            results=[
+                SearchResult(text="a1", score=0.6, file_id=1, uri="/a1.txt"),
+                SearchResult(text="a2", score=0.9, file_id=2, uri="/a2.txt"),
+            ],
+            total=2,
+            query_time_ms=5.0,
+            l1_llm_applied=False,
+            l1_llm_skip_reason="no_l1_hits",
+        ),
+        SearchResponse(
+            results=[SearchResult(text="b1", score=0.8, file_id=3, uri="/b1.txt")],
+            total=1,
+            query_time_ms=7.0,
+            l1_llm_applied=True,
+            l1_llm_skip_reason="no_api_key",
+        ),
+    ]
+
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [workspace.name, other.name],
+            "query": "hello",
+            "top_k": 2,
+        },
+        headers={"X-OpenRag-Token": "sk-merge"},
+    )
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 2
+    assert data["workspace_count"] == 2
+    assert data["l1_llm_applied"] is True
+    assert data["l1_llm_skip_reason"] == "mixed"
+    assert [(hit["text"], hit["score"]) for hit in data["results"]] == [
+        ("a2", 0.9),
+        ("b1", 0.8),
+    ]
+    assert data["results"][0]["workspace_id"] == workspace.id
+    assert data["results"][0]["workspace_name"] == workspace.name
+    assert data["results"][1]["workspace_id"] == other.id
+    assert data["results"][1]["workspace_name"] == other.name
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_search_applies_path_prefix_per_workspace(
+    mock_search: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+) -> None:
+    other = Workspace(name="SvcApiWSB", slug="svc-api-ws-b", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    tok = ServiceToken(secret="sk-prefix", name="prefix", created_by_user_id=owner.id)
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=workspace.id, permission="read"))
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=other.id, permission="read"))
+    db.commit()
+    mock_search.side_effect = [
+        SearchResponse(
+            results=[
+                SearchResult(text="a", score=1.0, file_id=1, uri="/docs/a.txt"),
+                SearchResult(text="x", score=0.9, file_id=2, uri="/other/x.txt"),
+            ],
+            total=2,
+            query_time_ms=1.0,
+            l1_llm_applied=False,
+            l1_llm_skip_reason="no_l1_hits",
+        ),
+        SearchResponse(
+            results=[
+                SearchResult(text="b", score=0.8, file_id=3, uri="/docs/b.txt"),
+                SearchResult(text="y", score=0.7, file_id=4, uri="/other/y.txt"),
+            ],
+            total=2,
+            query_time_ms=1.0,
+            l1_llm_applied=True,
+            l1_llm_skip_reason="no_api_key",
+        ),
+    ]
+
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [workspace.name, other.name],
+            "query": "hello",
+            "path_prefix": "/docs",
+        },
+        headers={"X-OpenRag-Token": "sk-prefix"},
+    )
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 2
+    assert data["l1_llm_applied"] is True
+    assert data["l1_llm_skip_reason"] == "mixed"
+    assert [hit["uri"] for hit in data["results"]] == ["/docs/a.txt", "/docs/b.txt"]
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_search_route_not_captured_by_single_workspace_route(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    mock_search.return_value = SearchResponse(results=[], total=0, query_time_ms=1.0)
+
+    r = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={"workspace_names": [workspace.name], "query": "hello"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    mock_search.assert_called_once()
+    assert mock_search.call_args[0][2].workspace_id == workspace.id
+
+
 def test_service_upload_document_201(
     client: TestClient,
     db: Session,

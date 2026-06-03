@@ -48,11 +48,13 @@ async def service_list_workspaces(
         ws = db.query(Workspace).filter(Workspace.id == binding.workspace_id).first()
         if ws is not None:
             items.append({
+                "id": ws.id,
                 "name": ws.name,
                 "slug": ws.slug,
+                "description": ws.description,
                 "permission": binding.permission,
             })
-    return {"workspaces": items}
+    return {"items": items, "workspaces": items}
 
 
 class ServiceSearchRequest(BaseModel):
@@ -73,6 +75,46 @@ class ServiceSearchRequest(BaseModel):
     use_l1_llm_navigation: bool = False
 
 
+class ServiceMultiWorkspaceSearchRequest(BaseModel):
+    """Semantic search body for service token API across multiple workspaces."""
+
+    workspace_names: Optional[List[str]] = None
+    query: str = Field(..., min_length=1)
+    path_prefix: Optional[str] = Field(
+        None,
+        description="If set, only hits whose file uri is under this logical path prefix",
+    )
+    top_k: int = Field(10, gt=0, le=100)
+    use_rerank: bool = True
+    use_contextual_retrieval: bool = False
+    contextual_l0_top_n: int = Field(40, ge=5, le=200)
+    contextual_l1_top_n: int = Field(30, ge=5, le=200)
+    contextual_chunk_fetch_multiplier: int = Field(4, ge=1, le=20)
+    retrieval_strategy: str = "auto"
+    use_l1_llm_navigation: bool = False
+
+
+class SkippedWorkspace(BaseModel):
+    workspace_name: str
+    reason: str
+    message: str
+
+
+class MultiWorkspaceSearchResult(SearchResult):
+    workspace_id: int
+    workspace_name: str
+
+
+class MultiWorkspaceSearchResponse(BaseModel):
+    results: list[MultiWorkspaceSearchResult]
+    total: int
+    query_time_ms: float
+    workspace_count: int
+    l1_llm_applied: Optional[bool] = None
+    l1_llm_skip_reason: Optional[str] = None
+    skipped_workspaces: list[SkippedWorkspace]
+
+
 def _apply_path_prefix_filter(resp: SearchResponse, path_prefix: Optional[str]) -> SearchResponse:
     if path_prefix is None or not str(path_prefix).strip() or str(path_prefix).strip() == "/":
         return resp
@@ -88,6 +130,8 @@ def _apply_path_prefix_filter(resp: SearchResponse, path_prefix: Optional[str]) 
         results=kept,
         total=len(kept),
         query_time_ms=resp.query_time_ms,
+        l1_llm_applied=resp.l1_llm_applied,
+        l1_llm_skip_reason=resp.l1_llm_skip_reason,
     )
 
 
@@ -145,6 +189,40 @@ def _resolve_url_prefix(url_prefix: Optional[str], path_prefix: Optional[str]) -
             )
         return normalized_url_prefix
     return validate_path(url_prefix if url_prefix is not None else path_prefix or "/")
+
+
+def _dedupe_workspace_names(workspace_names: Optional[List[str]]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in workspace_names or []:
+        name = str(raw_name).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _token_can_read_workspace(ctx: ServiceTokenContext, workspace_id: int) -> bool:
+    binding = next((b for b in ctx.bindings if b.workspace_id == workspace_id), None)
+    return binding is not None and binding.permission in ("read", "write")
+
+
+def _merge_l1_applied(values: list[Optional[bool]]) -> Optional[bool]:
+    if any(value is True for value in values):
+        return True
+    if all(value is None for value in values):
+        return None
+    return False
+
+
+def _merge_l1_skip_reason(values: list[Optional[str]]) -> Optional[str]:
+    reasons = {value for value in values if value is not None}
+    if not reasons:
+        return None
+    if len(reasons) == 1:
+        return next(iter(reasons))
+    return "mixed"
 
 
 @router.post(
@@ -208,6 +286,105 @@ async def service_replace_document(
     )
     db.refresh(row)
     return _upload_response_dict(row, task.id if task else None)
+
+
+@router.post("/workspaces/multi_space/search", response_model=MultiWorkspaceSearchResponse)
+async def service_multi_workspace_semantic_search(
+    body: ServiceMultiWorkspaceSearchRequest,
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> MultiWorkspaceSearchResponse:
+    """
+    Semantic search across multiple workspace names visible to the service token.
+    Inaccessible workspace names are reported in ``skipped_workspaces``.
+    """
+    workspace_names = _dedupe_workspace_names(body.workspace_names)
+    if not workspace_names:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="workspace_names is required for multi_space search",
+        )
+
+    results: list[MultiWorkspaceSearchResult] = []
+    skipped: list[SkippedWorkspace] = []
+    l1_applied_values: list[Optional[bool]] = []
+    l1_skip_reasons: list[Optional[str]] = []
+    query_time_ms = 0.0
+    workspace_count = 0
+
+    try:
+        for workspace_name in workspace_names:
+            ws = db.query(Workspace).filter(Workspace.name == workspace_name).first()
+            if ws is None:
+                skipped.append(
+                    SkippedWorkspace(
+                        workspace_name=workspace_name,
+                        reason="not_found",
+                        message="Workspace not found",
+                    )
+                )
+                continue
+            if not _token_can_read_workspace(ctx, ws.id):
+                skipped.append(
+                    SkippedWorkspace(
+                        workspace_name=workspace_name,
+                        reason="permission_denied",
+                        message="Token not authorized for this workspace",
+                    )
+                )
+                continue
+
+            search_req = SearchRequest(
+                query=body.query,
+                top_k=body.top_k,
+                workspace_id=ws.id,
+                use_rerank=body.use_rerank,
+                use_contextual_retrieval=body.use_contextual_retrieval,
+                contextual_l0_top_n=body.contextual_l0_top_n,
+                contextual_l1_top_n=body.contextual_l1_top_n,
+                contextual_chunk_fetch_multiplier=body.contextual_chunk_fetch_multiplier,
+                retrieval_strategy=body.retrieval_strategy,
+                use_l1_llm_navigation=body.use_l1_llm_navigation,
+            )
+            resp = _execute_search(
+                db,
+                ws.owner_id,
+                search_req,
+                endpoint="service_multi_workspace",
+                rerank_hierarchical_boost=None,
+            )
+            resp = _apply_path_prefix_filter(resp, body.path_prefix)
+            workspace_count += 1
+            query_time_ms += resp.query_time_ms
+            l1_applied_values.append(resp.l1_llm_applied)
+            l1_skip_reasons.append(resp.l1_llm_skip_reason)
+            for hit in resp.results:
+                results.append(
+                    MultiWorkspaceSearchResult(
+                        **hit.model_dump(),
+                        workspace_id=ws.id,
+                        workspace_name=ws.name,
+                    )
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Service multi-workspace search failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    results = sorted(results, key=lambda hit: hit.score, reverse=True)[: body.top_k]
+    return MultiWorkspaceSearchResponse(
+        results=results,
+        total=len(results),
+        query_time_ms=query_time_ms,
+        workspace_count=workspace_count,
+        l1_llm_applied=_merge_l1_applied(l1_applied_values),
+        l1_llm_skip_reason=_merge_l1_skip_reason(l1_skip_reasons),
+        skipped_workspaces=skipped,
+    )
 
 
 @router.post("/workspaces/{workspace_name}/search", response_model=SearchResponse)
