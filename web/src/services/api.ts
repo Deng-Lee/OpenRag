@@ -216,6 +216,13 @@ export const filesAPI = {
     const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/preview`);
     return response.data as { format: 'html' | 'text'; content: string };
   },
+  fetchWorkspaceChunkSource: async (
+    workspaceId: number,
+    fileId: number
+  ): Promise<{ format: 'text'; content: string }> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/chunk-source`);
+    return response.data as { format: 'text'; content: string };
+  },
 };
 
 export const searchAPI = {

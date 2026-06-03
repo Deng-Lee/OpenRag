@@ -20,6 +20,11 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File, ProcessingStatus
 from openrag.models.workspace import Workspace
 from openrag.parsers.parser_registry import ParserRegistry
+from openrag.services.canonical_chunk_source import (
+    build_canonical_chunk_source,
+    canonical_source_metadata,
+    supports_canonical_chunk_source,
+)
 from openrag.services.parse_artifact_service import ParseArtifactService
 from openrag.services.trace_service import TraceService
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
@@ -256,6 +261,13 @@ class DocumentProcessor:
                 error_message=str(exc),
             )
             raise
+        canonical_text_override = None
+        canonical_source = None
+        if supports_canonical_chunk_source(_parser_name(parser)):
+            canonical_result = build_canonical_chunk_source(text_blocks)
+            text_blocks = canonical_result.blocks
+            canonical_text_override = canonical_result.text
+            canonical_source = canonical_source_metadata()
         parse_duration_ms = int((time.perf_counter() - parse_started) * 1000)
         _safe_finish_span(
             trace_service,
@@ -318,6 +330,8 @@ class DocumentProcessor:
                     blocks=text_blocks,
                     parser_name=_parser_name(parser),
                     parser_version=_parser_version(parser),
+                    canonical_text_override=canonical_text_override,
+                    canonical_source=canonical_source,
                 )
                 _safe_finish_span(
                     trace_service,

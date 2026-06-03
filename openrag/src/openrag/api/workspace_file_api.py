@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from openrag.api.deps import get_current_active_user, get_db
+from openrag.models import DocumentParseArtifact
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel
 from openrag.models.user import User
@@ -219,6 +220,25 @@ def _chunk_to_response(
     )
 
 
+def _latest_completed_parse_artifact(
+    db: Session, workspace_id: int, file_id: int
+) -> Optional[DocumentParseArtifact]:
+    return (
+        db.query(DocumentParseArtifact)
+        .filter(
+            DocumentParseArtifact.workspace_id == workspace_id,
+            DocumentParseArtifact.file_id == file_id,
+            DocumentParseArtifact.status == "completed",
+        )
+        .order_by(
+            DocumentParseArtifact.updated_at.desc(),
+            DocumentParseArtifact.created_at.desc(),
+            DocumentParseArtifact.id.desc(),
+        )
+        .first()
+    )
+
+
 @router.get("/{file_id}/chunks", response_model=WorkspaceDocumentChunkListResponse)
 def list_workspace_file_chunks(
     workspace_id: int,
@@ -272,6 +292,46 @@ def list_workspace_file_chunks(
         total=total,
         skip=skip,
         limit=limit,
+    )
+
+
+@router.get("/{file_id}/chunk-source", response_model=WorkspaceFilePreviewResponse)
+def get_workspace_file_chunk_source(
+    workspace_id: int,
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> WorkspaceFilePreviewResponse:
+    file = get_readable_workspace_file_or_404(db, workspace_id, file_id, current_user)
+    _raise_if_directory(file, "Cannot get chunk source for a directory")
+
+    artifact = _latest_completed_parse_artifact(db, workspace_id, file.id)
+    if artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Canonical chunk source not found",
+        )
+
+    try:
+        data = MinioStorage().read_object_bytes(
+            artifact.canonical_md_bucket,
+            artifact.canonical_md_object_key,
+        )
+    except Exception as exc:
+        logger.warning(
+            "MinIO canonical chunk source read failed bucket=%s object_key=%s: %s",
+            artifact.canonical_md_bucket,
+            artifact.canonical_md_object_key,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Canonical chunk source not found",
+        ) from exc
+
+    return WorkspaceFilePreviewResponse(
+        format="text",
+        content=data.decode("utf-8", errors="replace"),
     )
 
 

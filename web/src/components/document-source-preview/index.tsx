@@ -65,6 +65,15 @@ function fetchPreview(
   return filesAPI.fetchPreview(fileId);
 }
 
+function isDocxPreviewFile(file: File): boolean {
+  const name = (file.name || file.uri || '').toLowerCase();
+  const mime = (file.mime_type || '').toLowerCase();
+  return (
+    name.endsWith('.docx') ||
+    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  );
+}
+
 export function extractPdfPositions(chunk: SourcePreviewChunk | null | undefined): PdfPos[] {
   if (!chunk) return [];
   const topLevel = Array.isArray(chunk.position_int) ? chunk.position_int : null;
@@ -120,14 +129,28 @@ function findTextSnippetStart(text: string, chunk: SourcePreviewChunk): number {
   return -1;
 }
 
+export function codePointOffsetToUtf16Index(text: string, offset: number): number {
+  if (offset <= 0) return 0;
+  let codePoints = 0;
+  let utf16Index = 0;
+  for (const char of text) {
+    if (codePoints >= offset) break;
+    utf16Index += char.length;
+    codePoints += 1;
+  }
+  return utf16Index;
+}
+
 export function renderTextWithNav(
   text: string,
   chunk: SourcePreviewChunk,
   instanceId?: string
 ): React.ReactNode {
   const anchorAttrs = chunkAnchorAttrs(chunk, instanceId);
-  const s = getChunkStartOffset(chunk) ?? 0;
-  const e = getChunkEndOffset(chunk) ?? 0;
+  const rawS = getChunkStartOffset(chunk) ?? 0;
+  const rawE = getChunkEndOffset(chunk) ?? 0;
+  const s = codePointOffsetToUtf16Index(text, rawS);
+  const e = codePointOffsetToUtf16Index(text, rawE);
   const snippet = (chunk.text || '').trim().slice(0, 200);
   if (e > s && e <= text.length) {
     return (
@@ -351,6 +374,8 @@ export function DocumentSourcePreview({
   const [markdownBody, setMarkdownBody] = useState<string | null>(null);
   const [officeHtml, setOfficeHtml] = useState<string | null>(null);
   const [officeText, setOfficeText] = useState<string | null>(null);
+  const [chunkSourceText, setChunkSourceText] = useState<string | null>(null);
+  const [usingChunkSource, setUsingChunkSource] = useState(false);
   const [kind, setKind] = useState<ReturnType<typeof classifyPreviewFile>>('unsupported');
   const objectUrlsRef = useRef<string[]>([]);
 
@@ -407,6 +432,8 @@ export function DocumentSourcePreview({
     setMarkdownBody(null);
     setOfficeHtml(null);
     setOfficeText(null);
+    setChunkSourceText(null);
+    setUsingChunkSource(false);
     setKind('unsupported');
     revokeAll();
   }, [revokeAll]);
@@ -432,6 +459,42 @@ export function DocumentSourcePreview({
 
     const run = async () => {
       try {
+        const chunkSourceWorkspaceId = workspaceId;
+        const shouldUseChunkSource =
+          chunkSourceWorkspaceId != null &&
+          (cat === 'markdown' ||
+            cat === 'text' ||
+            (cat === 'office' &&
+              isDocxPreviewFile({
+                id: fileId,
+                name: fileName,
+                mime_type: fileMimeType,
+                is_directory: fileIsDirectory,
+                uri: fileUri,
+              } as File)));
+        if (shouldUseChunkSource) {
+          try {
+            const src = await filesAPI.fetchWorkspaceChunkSource(chunkSourceWorkspaceId, fileId);
+            if (cancelled) return;
+            setChunkSourceText(src.content);
+            setUsingChunkSource(true);
+            setLoading(false);
+            if (onBlobReady) {
+              void fetchContentBlob(fileId, chunkSourceWorkspaceId)
+                .then((blob) => {
+                  if (!cancelled) onBlobReady(blob);
+                })
+                .catch(() => {
+                  /* download remains unavailable */
+                });
+            }
+            return;
+          } catch {
+            if (cancelled) return;
+            setUsingChunkSource(false);
+          }
+        }
+
         if (cat === 'office') {
           const prev = await fetchPreview(fileId, workspaceId);
           if (cancelled) return;
@@ -624,6 +687,18 @@ export function DocumentSourcePreview({
             <div style={{ textAlign: 'center' }}>
               <img src={imageUrl} alt={title} style={{ maxWidth: '100%', height: 'auto' }} />
             </div>
+          ) : usingChunkSource && chunkSourceText != null && chunk ? (
+            <pre
+              style={{
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                fontFamily: 'monospace',
+                fontSize: 13,
+                margin: 0,
+              }}
+            >
+              {renderTextWithNav(chunkSourceText, chunk, instanceDomId)}
+            </pre>
           ) : kind === 'markdown' && markdownBody != null ? (
             <div className="file-preview-markdown">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownBody}</ReactMarkdown>
