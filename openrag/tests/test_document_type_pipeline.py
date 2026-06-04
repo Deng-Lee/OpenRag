@@ -232,8 +232,8 @@ def test_document_processor_passes_document_type_to_chunk_engine(tmp_path, monke
         source = tmp_path / "source.txt"
         source.write_text("processor text", encoding="utf-8")
         chunk_engine = RecordingChunkEngine()
-        monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "512")
-        monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "0")
+        monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "600")
+        monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "80")
 
         processor = DocumentProcessor(
             db=db,

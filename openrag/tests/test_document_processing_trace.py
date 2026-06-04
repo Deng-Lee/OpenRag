@@ -400,8 +400,8 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         monkeypatch.setattr(task_worker, "_create_vector_store", lambda: FakeVectorStore())
         monkeypatch.setattr(task_worker, "_create_layer_store", lambda: None)
         monkeypatch.setattr(task_worker, "_create_es_chunk_store", lambda: FakeEsStore())
-        monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "256")
-        monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "32")
+        monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "600")
+        monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "80")
         monkeypatch.setenv("OPENRAG_MIN_CHUNK_TOKENS", "2")
 
         set_trace_context(

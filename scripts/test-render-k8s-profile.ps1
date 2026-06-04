@@ -90,6 +90,10 @@ try {
     Assert-FileContains -Path (Join-Path $RenderedDir "11-web.yaml") -Needle "imagePullPolicy: IfNotPresent"
     Assert-FileNotContains -Path (Join-Path $RenderedDir "11-web.yaml") -Needle "imagePullPolicy: Always"
 
+    Assert-FileContains -Path (Join-Path $RenderedDir "13-configmap-openrag-llm.yaml") -Needle 'EMBEDDING_DIMENSION: "2560"'
+    Assert-FileContains -Path (Join-Path $RenderedDir "09-api.yaml") -Needle "key: EMBEDDING_DIMENSION"
+    Assert-FileContains -Path (Join-Path $RenderedDir "10-task-worker.yaml") -Needle "key: EMBEDDING_DIMENSION"
+
     Assert-FileContains -Path (Join-Path $RenderedDir "07-milvus.yaml") -Needle "value: 172.16.31.63:9000"
     Assert-FileContains -Path (Join-Path $RenderedDir "07-milvus-config.yaml") -Needle "address: 172.16.31.63"
     Assert-FileContains -Path (Join-Path $RenderedDir "07-milvus-config.yaml") -Needle "port: 9000"

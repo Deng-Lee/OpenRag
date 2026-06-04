@@ -119,6 +119,11 @@ spec:
                 configMapKeyRef:
                   name: openrag-llm-config
                   key: EMBEDDING_MODEL
+            - name: EMBEDDING_DIMENSION
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: EMBEDDING_DIMENSION
             - name: L1_NAV_MODEL
               valueFrom:
                 configMapKeyRef:

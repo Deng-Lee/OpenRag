@@ -345,6 +345,7 @@ function Assert-RenderedOutput {
         "09-api.yaml",
         "10-task-worker.yaml",
         "11-web.yaml",
+        "13-configmap-openrag-llm.yaml",
         "15-configmap-openrag-service-conf.yaml",
         "kustomization.yaml"
     )
@@ -375,6 +376,10 @@ function Assert-RenderedOutput {
     Assert-Contains -Path (Join-Path $Dir "11-web.yaml") -Needle "image: openrag/web:$ImageTag"
     Assert-Contains -Path (Join-Path $Dir "11-web.yaml") -Needle "imagePullPolicy: IfNotPresent"
     Assert-NotContains -Path (Join-Path $Dir "11-web.yaml") -Needle "imagePullPolicy: Always"
+
+    Assert-Contains -Path (Join-Path $Dir "13-configmap-openrag-llm.yaml") -Needle 'EMBEDDING_DIMENSION: "2560"'
+    Assert-Contains -Path (Join-Path $Dir "09-api.yaml") -Needle "key: EMBEDDING_DIMENSION"
+    Assert-Contains -Path (Join-Path $Dir "10-task-worker.yaml") -Needle "key: EMBEDDING_DIMENSION"
 
     Assert-Contains -Path (Join-Path $Dir "07-milvus.yaml") -Needle "value: $($Minio.Address):$($Minio.Port)"
     Assert-Contains -Path (Join-Path $Dir "07-milvus-config.yaml") -Needle "address: $($Minio.Address)"
