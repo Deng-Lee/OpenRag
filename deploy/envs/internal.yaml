@@ -1,0 +1,9 @@
+minio:
+  endpoint: http://172.16.31.63:9000
+  address: 172.16.31.63
+  port: 9000
+  storageBucket: rag-kb
+  storagePrefix: openrag
+  publicUrl: http://172.16.31.63:9000
+  milvusBucket: rag-kb
+  milvusRootPath: milvus
