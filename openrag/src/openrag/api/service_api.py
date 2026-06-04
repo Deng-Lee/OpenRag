@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
@@ -16,9 +17,12 @@ from openrag.api.search_api import (
     SearchResult,
     _execute_search,
 )
+from openrag.config import get_preview_public_web_base_url
+from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as DbFile
 from openrag.models.workspace import Workspace
 from openrag.services.file_ingest import ingest_new_file, replace_file_content, validate_path
+from openrag.services.preview_token_service import create_preview_token, decode_preview_token
 from openrag.services.service_token_service import (
     ServiceTokenContext,
     assert_token_workspace_permission,
@@ -113,6 +117,19 @@ class MultiWorkspaceSearchResponse(BaseModel):
     l1_llm_applied: Optional[bool] = None
     l1_llm_skip_reason: Optional[str] = None
     skipped_workspaces: list[SkippedWorkspace]
+
+
+class ServicePreviewLinkRequest(BaseModel):
+    file_id: int
+    chunk_id: str = Field(..., min_length=1)
+    chunk_index: int | None = None
+    ttl_seconds: int | None = None
+
+
+class ServicePreviewLinkResponse(BaseModel):
+    preview_url: str
+    expires_at: datetime
+    ttl_seconds: int
 
 
 def _apply_path_prefix_filter(resp: SearchResponse, path_prefix: Optional[str]) -> SearchResponse:
@@ -223,6 +240,47 @@ def _merge_l1_skip_reason(values: list[Optional[str]]) -> Optional[str]:
     if len(reasons) == 1:
         return next(iter(reasons))
     return "mixed"
+
+
+def resolve_preview_target(
+    db: Session,
+    *,
+    workspace_id: int,
+    file_id: int,
+    chunk_id: str,
+    chunk_index: int | None,
+) -> tuple[DbFile, DocumentChunk]:
+    file_row = (
+        db.query(DbFile)
+        .filter(DbFile.id == file_id, DbFile.workspace_id == workspace_id)
+        .first()
+    )
+    if file_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    if file_row.is_directory:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is a directory")
+
+    chunk_row = (
+        db.query(DocumentChunk)
+        .filter(
+            DocumentChunk.chunk_id == chunk_id,
+            DocumentChunk.file_id == file_row.id,
+            DocumentChunk.workspace_id == workspace_id,
+        )
+        .first()
+    )
+    if chunk_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chunk not found")
+    if chunk_index is not None and chunk_row.chunk_index != chunk_index:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="chunk_index does not match chunk",
+        )
+    return file_row, chunk_row
+
+
+def build_preview_url(*, base_url: str, token: str) -> str:
+    return f"{(base_url or '').strip().rstrip('/')}/embed/document-preview#token={token}"
 
 
 @router.post(
@@ -430,6 +488,43 @@ async def service_semantic_search(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(exc),
         ) from exc
+
+
+@router.post(
+    "/workspaces/{workspace_name}/preview-links",
+    response_model=ServicePreviewLinkResponse,
+)
+async def service_create_preview_link(
+    workspace_name: str,
+    body: ServicePreviewLinkRequest,
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> ServicePreviewLinkResponse:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    file_row, chunk_row = resolve_preview_target(
+        db,
+        workspace_id=ws.id,
+        file_id=body.file_id,
+        chunk_id=body.chunk_id,
+        chunk_index=body.chunk_index,
+    )
+    token, expires_at = create_preview_token(
+        workspace_id=ws.id,
+        file_id=file_row.id,
+        chunk_id=chunk_row.chunk_id,
+        chunk_index=chunk_row.chunk_index,
+        ttl_seconds=body.ttl_seconds,
+    )
+    claims = decode_preview_token(token)
+    return ServicePreviewLinkResponse(
+        preview_url=build_preview_url(
+            base_url=get_preview_public_web_base_url(),
+            token=token,
+        ),
+        expires_at=expires_at,
+        ttl_seconds=claims.exp - claims.iat,
+    )
 
 
 @router.get("/workspaces/{workspace_name}/tree")

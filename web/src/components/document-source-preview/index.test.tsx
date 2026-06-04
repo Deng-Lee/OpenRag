@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { DocumentSourcePreview, PdfPageWithBBox, extractPdfPositions } from './index';
 
 const i18nMock = vi.hoisted(() => ({
@@ -212,6 +212,69 @@ describe('document-source-preview non-PDF chunk behavior', () => {
       expect(container.querySelector('.chunk-text-highlight')?.textContent).toBe('beta');
     });
     expect(filesApiMock.fetchWorkspaceChunkSource).toHaveBeenCalledWith(1, 10);
+  });
+
+  it('uses custom fetchers when provided', async () => {
+    const fetchers = {
+      fetchContentBlob: vi.fn().mockResolvedValue(textBlob('alpha beta gamma')),
+      fetchPreview: vi.fn().mockResolvedValue({ format: 'text' as const, content: 'alpha beta gamma' }),
+      fetchChunkSource: vi.fn().mockResolvedValue({
+        format: 'text' as const,
+        content: 'alpha beta gamma',
+      }),
+    };
+
+    const { container } = render(
+      <DocumentSourcePreview
+        file={textFile()}
+        chunk={textChunk(6, 10)}
+        fetchers={fetchers}
+      />
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.chunk-text-highlight')?.textContent).toBe('beta');
+    });
+    expect(fetchers.fetchChunkSource).toHaveBeenCalled();
+    expect(filesApiMock.fetchWorkspaceChunkSource).not.toHaveBeenCalled();
+    expect(filesApiMock.fetchContentBlob).not.toHaveBeenCalled();
+  });
+
+  it('uses custom unsupported preview message', async () => {
+    render(
+      <DocumentSourcePreview
+        file={officeFile('archive.zip', 'application/zip')}
+        chunk={textChunk(0, 5)}
+        previewMessages={{
+          unsupported: '该文件类型暂不支持内联预览。',
+        }}
+      />
+    );
+
+    await screen.findByText('该文件类型暂不支持内联预览。');
+    expect(screen.queryByText(/下载/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/download/i)).not.toBeInTheDocument();
+  });
+
+  it('uses custom load failed preview message', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    filesApiMock.fetchContentBlob.mockRejectedValueOnce(new Error('boom'));
+
+    render(
+      <DocumentSourcePreview
+        file={textFile()}
+        chunk={textChunk(0, 5)}
+        previewMessages={{
+          loadFailed: '无法加载文档预览。',
+        }}
+      />
+    );
+
+    await screen.findByText('无法加载文档预览。');
+    expect(consoleError).toHaveBeenCalled();
+    expect(screen.queryByText(/下载/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/download/i)).not.toBeInTheDocument();
+    consoleError.mockRestore();
   });
 
   it('keeps non-DOCX office files on the existing preview path', async () => {

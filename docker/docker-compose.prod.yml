@@ -28,6 +28,9 @@ services:
       - MAX_UPLOAD_SIZE=20971520
       - UPLOAD_DIR=/app/uploads
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost}
+      - PREVIEW_PUBLIC_WEB_BASE_URL=${PREVIEW_PUBLIC_WEB_BASE_URL:-https://openrag.guozhijishu.com}
+      - PREVIEW_TOKEN_TTL_SECONDS=${PREVIEW_TOKEN_TTL_SECONDS:-900}
+      - PREVIEW_TOKEN_MAX_TTL_SECONDS=${PREVIEW_TOKEN_MAX_TTL_SECONDS:-1800}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
@@ -71,6 +74,8 @@ services:
     restart: unless-stopped
     ports:
       - "${WEB_PORT:-80}:80"
+    environment:
+      - PREVIEW_FRAME_ANCESTORS=${PREVIEW_FRAME_ANCESTORS:-'self' http://192.168.100.33:2026 http://192.168.100.32:2026 http://172.16.31.61:2026 http://172.16.31.156:2026}
     depends_on:
       - api
     networks:

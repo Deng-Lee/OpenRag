@@ -10,6 +10,7 @@ import ServiceTokens from './pages/ServiceTokens';
 import Settings from './pages/Settings';
 import SearchPage from './pages/Search';
 import DocumentChunks from './pages/DocumentChunks';
+import EmbeddedDocumentPreview from './pages/EmbeddedDocumentPreview';
 import { authAPI } from './services/api';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -49,6 +50,7 @@ function App() {
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
+        <Route path="/embed/document-preview" element={<EmbeddedDocumentPreview />} />
         <Route
           path="/files"
           element={

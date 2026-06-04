@@ -36,6 +36,19 @@ export interface DocumentSourcePreviewProps {
   embedded?: boolean;
   active?: boolean;
   onBlobReady?: (blob: Blob | null) => void;
+  fetchers?: DocumentSourcePreviewFetchers;
+  previewMessages?: DocumentSourcePreviewMessages;
+}
+
+export interface DocumentSourcePreviewFetchers {
+  fetchContentBlob: () => Promise<Blob>;
+  fetchPreview: () => Promise<{ format: 'html' | 'text'; content: string }>;
+  fetchChunkSource: () => Promise<{ format: 'text'; content: string }>;
+}
+
+export interface DocumentSourcePreviewMessages {
+  unsupported?: string;
+  loadFailed?: string;
 }
 
 function getChunkStartOffset(chunk: SourcePreviewChunk): number | null {
@@ -48,7 +61,12 @@ function getChunkEndOffset(chunk: SourcePreviewChunk): number | null {
   return legacy ?? chunk.source_char_end ?? null;
 }
 
-function fetchContentBlob(fileId: number, workspaceId?: number): Promise<Blob> {
+function fetchContentBlob(
+  fileId: number,
+  workspaceId?: number,
+  fetchers?: DocumentSourcePreviewFetchers
+): Promise<Blob> {
+  if (fetchers) return fetchers.fetchContentBlob();
   if (workspaceId != null) {
     return filesAPI.fetchWorkspaceContentBlob(workspaceId, fileId);
   }
@@ -57,12 +75,26 @@ function fetchContentBlob(fileId: number, workspaceId?: number): Promise<Blob> {
 
 function fetchPreview(
   fileId: number,
-  workspaceId?: number
+  workspaceId?: number,
+  fetchers?: DocumentSourcePreviewFetchers
 ): Promise<{ format: 'html' | 'text'; content: string }> {
+  if (fetchers) return fetchers.fetchPreview();
   if (workspaceId != null) {
     return filesAPI.fetchWorkspacePreview(workspaceId, fileId);
   }
   return filesAPI.fetchPreview(fileId);
+}
+
+function fetchChunkSource(
+  fileId: number,
+  workspaceId?: number,
+  fetchers?: DocumentSourcePreviewFetchers
+): Promise<{ format: 'text'; content: string }> {
+  if (fetchers) return fetchers.fetchChunkSource();
+  if (workspaceId == null) {
+    return Promise.reject(new Error('workspaceId required'));
+  }
+  return filesAPI.fetchWorkspaceChunkSource(workspaceId, fileId);
 }
 
 function isDocxPreviewFile(file: File): boolean {
@@ -353,6 +385,8 @@ export function DocumentSourcePreview({
   embedded = false,
   active = true,
   onBlobReady,
+  fetchers,
+  previewMessages,
 }: DocumentSourcePreviewProps) {
   const { t } = useTranslation();
   const reactInstanceId = useId();
@@ -408,6 +442,8 @@ export function DocumentSourcePreview({
         chunkPositionsKey,
       ].join('\u001f')
     : '';
+  const unsupportedMessage = previewMessages?.unsupported ?? t('files.preview.unsupported');
+  const loadFailedMessage = previewMessages?.loadFailed ?? t('files.preview.load_failed');
 
   const revokeAll = useCallback(() => {
     objectUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
@@ -461,7 +497,7 @@ export function DocumentSourcePreview({
       try {
         const chunkSourceWorkspaceId = workspaceId;
         const shouldUseChunkSource =
-          chunkSourceWorkspaceId != null &&
+          (chunkSourceWorkspaceId != null || fetchers != null) &&
           (cat === 'markdown' ||
             cat === 'text' ||
             (cat === 'office' &&
@@ -474,13 +510,13 @@ export function DocumentSourcePreview({
               } as File)));
         if (shouldUseChunkSource) {
           try {
-            const src = await filesAPI.fetchWorkspaceChunkSource(chunkSourceWorkspaceId, fileId);
+            const src = await fetchChunkSource(fileId, chunkSourceWorkspaceId, fetchers);
             if (cancelled) return;
             setChunkSourceText(src.content);
             setUsingChunkSource(true);
             setLoading(false);
             if (onBlobReady) {
-              void fetchContentBlob(fileId, chunkSourceWorkspaceId)
+              void fetchContentBlob(fileId, chunkSourceWorkspaceId, fetchers)
                 .then((blob) => {
                   if (!cancelled) onBlobReady(blob);
                 })
@@ -496,7 +532,7 @@ export function DocumentSourcePreview({
         }
 
         if (cat === 'office') {
-          const prev = await fetchPreview(fileId, workspaceId);
+          const prev = await fetchPreview(fileId, workspaceId, fetchers);
           if (cancelled) return;
           if (prev.format === 'html') {
             setOfficeHtml(prev.content);
@@ -505,7 +541,7 @@ export function DocumentSourcePreview({
             setOfficeText(prev.content);
             setOfficeHtml(null);
           }
-          const blob = await fetchContentBlob(fileId, workspaceId);
+          const blob = await fetchContentBlob(fileId, workspaceId, fetchers);
           if (cancelled) return;
           onBlobReady?.(blob);
           setLoading(false);
@@ -514,18 +550,18 @@ export function DocumentSourcePreview({
 
         if (cat === 'unsupported') {
           try {
-            const blob = await fetchContentBlob(fileId, workspaceId);
+            const blob = await fetchContentBlob(fileId, workspaceId, fetchers);
             if (!cancelled) onBlobReady?.(blob);
           } catch {
             /* ignore */
           }
           if (cancelled) return;
-          setError(t('files.preview.unsupported'));
+          setError(unsupportedMessage);
           setLoading(false);
           return;
         }
 
-        const blob = await fetchContentBlob(fileId, workspaceId);
+        const blob = await fetchContentBlob(fileId, workspaceId, fetchers);
         if (cancelled) return;
         onBlobReady?.(blob);
 
@@ -566,7 +602,7 @@ export function DocumentSourcePreview({
       } catch (e: unknown) {
         if (cancelled) return;
         console.error(e);
-        setError(t('files.preview.load_failed'));
+        setError(loadFailedMessage);
         setLoading(false);
       }
     };
@@ -584,11 +620,13 @@ export function DocumentSourcePreview({
     fileIsDirectory,
     fileUri,
     workspaceId,
+    fetchers,
     chunkLoadKey,
     resetState,
     revokeAll,
     pushObjectUrl,
-    t,
+    unsupportedMessage,
+    loadFailedMessage,
     onBlobReady,
   ]);
 
@@ -735,7 +773,7 @@ export function DocumentSourcePreview({
               {officeText}
             </pre>
           ) : !loading && kind === 'unsupported' ? (
-            <Alert type="info" message={t('files.preview.unsupported')} showIcon />
+            <Alert type="info" message={unsupportedMessage} showIcon />
           ) : null}
         </div>
       </div>

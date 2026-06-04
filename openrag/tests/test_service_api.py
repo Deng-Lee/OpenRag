@@ -9,11 +9,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import openrag.models  # noqa: F401 — register all mappers on Base.metadata
+import openrag.config as config_module
 from openrag.api.deps import get_db
 from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
-from openrag.models import Base, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
+from openrag.models import Base, DocumentChunk, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
 from openrag.security import hash_password
+from openrag.services.preview_token_service import decode_preview_token
 from openrag.storage.minio_storage import MinioStorage
 
 TEST_DATABASE_URL = "sqlite:///:memory:"
@@ -119,6 +121,44 @@ def _root(db: Session, ws: Workspace, owner: User) -> None:
         )
     )
     db.commit()
+
+
+def _file(db: Session, ws: Workspace, owner: User, uri: str, *, is_directory: bool = False) -> File:
+    f = File(
+        uri=uri,
+        name=uri.rsplit("/", 1)[-1] or "root",
+        owner_id=owner.id,
+        workspace_id=ws.id,
+        is_directory=is_directory,
+        size=0 if is_directory else 3,
+        mime_type=None if is_directory else "text/plain",
+    )
+    db.add(f)
+    db.commit()
+    db.refresh(f)
+    return f
+
+
+def _chunk(
+    db: Session,
+    ws: Workspace,
+    file: File,
+    chunk_id: str,
+    *,
+    chunk_index: int = 0,
+) -> DocumentChunk:
+    c = DocumentChunk(
+        id=db.query(DocumentChunk).count() + 1,
+        file_id=file.id,
+        workspace_id=ws.id,
+        chunk_id=chunk_id,
+        chunk_index=chunk_index,
+        object_key=f"chunks/{chunk_id}.md",
+    )
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return c
 
 
 def test_service_list_workspaces_requires_token(client: TestClient, workspace: Workspace) -> None:
@@ -604,6 +644,228 @@ def test_service_multi_workspace_search_route_not_captured_by_single_workspace_r
     assert r.status_code == 200
     mock_search.assert_called_once()
     assert mock_search.call_args[0][2].workspace_id == workspace.id
+
+
+def test_service_create_preview_link_ok_returns_url_and_actual_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    monkeypatch.setenv("PREVIEW_PUBLIC_WEB_BASE_URL", "https://preview.example.com///")
+    monkeypatch.setattr(config_module, "_config", None)
+    f = _file(db, workspace, owner, "/docs/a.txt")
+    c = _chunk(db, workspace, f, "chunk-preview-ok", chunk_index=42)
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={
+            "file_id": f.id,
+            "chunk_id": c.chunk_id,
+            "chunk_index": 42,
+            "ttl_seconds": 9999,
+        },
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["preview_url"].startswith(
+        "https://preview.example.com/embed/document-preview#token="
+    )
+    assert body["ttl_seconds"] == 1800
+    assert body["expires_at"]
+    token = body["preview_url"].split("#token=", 1)[1]
+    claims = decode_preview_token(token)
+    assert claims.workspace_id == workspace.id
+    assert claims.file_id == f.id
+    assert claims.chunk_id == c.chunk_id
+    assert claims.chunk_index == 42
+    assert claims.exp - claims.iat == body["ttl_seconds"]
+
+
+def test_service_create_preview_link_default_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    monkeypatch.setenv("PREVIEW_PUBLIC_WEB_BASE_URL", "https://preview.example.com")
+    monkeypatch.setattr(config_module, "_config", None)
+    f = _file(db, workspace, owner, "/docs/default.txt")
+    c = _chunk(db, workspace, f, "chunk-preview-default", chunk_index=7)
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": f.id, "chunk_id": c.chunk_id},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["ttl_seconds"] == 900
+
+
+def test_service_create_preview_link_requires_workspace_read_permission(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+) -> None:
+    other = Workspace(name="SvcPreviewOther", slug="svc-preview-other", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    tok = ServiceToken(secret="sk-preview-other", name="other", created_by_user_id=owner.id)
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=other.id, permission="read"))
+    db.commit()
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": 1, "chunk_id": "chunk-no-permission"},
+        headers={"X-OpenRag-Token": "sk-preview-other"},
+    )
+
+    assert r.status_code == 403
+    assert r.json()["detail"] == "Token not authorized for this workspace"
+
+
+def test_service_create_preview_link_rejects_missing_file(
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": 999, "chunk_id": "chunk-missing-file"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 404
+    assert r.json()["detail"] == "File not found"
+
+
+def test_service_create_preview_link_rejects_file_from_other_workspace(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    other = Workspace(name="SvcPreviewFileOther", slug="svc-preview-file-other", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    f = _file(db, other, owner, "/docs/other.txt")
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": f.id, "chunk_id": "chunk-other-file"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 404
+    assert r.json()["detail"] == "File not found"
+
+
+def test_service_create_preview_link_rejects_directory(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    directory = _file(db, workspace, owner, "/docs", is_directory=True)
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": directory.id, "chunk_id": "chunk-dir"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "File is a directory"
+
+
+def test_service_create_preview_link_rejects_chunk_from_other_file(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    requested_file = _file(db, workspace, owner, "/docs/requested.txt")
+    other_file = _file(db, workspace, owner, "/docs/other.txt")
+    c = _chunk(db, workspace, other_file, "chunk-other-file", chunk_index=2)
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": requested_file.id, "chunk_id": c.chunk_id},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Chunk not found"
+
+
+def test_service_create_preview_link_rejects_chunk_from_other_workspace(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    other = Workspace(name="SvcPreviewChunkOther", slug="svc-preview-chunk-other", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    f = _file(db, workspace, owner, "/docs/a.txt")
+    c = DocumentChunk(
+        id=db.query(DocumentChunk).count() + 1,
+        file_id=f.id,
+        workspace_id=other.id,
+        chunk_id="chunk-other-workspace",
+        chunk_index=3,
+        object_key="chunks/chunk-other-workspace.md",
+    )
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": f.id, "chunk_id": c.chunk_id},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Chunk not found"
+
+
+def test_service_create_preview_link_rejects_chunk_index_mismatch(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    f = _file(db, workspace, owner, "/docs/a.txt")
+    c = _chunk(db, workspace, f, "chunk-index-mismatch", chunk_index=5)
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/preview-links",
+        json={"file_id": f.id, "chunk_id": c.chunk_id, "chunk_index": 6},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "chunk_index does not match chunk"
 
 
 def test_service_upload_document_201(

@@ -87,6 +87,12 @@ export interface DocumentChunkListResponse {
   limit: number;
 }
 
+export interface EmbedDocumentPreviewResponse {
+  file: WorkspaceFileSummary;
+  chunk: DocumentChunkItem;
+  expires_at: string;
+}
+
 export interface SearchRequest {
   query: string;
   top_k?: number;

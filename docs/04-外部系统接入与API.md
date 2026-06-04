@@ -78,7 +78,7 @@ flowchart LR
 
 1. **获取令牌** — 系统管理员在 OpenRag Web 端「服务令牌」页面创建令牌，并授权绑定一个或多个工作区（每个工作区独立设置 `read` 或 `write` 权限）。
 2. **保存密钥** — 将完整密钥字符串（`sk-...`）存入 Secret 管理工具（环境变量、Vault、K8s Secret），禁止写入前端代码或版本库。
-3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 10 个机读接口。
+3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 11 个机读接口。
 
 ```bash
 # 示例：列根目录树
@@ -118,7 +118,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 | 操作 | 所需令牌权限 |
 |------|----------------|
-| 目录树、列子项、按前缀查询、文件元数据、语义检索、按文件名搜索 | **read** 或 **write** |
+| 目录树、列子项、按前缀查询、文件元数据、语义检索、按文件名搜索、创建预览链接 | **read** 或 **write** |
 | 上传新文件、覆盖已有文件 | **write** |
 
 只读令牌调用写接口 → **403**，`detail`：`Write permission required`。
@@ -161,6 +161,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `POST` | `/workspaces/{workspace_name}/search` | 语义检索（JSON body） | read |
 | `POST` | `/workspaces/multi_space/search` | 多工作区语义检索（JSON body） | read |
 | `GET` | `/workspaces/{workspace_name}/documents/search-by-name` | 按文件名子串模糊搜索 | read |
+| `POST` | `/workspaces/{workspace_name}/preview-links` | 创建文档片段 iframe 预览链接 | read |
 
 **外部系统可用能力汇总：**
 
@@ -172,6 +173,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 文件写入 | `POST /workspaces/{workspace_name}/documents`、`PUT /workspaces/{workspace_name}/documents/by-path` | 上传新文件或覆盖已有文件，需要 `write` 权限 |
 | 单工作区语义检索 | `POST /workspaces/{workspace_name}/search` | 在一个指定工作区中检索，需要 `read` 或 `write` 权限 |
 | 多工作区语义检索 | `POST /workspaces/multi_space/search` | 在请求体指定的多个工作区中检索，可访问工作区正常执行，不可访问工作区写入 `skipped_workspaces` |
+| 文档片段 iframe 预览 | `POST /workspaces/{workspace_name}/preview-links` | 外部后端为检索命中的 chunk 换取短期 `preview_url`，外部前端只把该 URL 放入 iframe |
 | 服务令牌管理 | `/service-tokens` 系列管理端点 | 由用户 JWT 鉴权，用于创建令牌、列出令牌、管理绑定、吊销令牌和查看密钥 |
 
 ### 2.5 管理端点详情
@@ -668,7 +670,102 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 ---
 
-#### 2.6.8 POST `/workspaces/multi_space/search` — 多工作区语义检索
+#### 2.6.8 POST `/workspaces/{workspace_name}/preview-links` — 创建文档片段 iframe 预览链接
+
+该接口用于把 service token 检索命中的某个文档 chunk 换成可嵌入 iframe 的短期预览链接。`X-OpenRag-Token` 只在接入方后端使用，浏览器 iframe 只使用短期 preview token；长期 service token 不得进入浏览器、页面源码、localStorage 或前端日志。
+
+**典型调用流程：**
+
+1. 外部后端使用 `X-OpenRag-Token` 调用 `POST /workspaces/{workspace_name}/search`，拿到命中的 `file_id`、`chunk_id` 和 `chunk_index`。
+2. 用户在外部前端点击某个 chunk。
+3. 外部前端把用户选择通知外部后端，不直接接触 `X-OpenRag-Token`。
+4. 外部后端调用 OpenRag `POST /workspaces/{workspace_name}/preview-links` 创建 preview link。
+5. OpenRag 返回完整 `preview_url`；外部前端只把该地址放入 iframe。
+
+**鉴权：** Service Token（`X-OpenRag-Token`），需要该工作区 `read` 或 `write` 权限。
+
+**Content-Type：** `application/json`
+
+**请求体 `ServicePreviewLinkRequest`：**
+
+| 字段 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `file_id` | int | **是** | — | search 命中返回的源文件 ID，必须属于 URL 中的工作区 |
+| `chunk_id` | string | **是** | — | search 命中返回的 chunk 标识，必须属于同一 `file_id` |
+| `chunk_index` | int/null | 否 | `null` | 可选一致性校验；提供时必须与该 chunk 的实际序号一致 |
+| `ttl_seconds` | int/null | 否 | `null` | 预览 token 有效期秒数；不传时默认 15 分钟或 900 秒，超过部署上限时按上限裁剪 |
+
+**请求示例：**
+
+```json
+{
+  "file_id": 123,
+  "chunk_id": "abc-456",
+  "chunk_index": 0,
+  "ttl_seconds": 900
+}
+```
+
+**响应 `200 OK`，`ServicePreviewLinkResponse`：**
+
+```json
+{
+  "preview_url": "https://openrag.example.com/embed/document-preview#token=eyJ...",
+  "expires_at": "2026-06-03T10:15:00+00:00",
+  "ttl_seconds": 900
+}
+```
+
+**响应字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `preview_url` | string | OpenRag 返回的完整 iframe 地址，包含 `/embed/document-preview#token=` |
+| `expires_at` | string | preview token 过期时间，ISO 8601 格式 |
+| `ttl_seconds` | int | 实际有效期秒数；可能因部署上限小于请求值 |
+
+`preview_url` 是 OpenRag 返回的完整地址，接入方不要自己拼 preview token/preview_url，也不要从 `preview_url` 中拆 token 后转存为长期凭证。iframe 内部 API 会通过 `X-OpenRag-Preview-Token` 同源访问 `/embed/v1/**`，不需要为了 iframe 预览放开浏览器 CORS。
+
+**iframe 示例：**
+
+```html
+<iframe
+  src="https://openrag.example.com/embed/document-preview#token=eyJ..."
+  sandbox="allow-scripts allow-same-origin"
+  referrerpolicy="no-referrer"
+  width="100%"
+  height="720"
+></iframe>
+```
+
+生产部署需要在 Web 侧配置 `PREVIEW_FRAME_ANCESTORS`，把接入方 iframe 父页面 origin 加入 CSP `frame-ancestors`。例如只允许 OpenRag 自身和接入方控制台嵌入：
+
+```bash
+PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32:2026 http://172.16.31.61:2026 http://172.16.31.156:2026"
+```
+
+**安全边界：**
+
+- `X-OpenRag-Token` 只保存在接入方后端，不进入浏览器。
+- preview token 是短期 bearer token，默认 15 分钟或 900 秒；被转发后，在有效期内可打开同一个文档 chunk。
+- preview token 只能访问签发时绑定的 workspace/file/chunk，不能访问其它 workspace、file 或 chunk，也不能 search/upload/delete。
+- 第一版不提供显式下载按钮，也不提供面向接入方的下载流程。iframe 内部预览 API 会获取渲染所需内容，因此 preview link 不是 DRM，也不承诺阻止截图、复制、网络抓包或通过开发者工具保存预览内容；如需更强内容保护，请在接入方业务层额外设计。
+
+**常见错误：**
+
+| 状态码 | 常见 `detail` | 说明 |
+|--------|---------------|------|
+| **400** | `File is a directory` | `file_id` 指向目录 |
+| **400** | `chunk_index does not match chunk` | 请求中的 `chunk_index` 与真实 chunk 不一致 |
+| **401** | `Invalid or missing service token` | 缺少、错误或已吊销 `X-OpenRag-Token` |
+| **403** | `Token not authorized for this workspace` | 令牌未绑定 URL 中的工作区 |
+| **404** | `Workspace not found` | 工作区名不存在 |
+| **404** | `File not found` | 文件不存在，或文件不属于该工作区 |
+| **404** | `Chunk not found` | chunk 不存在，或 chunk 不属于该 workspace/file |
+
+---
+
+#### 2.6.9 POST `/workspaces/multi_space/search` — 多工作区语义检索
 
 **Content-Type：** `application/json`
 
@@ -801,7 +898,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 ---
 
-#### 2.6.9 GET `/workspaces/{workspace_name}/documents/search-by-name` — 按文件名模糊搜索
+#### 2.6.10 GET `/workspaces/{workspace_name}/documents/search-by-name` — 按文件名模糊搜索
 
 **Query 参数：**
 
@@ -869,6 +966,25 @@ curl -sS -X POST "https://api.example.com/service/v1/workspaces/multi_space/sear
   -H "X-OpenRag-Token: sk-xxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"workspace_names":["MyWorkspace","AnotherWS"],"query":"合同金额","top_k":5,"path_prefix":"/法务"}'
+```
+
+**创建文档片段预览链接：**
+
+```bash
+curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/preview-links" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"file_id":123,"chunk_id":"abc-456","chunk_index":0,"ttl_seconds":900}'
+```
+
+外部前端使用响应中的完整 `preview_url`：
+
+```html
+<iframe
+  src="https://openrag.example.com/embed/document-preview#token=eyJ..."
+  sandbox="allow-scripts allow-same-origin"
+  referrerpolicy="no-referrer"
+></iframe>
 ```
 
 **上传文件：**
@@ -948,6 +1064,27 @@ r = requests.post(
 r.raise_for_status()
 print(r.json())
 
+# 创建文档片段 iframe 预览链接。外部后端执行本请求，外部前端只使用返回的 preview_url。
+r = requests.post(
+    f"{WS_URL}/preview-links",
+    json={
+        "file_id": 123,
+        "chunk_id": "abc-456",
+        "chunk_index": 0,
+        "ttl_seconds": 900,
+    },
+    headers=HEADERS,
+    timeout=30,
+)
+r.raise_for_status()
+preview_url = r.json()["preview_url"]
+iframe_html = (
+    f'<iframe src="{preview_url}" '
+    'sandbox="allow-scripts allow-same-origin" '
+    'referrerpolicy="no-referrer"></iframe>'
+)
+print(iframe_html)
+
 # 上传文件
 r = requests.post(
     f"{WS_URL}/documents",
@@ -1007,12 +1144,17 @@ print(r.json())
 | **400** | `Cannot modify bindings on a revoked token` | 修改已吊销令牌的绑定 |
 | **400** | `File type ... is not supported for processing` | 覆盖时文件 MIME 不在支持列表 |
 | **400** | `workspace_names is required for multi_space search` | 多工作区检索缺少目标工作区数组 |
+| **400** | `File is a directory` | 创建 preview link 时 `file_id` 指向目录 |
+| **400** | `chunk_index does not match chunk` | 创建 preview link 时 chunk 序号校验失败 |
 | **401** | `Invalid or missing service token` | 缺头、密钥错、已吊销 |
+| **401** | `Preview token required` | iframe 内部预览 API 缺少 `X-OpenRag-Preview-Token` |
+| **401** | `Invalid preview token` | preview token 无效、过期或签名错误 |
 | **403** | `Token not authorized for this workspace` | 单工作区接口中，令牌未绑定该工作区 |
 | **403** | `Token permission insufficient` | 令牌对绑定的工作区权限不足 |
 | **404** | `Workspace not found` | 单工作区接口中，工作区名不存在 |
 | **404** | `Directory not found` | 目录路径不存在 |
 | **404** | `File not found` | 文件路径不存在 |
+| **404** | `Chunk not found` | 创建 preview link 时 chunk 不属于该 workspace/file |
 | **409** | `File already exists at <uri>` | 上传时目标路径已有文件 |
 | **409** | `Binding already exists` | 添加已存在的绑定 |
 | **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过 100 MB |
@@ -1033,6 +1175,10 @@ print(r.json())
 | 400 `Parent directory does not exist` | 上传时父目录未创建 | 先通过 Web 端或 POST `/files/directories`（JWT）创建目录 |
 | 检索返回 0 结果 | 文件 `processing_status` 非 `completed` | 等待文件处理完成再检索 |
 | 文件名搜索返回 0 结果 | 文件名不匹配或 `path_prefix` 限定范围内无文件 | 尝试缩短关键词或扩大 path_prefix 范围 |
+| 创建 preview link 返回 404 `File not found` 或 `Chunk not found` | 前端传回的 `file_id`、`chunk_id` 与当前工作区或文件不匹配 | 使用 search 响应原样传递这些字段，不要按文件名或路径自行定位 chunk |
+| 创建 preview link 返回 400 `chunk_index does not match chunk` | `chunk_index` 不是该 chunk 的真实序号 | 使用 search 返回的 `chunk_index`，或不传该可选字段 |
+| iframe 空白或被浏览器拒绝嵌入 | `PREVIEW_FRAME_ANCESTORS` 未包含接入方父页面 origin | 在 Web 部署配置中加入接入方 origin，例如 `http://192.168.100.33:2026` |
+| iframe 内预览 401 | `preview_url` 过期，或接入方自行拼接/截断了 token | 重新向外部后端请求 preview link；接入方不要自己拼 preview token/preview_url |
 
 ### 2.10 安全建议
 
@@ -1041,6 +1187,10 @@ print(r.json())
 - 密钥应定期轮换：吊销旧令牌、创建新令牌、更新外部系统配置。
 - 禁止在日志中输出完整 `X-OpenRag-Token` 或 `secret` 值。
 - `write` 令牌具有完整读写权限，仅在必要时发放；日常检索使用 `read` 令牌即可。
+- 创建 preview link 应在接入方后端完成；浏览器 iframe 只接收 OpenRag 返回的 `preview_url`，不要暴露长期 `X-OpenRag-Token`。
+- preview token 是短期 bearer token，默认 15 分钟或 900 秒；外部系统不要持久化为长期链接，过期后重新创建。
+- `PREVIEW_FRAME_ANCESTORS` 只控制哪些父页面可嵌入 OpenRag 预览页；iframe 内 API 是同源访问，不需要为了预览扩大浏览器 CORS。
+- 第一版 iframe 预览不提供显式下载按钮，也不提供面向接入方的下载流程；但 iframe 内部预览 API 会获取渲染所需内容，preview link 不是 DRM，不能阻止截图、复制、网络抓包或通过开发者工具保存已渲染内容。
 
 ### 2.11 与 OpenAPI 对齐
 
