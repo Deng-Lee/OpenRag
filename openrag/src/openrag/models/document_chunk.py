@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import BigInteger, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import BigInteger, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from openrag.models.base import Base, TimestampMixin
@@ -66,6 +66,9 @@ class DocumentChunk(Base, TimestampMixin):
     )
 
     page: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    page_num_int: Mapped[Optional[list[int]]] = mapped_column(JSON, nullable=True)
+    position_int: Mapped[Optional[list[list[int]]]] = mapped_column(JSON, nullable=True)
+    top_int: Mapped[Optional[list[int]]] = mapped_column(JSON, nullable=True)
     level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     block_type: Mapped[str] = mapped_column(String(32), default="text", nullable=False)
     start_offset: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

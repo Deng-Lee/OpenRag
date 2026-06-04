@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
 from openrag.models.file import File as FileModel
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
@@ -261,6 +262,7 @@ def ingest_new_file(
     file_content: bytes,
     content_type: Optional[str],
     parser_type: str = "auto",
+    document_type: str = DEFAULT_DOCUMENT_TYPE,
     require_parent_dir: bool = False,
     duplicate_status_code: int = status.HTTP_400_BAD_REQUEST,
 ) -> Tuple[FileModel, Optional[Task]]:
@@ -271,6 +273,25 @@ def ingest_new_file(
     trace_service, trace_id = _safe_start_upload_run(db, workspace, owner_user_id)
     file_record: Optional[FileModel] = None
     try:
+        try:
+            normalized_document_type = normalize_document_type(document_type)
+        except ValueError as exc:
+            _safe_span(
+                trace_service,
+                "upload.validate",
+                input_summary={
+                    "filename": upload_filename,
+                    "workspace_id": workspace.id,
+                    "parser_type": parser_type,
+                    "document_type": document_type,
+                },
+                error_message="invalid_document_type",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
         if parser_type not in SUPPORTED_PARSER_TYPES:
             _safe_span(
                 trace_service,
@@ -279,6 +300,7 @@ def ingest_new_file(
                     "filename": upload_filename,
                     "workspace_id": workspace.id,
                     "parser_type": parser_type,
+                    "document_type": normalized_document_type,
                 },
                 error_message="invalid_parser_type",
             )
@@ -296,6 +318,7 @@ def ingest_new_file(
                     "filename": upload_filename,
                     "workspace_id": workspace.id,
                     "parser_type": parser_type,
+                    "document_type": normalized_document_type,
                     "file_size": file_size,
                 },
                 error_message="file_too_large",
@@ -324,6 +347,7 @@ def ingest_new_file(
                     "filename": upload_filename,
                     "workspace_id": workspace.id,
                     "parser_type": parser_type,
+                    "document_type": normalized_document_type,
                     "file_size": file_size,
                     "target_uri": file_uri,
                 },
@@ -342,6 +366,7 @@ def ingest_new_file(
                 "filename": upload_filename,
                 "workspace_id": workspace.id,
                 "parser_type": parser_type,
+                "document_type": normalized_document_type,
                 "file_size": file_size,
             },
             output_summary={
@@ -378,6 +403,7 @@ def ingest_new_file(
             is_directory=False,
             size=file_size,
             mime_type=ct,
+            document_type=normalized_document_type,
             parser_type=parser_type if parser_type != "auto" else None,
         )
         db.add(file_record)
@@ -404,6 +430,7 @@ def ingest_new_file(
             input_summary={
                 "workspace_id": workspace.id,
                 "file_uri": file_uri,
+                "document_type": normalized_document_type,
                 "processing_supported": ct in ALLOWED_MIME_TYPES,
             },
             output_summary={
@@ -479,6 +506,7 @@ def replace_file_content(
     from openrag.api.files_api import cleanup_file_processing_data
 
     file.parser_type = parser_type if parser_type != "auto" else None
+    file.document_type = normalize_document_type(getattr(file, "document_type", None))
     cleanup_file_processing_data(file, workspace.slug, db)
     db.commit()
 

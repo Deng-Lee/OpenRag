@@ -33,11 +33,17 @@ class ParseArtifactService:
         blocks: Iterable[Any],
         parser_name: str,
         parser_version: str,
+        canonical_text_override: Optional[str] = None,
+        canonical_source: Optional[dict[str, Any]] = None,
     ) -> DocumentParseArtifact:
         block_list = list(blocks)
         source_doc_hash = _sha256_hex(source_doc_bytes)
         canonical_blocks = [_block_to_dict(block, index) for index, block in enumerate(block_list)]
-        canonical_text = _canonical_markdown(canonical_blocks)
+        canonical_text = (
+            canonical_text_override
+            if canonical_text_override is not None
+            else _canonical_markdown(canonical_blocks)
+        )
         canonical_text_hash = _sha256_hex(canonical_text.encode("utf-8"))
         page_count = len(
             {
@@ -70,6 +76,8 @@ class ParseArtifactService:
             "block_type_counts": block_type_counts,
             "blocks": canonical_blocks,
         }
+        if canonical_source is not None:
+            json_payload["canonical_source"] = canonical_source
         json_bytes = json.dumps(
             json_payload,
             ensure_ascii=False,

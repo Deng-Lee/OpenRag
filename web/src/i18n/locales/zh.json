@@ -211,7 +211,7 @@
       "dir_has_children": "该目录下有文件，暂不支持移动非空目录。请先删除或移动目录下的所有文件。",
       "reprocess_success": "文件重新处理已开始",
       "reprocess_failed": "重新处理失败",
-      "reprocess_hint": "选择解析器类型重新处理文件。原有切片和向量数据将被清除。"
+      "reprocess_hint": "选择解析器类型和文档内容类型重新处理文件。原有切片和向量数据将被清除。"
     },
     "upload": {
       "target_dir": "指定上传目录",
@@ -221,7 +221,8 @@
       "path_tip": "从当前工作区的目录树中选择；默认与左侧选中的目录一致。"
     },
     "fields": {
-      "parser_type": "解析器类型"
+      "parser_type": "解析器类型",
+      "document_type": "文档内容类型"
     },
     "preview": {
       "loading": "加载中…",
@@ -243,10 +244,47 @@
       "json": "JSON 解析器",
       "csv": "CSV 解析器",
       "epub": "EPUB 解析器"
+    },
+    "document_types": {
+      "general": "通用",
+      "manual": "说明书",
+      "laws": "法律法规"
     }
   },
   "common": {
     "delete": "删除"
+  },
+  "documentChunks": {
+    "title": "文档切块详情",
+    "back": "返回",
+    "fileFallback": "文件 #{{fileId}}",
+    "workspaceId": "工作区 {{workspaceId}}",
+    "fileId": "文件 {{fileId}}",
+    "previewLabel": "原文预览",
+    "listLabel": "切块列表",
+    "searchPlaceholder": "搜索切块内容",
+    "stats": "共 {{total}} 个切块",
+    "chunk": {
+      "index": "切块 {{index}}",
+      "page": "第 {{page}} 页",
+      "truncated": "已截断",
+      "noText": "无文本内容"
+    },
+    "position": {
+      "page": "第 {{page}} 页",
+      "textRange": "文本区间",
+      "visual": "视觉定位",
+      "none": "无定位元数据"
+    },
+    "empty": {
+      "noChunks": "该文件暂无切块",
+      "search": "没有匹配搜索条件的切块",
+      "selectChunk": "选择右侧切块后预览原文"
+    },
+    "errors": {
+      "invalidRoute": "工作区或文件路由无效",
+      "loadFailed": "加载文档切块失败"
+    }
   },
   "searchPage": {
     "title": "语义检索",
@@ -255,6 +293,7 @@
     "query_required": "请输入检索内容",
     "run": "检索",
     "top_k": "返回条数",
+    "vector_weight": "向量权重",
     "mode": "检索接口",
     "mode_semantic": "语义",
     "mode_hierarchical": "层级",

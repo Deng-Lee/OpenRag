@@ -131,6 +131,12 @@ spec:
               value: /app/uploads
             - name: CORS_ORIGINS
               value: http://localhost
+            - name: PREVIEW_PUBLIC_WEB_BASE_URL
+              value: https://openrag.guozhijishu.com
+            - name: PREVIEW_TOKEN_TTL_SECONDS
+              value: "900"
+            - name: PREVIEW_TOKEN_MAX_TTL_SECONDS
+              value: "1800"
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:

@@ -211,7 +211,7 @@
       "dir_has_children": "This directory contains files. Moving non-empty directories is not supported. Please delete or move all files in the directory first.",
       "reprocess_success": "File reprocessing started",
       "reprocess_failed": "Reprocessing failed",
-      "reprocess_hint": "Select parser type to reprocess the file. Existing chunks and vectors will be cleared."
+      "reprocess_hint": "Select parser type and document content type to reprocess the file. Existing chunks and vectors will be cleared."
     },
     "upload": {
       "target_dir": "Upload folder",
@@ -221,7 +221,8 @@
       "path_tip": "Pick a folder from the workspace tree; defaults to the folder selected in the left panel."
     },
     "fields": {
-      "parser_type": "Parser Type"
+      "parser_type": "Parser Type",
+      "document_type": "Document Content Type"
     },
     "preview": {
       "loading": "Loading…",
@@ -243,10 +244,47 @@
       "json": "JSON Parser",
       "csv": "CSV Parser",
       "epub": "EPUB Parser"
+    },
+    "document_types": {
+      "general": "General",
+      "manual": "Manual",
+      "laws": "Laws and regulations"
     }
   },
   "common": {
     "delete": "Delete"
+  },
+  "documentChunks": {
+    "title": "Document chunks",
+    "back": "Back",
+    "fileFallback": "File #{{fileId}}",
+    "workspaceId": "Workspace {{workspaceId}}",
+    "fileId": "File {{fileId}}",
+    "previewLabel": "Source preview",
+    "listLabel": "Chunk list",
+    "searchPlaceholder": "Search chunks",
+    "stats": "{{total}} chunk(s)",
+    "chunk": {
+      "index": "Chunk {{index}}",
+      "page": "Page {{page}}",
+      "truncated": "Truncated",
+      "noText": "No text content"
+    },
+    "position": {
+      "page": "Page {{page}}",
+      "textRange": "Text range",
+      "visual": "Visual position",
+      "none": "No positioning metadata"
+    },
+    "empty": {
+      "noChunks": "No chunks found for this file",
+      "search": "No chunks match this search",
+      "selectChunk": "Select a chunk to preview the source"
+    },
+    "errors": {
+      "invalidRoute": "Invalid workspace or file route",
+      "loadFailed": "Failed to load document chunks"
+    }
   },
   "searchPage": {
     "title": "Semantic search",
@@ -255,6 +293,7 @@
     "query_required": "Please enter a query",
     "run": "Search",
     "top_k": "Top K",
+    "vector_weight": "Vector weight",
     "mode": "Endpoint",
     "mode_semantic": "Semantic",
     "mode_hierarchical": "Hierarchical",

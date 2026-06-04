@@ -1,7 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen, within, fireEvent } from '@testing-library/react';
+import { render, screen, within, fireEvent, waitFor } from '@testing-library/react';
 import FileList from './FileList';
+
+const navigateMock = vi.hoisted(() => vi.fn());
+const reprocessMock = vi.hoisted(() => vi.fn());
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -29,6 +32,7 @@ vi.mock('react-i18next', () => ({
         'common.delete': 'Delete',
         'files.actions.reprocess': 'Reprocess',
         'files.fields.parser_type': 'Parser',
+        'files.fields.document_type': 'Document Type',
         'files.messages.reprocess_hint': 'Hint',
         'files.parser_types.auto': 'auto',
         'files.parser_types.pdf': 'pdf',
@@ -41,6 +45,9 @@ vi.mock('react-i18next', () => ({
         'files.parser_types.json': 'json',
         'files.parser_types.csv': 'csv',
         'files.parser_types.epub': 'epub',
+        'files.document_types.general': 'General',
+        'files.document_types.manual': 'Manual',
+        'files.document_types.laws': 'Laws',
       };
       return labels[key] ?? key;
     },
@@ -48,11 +55,33 @@ vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => {} },
 }));
 
+vi.mock('react-router-dom', () => ({
+  useNavigate: () => navigateMock,
+}));
+
+vi.mock('./FilePreviewModal', () => ({
+  default: () => null,
+}));
+
+vi.mock('../services/api', () => ({
+  filesAPI: {
+    delete: vi.fn(),
+    reprocess: reprocessMock,
+    fetchContentBlob: vi.fn(() => Promise.resolve(new Blob(['hello'], { type: 'text/plain' }))),
+    fetchPreview: vi.fn(() => Promise.resolve({ format: 'text', content: 'hello' })),
+  },
+}));
+
 function renderFileList(ui: ReactElement) {
   return render(ui);
 }
 
 describe('FileList', () => {
+  beforeEach(() => {
+    navigateMock.mockClear();
+    reprocessMock.mockReset();
+    reprocessMock.mockResolvedValue({});
+  });
 
   it('renders empty state when no files', () => {
     renderFileList(<FileList files={[]} onFileDeleted={vi.fn()} />);
@@ -100,6 +129,62 @@ describe('FileList', () => {
       />,
     );
     expect(screen.getByText('Done')).toBeInTheDocument();
+  });
+
+  it('navigates done document names to the chunk page when workspaceId is available', () => {
+    renderFileList(
+      <FileList
+        files={[
+          {
+            id: 1,
+            uri: '/a.pdf',
+            name: 'a.pdf',
+            owner_id: 1,
+            is_directory: false,
+            size: 100,
+            mime_type: 'application/pdf',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+            simple_status: 'done',
+          },
+        ]}
+        onFileDeleted={vi.fn()}
+        workspaceId={7}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'a.pdf' }));
+
+    expect(navigateMock).toHaveBeenCalledWith('/workspaces/7/files/1/chunks', {
+      state: { from: 'files' },
+    });
+  });
+
+  it('does not navigate non-done document names to the chunk page', () => {
+    renderFileList(
+      <FileList
+        files={[
+          {
+            id: 2,
+            uri: '/b.pdf',
+            name: 'b.pdf',
+            owner_id: 1,
+            is_directory: false,
+            size: 100,
+            mime_type: 'application/pdf',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+            simple_status: 'processing',
+          },
+        ]}
+        onFileDeleted={vi.fn()}
+        workspaceId={7}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'b.pdf' }));
+
+    expect(navigateMock).not.toHaveBeenCalled();
   });
 
   it('shows dash for directory status', () => {
@@ -150,5 +235,66 @@ describe('FileList', () => {
     fireEvent.click(screen.getByText('Failed'));
     expect(await screen.findByText('parse failed')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /reprocess/i })).toBeInTheDocument();
+  });
+
+  it('shows document type selector in reprocess modal and submits current document type', async () => {
+    renderFileList(
+      <FileList
+        files={[
+          {
+            id: 4,
+            uri: '/manual.pdf',
+            name: 'manual.pdf',
+            owner_id: 1,
+            is_directory: false,
+            size: 10,
+            mime_type: 'application/pdf',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+            document_type: 'manual',
+          },
+        ]}
+        onFileDeleted={vi.fn()}
+        canWrite
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('Reprocess'));
+
+    expect(await screen.findByLabelText('Document Type')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'OK' }));
+
+    await waitFor(() => {
+      expect(reprocessMock).toHaveBeenCalledWith(4, undefined, 'manual');
+    });
+  });
+
+  it('defaults missing document type to general when reprocessing', async () => {
+    renderFileList(
+      <FileList
+        files={[
+          {
+            id: 5,
+            uri: '/general.pdf',
+            name: 'general.pdf',
+            owner_id: 1,
+            is_directory: false,
+            size: 10,
+            mime_type: 'application/pdf',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+          },
+        ]}
+        onFileDeleted={vi.fn()}
+        canWrite
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('Reprocess'));
+    fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
+
+    await waitFor(() => {
+      expect(reprocessMock).toHaveBeenCalledWith(5, undefined, 'general');
+    });
   });
 });

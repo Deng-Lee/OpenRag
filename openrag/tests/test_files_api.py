@@ -20,6 +20,14 @@ from openrag.models.permission import FilePermission, EntityType, Permission
 from openrag.security import hash_password
 
 
+class FakeMinioStorage:
+    def put_file(self, *args, **kwargs):
+        return None
+
+    def remove_document_hierarchy(self, *args, **kwargs):
+        return None
+
+
 # Test database setup
 TEST_DATABASE_URL = "sqlite:///:memory:"
 
@@ -152,9 +160,10 @@ def client():
 class TestFileUpload:
     """Test file upload endpoint"""
 
-    def test_upload_file_success(self, client, db, test_user, test_workspace):
+    def test_upload_file_success(self, client, db, test_user, test_workspace, monkeypatch):
         """Test successful file upload"""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+        monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", FakeMinioStorage)
 
         file_content = b"Test file content"
         files = {"file": ("test.txt", io.BytesIO(file_content), "text/plain")}
@@ -168,8 +177,46 @@ class TestFileUpload:
         assert result["size"] == len(file_content)
         assert result["mime_type"] == "text/plain"
         assert result["owner_id"] == test_user.id
+        assert result["document_type"] == "general"
         assert "id" in result
         assert "task_id" in result
+
+    def test_upload_file_manual_document_type(self, client, db, test_user, test_workspace, monkeypatch):
+        """Upload should normalize, persist, and return manual document_type."""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+        monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", FakeMinioStorage)
+
+        file_content = b"Manual content"
+        files = {"file": ("manual.txt", io.BytesIO(file_content), "text/plain")}
+        data = {
+            "path": "/uploads",
+            "workspace_id": str(test_workspace.id),
+            "document_type": " Manual ",
+        }
+
+        response = client.post("/files/upload", files=files, data=data)
+
+        assert response.status_code == status.HTTP_201_CREATED
+        result = response.json()
+        assert result["document_type"] == "manual"
+        saved = db.query(File).filter(File.id == result["id"]).one()
+        assert saved.document_type == "manual"
+
+    def test_upload_file_invalid_document_type(self, client, db, test_user, test_workspace):
+        """Invalid upload document_type should return 400."""
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+
+        file_content = b"Bad type"
+        files = {"file": ("bad.txt", io.BytesIO(file_content), "text/plain")}
+        data = {
+            "workspace_id": str(test_workspace.id),
+            "document_type": "contract",
+        }
+
+        response = client.post("/files/upload", files=files, data=data)
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "document_type" in response.json()["detail"]
 
     def test_upload_file_no_auth(self, client, db):
         """Test file upload without authentication"""
@@ -431,6 +478,57 @@ class TestFileGet:
         body = response.json()
         assert body["simple_status"] == "failed"
         assert body["error_message"] == "boom"
+
+
+class TestFileReprocessDocumentType:
+    """Test document_type behavior on reprocess."""
+
+    def test_reprocess_without_document_type_preserves_existing_value(
+        self, client, db, test_user, test_file, monkeypatch
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+        test_file.document_type = "manual"
+        db.add(test_file)
+        db.commit()
+        monkeypatch.setattr(
+            "openrag.api.files_api.cleanup_file_processing_data",
+            lambda file, workspace_slug, db: None,
+        )
+
+        response = client.post(f"/files/{test_file.id}/reprocess", json={})
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert result["document_type"] == "manual"
+        db.refresh(test_file)
+        assert test_file.document_type == "manual"
+
+    def test_reprocess_with_document_type_updates_existing_value(
+        self, client, db, test_user, test_file, monkeypatch
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+        test_file.document_type = "manual"
+        db.add(test_file)
+        db.commit()
+        monkeypatch.setattr(
+            "openrag.api.files_api.cleanup_file_processing_data",
+            lambda file, workspace_slug, db: None,
+        )
+
+        response = client.post(
+            f"/files/{test_file.id}/reprocess",
+            json={"document_type": "LAWS"},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert result["document_type"] == "laws"
+        db.refresh(test_file)
+        assert test_file.document_type == "laws"
 
 
 class TestFileDelete:

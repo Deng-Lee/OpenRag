@@ -11,6 +11,12 @@ from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.workspace import Workspace
 from openrag.parsers.base import DocumentBlock
+from openrag.processors.document_processor import DocumentProcessor
+from openrag.processors.document_processor import (
+    _coerce_int_list,
+    _coerce_position_int,
+    _extract_chunk_position_fields,
+)
 from openrag.services import file_ingest
 from openrag.tracing.context import reset_trace_context, set_trace_context
 from openrag.worker import task_worker
@@ -88,7 +94,21 @@ class FakeParserRegistry:
 class FakeChunkEngine:
     def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
         return [
-            Chunk(text="Heading body", chunk_id="chunk-1", page=1, level=1, block_type="heading"),
+            Chunk(
+                text="Heading body",
+                chunk_id="chunk-1",
+                page=1,
+                level=1,
+                block_type="heading",
+                metadata={
+                    "page_num_int": [1, 1],
+                    "position_int": [
+                        [1, 10, 100, 20, 40],
+                        [1, 10, 100, 45, 65],
+                    ],
+                    "top_int": [20, 45],
+                },
+            ),
             Chunk(text="tiny", chunk_id="chunk-2", page=2, block_type="text"),
             Chunk(text="", chunk_id="chunk-3", page=2, block_type="text"),
         ]
@@ -122,6 +142,64 @@ class FakeEsStore:
     def bulk_upsert_chunks(self, index_name, docs):
         self.docs = docs
         return len(docs)
+
+
+class TxtParserAdapter:
+    parser_version = "canonical-test"
+
+    def parse(self, file_path):
+        assert Path(file_path).read_bytes() == b"source text"
+        return [
+            DocumentBlock(
+                text="  Alpha  ",
+                page=1,
+                offset=10,
+                block_type="text",
+                block_id="txt:p:0",
+                char_start=100,
+                char_end=109,
+            ),
+            DocumentBlock(
+                text="\nBeta\n",
+                page=1,
+                offset=20,
+                block_type="text",
+                block_id="txt:p:1",
+                char_start=200,
+                char_end=206,
+            ),
+        ]
+
+
+class FakeCanonicalParserRegistry:
+    def get_parser(self, file_path, parser_type):
+        return TxtParserAdapter()
+
+
+class FakeCanonicalChunkEngine:
+    def __init__(self):
+        self.seen_blocks = None
+
+    def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
+        self.seen_blocks = list(text_blocks)
+        assert [block.text for block in self.seen_blocks] == ["Alpha", "Beta"]
+        assert [(block.char_start, block.char_end) for block in self.seen_blocks] == [
+            (0, 5),
+            (6, 10),
+        ]
+        return [
+            Chunk(
+                text="Beta",
+                chunk_id="canonical-chunk-1",
+                page=1,
+                start_offset=6,
+                end_offset=10,
+                block_type="text",
+                source_block_id="txt:p:1",
+                source_char_start=6,
+                source_char_end=10,
+            )
+        ]
 
 
 def _new_db():
@@ -162,6 +240,81 @@ def _seed_file(db):
 
 def teardown_function():
     reset_trace_context()
+
+
+def test_extract_chunk_position_fields_coerces_ragflow_metadata():
+    chunk = Chunk(
+        text="positioned",
+        chunk_id="chunk-positioned",
+        metadata={
+            "page_num_int": ("1",),
+            "position_int": [(1, "10", 120, 30.0, 58)],
+            "top_int": ["30"],
+        },
+    )
+
+    assert _coerce_int_list(chunk.metadata["page_num_int"]) == [1]
+    assert _coerce_position_int(chunk.metadata["position_int"]) == [[1, 10, 120, 30, 58]]
+    assert _extract_chunk_position_fields(chunk) == {
+        "page_num_int": [1],
+        "position_int": [[1, 10, 120, 30, 58]],
+        "top_int": [30],
+    }
+
+
+def test_document_processor_uses_canonical_source_for_text_like_parsers(tmp_path):
+    engine, db = _new_db()
+    try:
+        user, workspace, file = _seed_file(db)
+        file.uri = "/docs/notes.txt"
+        file.name = "notes.txt"
+        file.mime_type = "text/plain"
+        db.commit()
+        source_path = tmp_path / "notes.txt"
+        source_path.write_bytes(b"source text")
+        processing_minio = FakeProcessingMinio()
+        chunk_engine = FakeCanonicalChunkEngine()
+
+        processor = DocumentProcessor(
+            db=db,
+            parser_registry=FakeCanonicalParserRegistry(),
+            chunk_engine=chunk_engine,
+            embedding_engine=FakeEmbeddingEngine(),
+            minio_storage=processing_minio,
+            vector_store=None,
+            layer_store=None,
+            chunk_fulltext_store=None,
+        )
+
+        result = processor.process_document(
+            file_path=str(source_path),
+            file_id=file.id,
+            user_id=user.id,
+            parser_type="txt",
+        )
+
+        assert result["status"] == "completed"
+        assert [block.text for block in chunk_engine.seen_blocks] == ["Alpha", "Beta"]
+        artifact = db.query(DocumentParseArtifact).one()
+        md_object = processing_minio.objects[
+            (workspace.slug, artifact.canonical_md_object_key)
+        ]
+        json_object = processing_minio.objects[
+            (workspace.slug, artifact.canonical_json_object_key)
+        ]
+        payload = json.loads(json_object["data"].decode("utf-8"))
+        stored_chunk = db.query(DocumentChunk).filter_by(chunk_id="canonical-chunk-1").one()
+
+        assert md_object["data"].decode("utf-8") == "Alpha\nBeta"
+        assert payload["canonical_source"]["version"] == "chunk_source_v1"
+        assert payload["blocks"][1]["char_start"] == 6
+        assert payload["blocks"][1]["char_end"] == 10
+        assert stored_chunk.source_block_id == "txt:p:1"
+        assert stored_chunk.source_char_start == 6
+        assert stored_chunk.source_char_end == 10
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
 
 
 def test_upload_ingest_records_upload_trace_spans(monkeypatch):
@@ -322,6 +475,13 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             assert stages["fulltext.es_index"].output_summary["upsert_count"] == 3
             assert stages["metadata.persist_chunks"].output_summary["document_chunks_written"] == 3
             assert db2.query(DocumentChunk).count() == 3
+            first_chunk = db2.query(DocumentChunk).filter_by(chunk_id="chunk-1").one()
+            assert first_chunk.page_num_int == [1, 1]
+            assert first_chunk.position_int == [
+                [1, 10, 100, 20, 40],
+                [1, 10, 100, 45, 65],
+            ]
+            assert first_chunk.top_int == [20, 45]
             assert db2.query(DocumentParseArtifact).count() == 1
             keys = [key for (_bucket, key) in processing_minio.objects]
             assert any(key.endswith("/canonical.json") for key in keys)

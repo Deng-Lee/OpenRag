@@ -2,7 +2,7 @@
 
 import logging
 import time
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
 
 from openrag.chunking.chunk_engine import ChunkEngine
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
 from openrag.chunking.chunk_params import chunk_size_overlap_from_env, min_chunk_tokens_from_env, resolve_chunk_method
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.document_hierarchy_builder import DocumentHierarchyBuilder
@@ -19,6 +20,11 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File, ProcessingStatus
 from openrag.models.workspace import Workspace
 from openrag.parsers.parser_registry import ParserRegistry
+from openrag.services.canonical_chunk_source import (
+    build_canonical_chunk_source,
+    canonical_source_metadata,
+    supports_canonical_chunk_source,
+)
 from openrag.services.parse_artifact_service import ParseArtifactService
 from openrag.services.trace_service import TraceService
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
@@ -126,6 +132,40 @@ def _chunk_token_stats(chunks) -> dict:
     }
 
 
+def _coerce_int_list(value: Any) -> Optional[list[int]]:
+    if value is None or not isinstance(value, (list, tuple)):
+        return None
+    try:
+        return [int(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_position_int(value: Any) -> Optional[list[list[int]]]:
+    if value is None or not isinstance(value, (list, tuple)):
+        return None
+    positions: list[list[int]] = []
+    try:
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) != 5:
+                return None
+            positions.append([int(part) for part in item])
+    except (TypeError, ValueError):
+        return None
+    return positions
+
+
+def _extract_chunk_position_fields(chunk) -> dict:
+    metadata = getattr(chunk, "metadata", None) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "page_num_int": _coerce_int_list(metadata.get("page_num_int")),
+        "position_int": _coerce_position_int(metadata.get("position_int")),
+        "top_int": _coerce_int_list(metadata.get("top_int")),
+    }
+
+
 class DocumentProcessor:
     """Orchestrates the complete document processing pipeline."""
 
@@ -165,6 +205,7 @@ class DocumentProcessor:
         file_id: int,
         user_id: int,
         parser_type: str = "auto",
+        document_type: str = DEFAULT_DOCUMENT_TYPE,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> dict:
         """Process a document through the complete pipeline.
@@ -181,6 +222,8 @@ class DocumentProcessor:
         file_record = self.db.query(File).filter(File.id == file_id).first()
         if not file_record:
             raise ValueError(f"File not found: {file_id}")
+        normalized_document_type = normalize_document_type(document_type)
+        file_record.document_type = normalized_document_type
         trace_service = TraceService(self.db)
 
         # Step 1: Parse（策略仅在 ParserRegistry / Factory；此处只编排）
@@ -218,6 +261,13 @@ class DocumentProcessor:
                 error_message=str(exc),
             )
             raise
+        canonical_text_override = None
+        canonical_source = None
+        if supports_canonical_chunk_source(_parser_name(parser)):
+            canonical_result = build_canonical_chunk_source(text_blocks)
+            text_blocks = canonical_result.blocks
+            canonical_text_override = canonical_result.text
+            canonical_source = canonical_source_metadata()
         parse_duration_ms = int((time.perf_counter() - parse_started) * 1000)
         _safe_finish_span(
             trace_service,
@@ -280,6 +330,8 @@ class DocumentProcessor:
                     blocks=text_blocks,
                     parser_name=_parser_name(parser),
                     parser_version=_parser_version(parser),
+                    canonical_text_override=canonical_text_override,
+                    canonical_source=canonical_source,
                 )
                 _safe_finish_span(
                     trace_service,
@@ -328,6 +380,7 @@ class DocumentProcessor:
             "chunk.build",
             input_summary={
                 "chunk_method": chunk_method,
+                "document_type": normalized_document_type,
                 "chunk_size": chunk_size,
                 "overlap": chunk_overlap,
                 "min_chunk_tokens": min_chunk_tokens,
@@ -335,13 +388,25 @@ class DocumentProcessor:
             },
         )
         try:
-            chunks = self.chunk_engine.chunk(
-                text_blocks,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                chunk_method=chunk_method,
-                min_chunk_tokens=min_chunk_tokens,
-            )
+            try:
+                chunks = self.chunk_engine.chunk(
+                    text_blocks,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    chunk_method=chunk_method,
+                    min_chunk_tokens=min_chunk_tokens,
+                    document_type=normalized_document_type,
+                )
+            except TypeError as exc:
+                if "document_type" not in str(exc):
+                    raise
+                chunks = self.chunk_engine.chunk(
+                    text_blocks,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    chunk_method=chunk_method,
+                    min_chunk_tokens=min_chunk_tokens,
+                )
         except Exception as exc:
             _safe_fail_span(trace_service, chunk_span, str(exc))
             raise
@@ -702,6 +767,7 @@ class DocumentProcessor:
             self.db.add(
                 DocumentChunk(
                     **chunk_kwargs,
+                    **_extract_chunk_position_fields(chunk),
                     file_id=file_id,
                     workspace_id=file_record.workspace_id,
                     chunk_id=cid,
@@ -749,6 +815,7 @@ class DocumentProcessor:
             "file_id": file_id,
             "file_path": file_path,
             "parser_type": parser_type,
+            "document_type": normalized_document_type,
             "text_blocks": len(text_blocks),
             "chunks": len(chunks),
             "embeddings": len(chunk_embeddings),

@@ -127,10 +127,10 @@ class SearchRequest(BaseModel):
         description="B7/B8: 启用时由 LLM 根据 L1 选择 chunk 下标并过滤（需 OPENAI_API_KEY，仅上下文检索生效）",
     )
     vector_similarity_weight: float = Field(
-        1.0,
+        0.7,
         ge=0.0,
         le=1.0,
-        description="向量融合分权重；全文 BM25 权重为 1-该值。1 表示仅向量侧（默认）。",
+        description="向量融合分权重；全文 BM25 权重为 1-该值。默认 0.7；1 表示仅向量侧。",
     )
 
 

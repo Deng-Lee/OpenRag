@@ -27,6 +27,80 @@ _PDF_POS_TAG_SP = re.compile(
 )
 
 
+def _extract_pdf_position_tags(line: str) -> list[dict[str, float | int]]:
+    tags: list[dict[str, float | int]] = []
+    for match in _PDF_POS_TAG_SP.finditer(line):
+        tags.append(
+            {
+                "page": int(match.group("page").split("-")[0]),
+                "x0": float(match.group("x0")),
+                "x1": float(match.group("x1")),
+                "top": float(match.group("top")),
+                "bottom": float(match.group("bottom")),
+            }
+        )
+    return tags
+
+
+def _plain_line_from_tagged_line(line: str) -> str:
+    plain = _PDF_POS_TAG_SP.sub("", line)
+    if RAGFlowPdfParser is not None:
+        plain = RAGFlowPdfParser.remove_tag(plain)
+    return plain.strip()
+
+
+def _tagged_paragraph_to_plain_bbox_and_lines(
+    para: str,
+    abs_start: int = 0,
+) -> tuple[
+    str,
+    int,
+    tuple[float, float, float, float] | None,
+    list[dict[str, float | int | str]],
+]:
+    plain_lines: list[str] = []
+    line_positions: list[dict[str, float | int | str]] = []
+    paragraph_tags: list[dict[str, float | int]] = []
+    char_cursor = abs_start
+
+    for raw_line in para.splitlines() or [para]:
+        plain_line = _plain_line_from_tagged_line(raw_line)
+        line_tags = _extract_pdf_position_tags(raw_line)
+        plain_lines.append(plain_line)
+        paragraph_tags.extend(line_tags)
+
+        if plain_line and line_tags:
+            line_page = int(line_tags[0]["page"])
+            same_page_tags = [tag for tag in line_tags if tag["page"] == line_page]
+            line_positions.append(
+                {
+                    "page": line_page,
+                    "x0": min(float(tag["x0"]) for tag in same_page_tags),
+                    "x1": max(float(tag["x1"]) for tag in same_page_tags),
+                    "top": min(float(tag["top"]) for tag in same_page_tags),
+                    "bottom": max(float(tag["bottom"]) for tag in same_page_tags),
+                    "char_start": char_cursor,
+                    "char_end": char_cursor + len(plain_line),
+                    "text": plain_line,
+                }
+            )
+        char_cursor += len(plain_line) + 1
+
+    plain = "\n".join(plain_lines).strip()
+    if not paragraph_tags:
+        return plain, 1, None, []
+
+    primary_1based = int(paragraph_tags[0]["page"])
+    same_page_tags = [tag for tag in paragraph_tags if tag["page"] == primary_1based]
+    bbox = (
+        min(float(tag["x0"]) for tag in same_page_tags),
+        min(float(tag["top"]) for tag in same_page_tags),
+        max(float(tag["x1"]) for tag in same_page_tags),
+        max(float(tag["bottom"]) for tag in same_page_tags),
+    )
+    return plain, primary_1based, bbox, line_positions
+
+
 def _page_bbox_from_ragflow_table_positions(
     poss: list[tuple[float, ...]],
 ) -> tuple[int, tuple[float, float, float, float] | None, dict[int, tuple[float, float, float, float]]]:
@@ -99,39 +173,11 @@ def _plain_page_bbox_from_tagged_paragraph(
     支持分隔符为 **空格或制表符**（与 RAGFlow 原始 \\t 输出兼容）。
     bbox：原点左上，x 向右、y 向下，与 react-pdf 视口一致。
     """
-    plain = _PDF_POS_TAG_SP.sub("", para)
-    if RAGFlowPdfParser is not None:
-        plain = RAGFlowPdfParser.remove_tag(plain).strip()
-    else:
-        plain = plain.strip()
-
-    matches = list(_PDF_POS_TAG_SP.finditer(para))
-    if matches:
-        page_part = matches[0].group("page")
-        primary_1based = int(page_part.split("-")[0])
-        xs0: list[float] = []
-        xs1: list[float] = []
-        ys0: list[float] = []
-        ys1: list[float] = []
-        for m in matches:
-            p0 = int(m.group("page").split("-")[0])
-            if p0 != primary_1based:
-                continue
-            xs0.append(float(m.group("x0")))
-            xs1.append(float(m.group("x1")))
-            ys0.append(float(m.group("top")))
-            ys1.append(float(m.group("bottom")))
-        if not xs0:
-            m0 = matches[0]
-            bbox = (
-                float(m0.group("x0")),
-                float(m0.group("top")),
-                float(m0.group("x1")),
-                float(m0.group("bottom")),
-            )
-        else:
-            bbox = (min(xs0), min(ys0), max(xs1), max(ys1))
-        return plain, primary_1based, bbox
+    plain, page, bbox, _line_positions = _tagged_paragraph_to_plain_bbox_and_lines(
+        para
+    )
+    if bbox is not None:
+        return plain, page, bbox
 
     if RAGFlowPdfParser is None:
         return plain, 1, None
@@ -206,11 +252,17 @@ class PDFParserAdapter(RAGFlowParserAdapter):
                 raw_para = para.strip()
                 if not raw_para:
                     continue
-                text_plain, page_n, bbox = _plain_page_bbox_from_tagged_paragraph(
-                    raw_para
+                text_plain, page_n, bbox, line_positions = (
+                    _tagged_paragraph_to_plain_bbox_and_lines(
+                        raw_para,
+                        abs_start=stream_cursor,
+                    )
                 )
                 if not text_plain:
                     continue
+                text_meta = (
+                    {"line_positions": line_positions} if line_positions else None
+                )
                 raw_rows.append(
                     {
                         "text": text_plain,
@@ -223,6 +275,7 @@ class PDFParserAdapter(RAGFlowParserAdapter):
                         "block_id": f"ragflow:text:{idx}",
                         "char_start": stream_cursor,
                         "char_end": stream_cursor + len(text_plain),
+                        "metadata": text_meta,
                     }
                 )
                 stream_cursor += len(text_plain) + 2

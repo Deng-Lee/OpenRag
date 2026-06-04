@@ -33,8 +33,10 @@ FROM nginx:alpine
 # Copy built files
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Copy nginx configuration
-COPY docker/nginx/nginx.conf /etc/nginx/nginx.conf
+# Copy nginx configuration template
+COPY docker/nginx/nginx.conf /etc/nginx/templates/nginx.conf.template
+
+ENV PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32:2026 http://172.16.31.61:2026 http://172.16.31.156:2026"
 
 # Expose port
 EXPOSE 80
@@ -43,4 +45,4 @@ EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --quiet --tries=1 --spider http://localhost/health || exit 1
 
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["sh", "-c", "envsubst '${PREVIEW_FRAME_ANCESTORS}' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]

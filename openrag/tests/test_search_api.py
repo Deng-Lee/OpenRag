@@ -5,7 +5,9 @@ from fastapi.testclient import TestClient
 from unittest.mock import Mock, patch
 from sqlalchemy.orm import Session
 
-from openrag.api.search_api import router, get_user_id
+from pydantic import ValidationError
+
+from openrag.api.search_api import router, get_user_id, SearchRequest
 from openrag.api.deps import get_db
 from fastapi import FastAPI
 
@@ -43,6 +45,26 @@ def override_dependencies(app, mock_db, mock_user_id):
     app.dependency_overrides[get_user_id] = lambda: mock_user_id
     yield
     app.dependency_overrides.clear()
+
+
+class TestSearchRequestVectorSimilarityWeight:
+    """Tests for vector similarity weight request validation"""
+
+    def test_vector_similarity_weight_defaults_to_0_7(self):
+        request = SearchRequest(query="test")
+
+        assert request.vector_similarity_weight == 0.7
+
+    @pytest.mark.parametrize("weight", [0.0, 0.7, 1.0])
+    def test_vector_similarity_weight_accepts_valid_values(self, weight):
+        request = SearchRequest(query="test", vector_similarity_weight=weight)
+
+        assert request.vector_similarity_weight == weight
+
+    @pytest.mark.parametrize("weight", [-0.1, 1.1])
+    def test_vector_similarity_weight_rejects_out_of_range_values(self, weight):
+        with pytest.raises(ValidationError):
+            SearchRequest(query="test", vector_similarity_weight=weight)
 
 
 class TestSemanticSearch:
@@ -248,10 +270,10 @@ class TestHierarchicalSearch:
             assert data["results"][0]["block_type"] == "title"
             assert data["results"][0]["level"] == 1
 
-            # Verify hierarchical search was called
+            # Verify current retrieval API parameters were passed
             mock_retrieval_instance.search.assert_called_once()
             call_kwargs = mock_retrieval_instance.search.call_args[1]
-            assert call_kwargs["use_hierarchical"] is True
+            assert call_kwargs["retrieval_strategy"] == "auto"
 
     def test_hierarchical_search_without_rerank(self, client, override_dependencies, mock_db):
         """Test hierarchical search without reranking"""
@@ -377,7 +399,7 @@ class TestErrorHandling:
             assert response.status_code == 500
             data = response.json()
             assert "detail" in data
-            assert "error" in data["detail"]
+            assert data["detail"] == "AGFS client not initialized"
 
     def test_invalid_top_k(self, client, override_dependencies):
         """Test with invalid top_k parameter"""

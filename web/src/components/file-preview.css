@@ -36,6 +36,19 @@
   padding: 4px 8px;
 }
 
+.document-source-preview {
+  min-height: 0;
+  width: 100%;
+}
+
+.document-source-preview-scroll {
+  min-height: 0;
+}
+
+.document-source-preview--embedded {
+  height: 100%;
+}
+
 .chunk-text-highlight,
 .chunk-html-highlight-wrap {
   background: rgba(255, 235, 59, 0.35);

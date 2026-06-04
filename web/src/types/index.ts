@@ -29,6 +29,8 @@ export interface RegisterRequest {
 
 export type SimpleStatus = 'unprocessed' | 'processing' | 'done' | 'failed';
 
+export type DocumentType = 'general' | 'manual' | 'laws';
+
 export interface File {
   id: number;
   uri: string;
@@ -43,7 +45,52 @@ export interface File {
   updated_at: string;
   processing_status?: string | null;
   simple_status?: SimpleStatus | null;
+  document_type?: DocumentType;
   error_message?: string | null;
+}
+
+export interface WorkspaceFileSummary {
+  id: number;
+  workspace_id: number;
+  name: string;
+  uri: string;
+  mime_type?: string | null;
+  processing_status?: string | null;
+  simple_status?: SimpleStatus | string | null;
+  total_chunks: number;
+}
+
+export interface DocumentChunkItem {
+  file_id: number;
+  workspace_id: number;
+  filename: string;
+  chunk_id: string;
+  chunk_index: number;
+  text: string;
+  is_truncated: boolean;
+  page?: number | null;
+  bbox_x0?: number | null;
+  bbox_y0?: number | null;
+  bbox_x1?: number | null;
+  bbox_y1?: number | null;
+  source_char_start?: number | null;
+  source_char_end?: number | null;
+  position_int?: number[][] | null;
+  positions?: number[][] | null;
+}
+
+export interface DocumentChunkListResponse {
+  file: WorkspaceFileSummary;
+  items: DocumentChunkItem[];
+  total: number;
+  skip: number;
+  limit: number;
+}
+
+export interface EmbedDocumentPreviewResponse {
+  file: WorkspaceFileSummary;
+  chunk: DocumentChunkItem;
+  expires_at: string;
 }
 
 export interface SearchRequest {
@@ -52,6 +99,7 @@ export interface SearchRequest {
   workspace_id?: number;
   use_rerank?: boolean;
   use_contextual_retrieval?: boolean;
+  vector_similarity_weight?: number;
   contextual_l0_top_n?: number;
   contextual_l1_top_n?: number;
   contextual_chunk_fetch_multiplier?: number;

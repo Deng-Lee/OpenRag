@@ -134,6 +134,16 @@ class SecurityConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SECURITY_", populate_by_name=True)
 
 
+class PreviewConfig(BaseSettings):
+    """外部文档预览配置"""
+
+    public_web_base_url: Optional[str] = None
+    token_ttl_seconds: int = 900
+    token_max_ttl_seconds: int = 1800
+
+    model_config = SettingsConfigDict(env_prefix="PREVIEW_", populate_by_name=True)
+
+
 class Config(BaseSettings):
     """全局配置"""
 
@@ -143,6 +153,7 @@ class Config(BaseSettings):
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    preview: PreviewConfig = Field(default_factory=PreviewConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -169,6 +180,24 @@ def get_config() -> Config:
     if _config is None:
         _config = Config()
     return _config
+
+
+def get_preview_public_web_base_url() -> str:
+    """获取对外预览 Web 根地址，并去除尾部斜杠。"""
+    value = get_config().preview.public_web_base_url
+    if value is None:
+        return ""
+    return value.strip().rstrip("/")
+
+
+def get_preview_token_ttl_seconds() -> int:
+    """获取 preview token 默认有效期。"""
+    return get_config().preview.token_ttl_seconds
+
+
+def get_preview_token_max_ttl_seconds() -> int:
+    """获取 preview token 最大有效期。"""
+    return get_config().preview.token_max_ttl_seconds
 
 
 # Note: Use get_config() to access config instead of direct import

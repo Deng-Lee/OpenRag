@@ -126,3 +126,55 @@ def test_parse_artifact_service_writes_canonical_objects_and_upserts_reference()
     finally:
         db.close()
         Base.metadata.drop_all(bind=engine)
+
+
+def test_parse_artifact_service_uses_canonical_text_override():
+    engine, db = _db_session()
+    try:
+        _, workspace = _seed_workspace(db)
+        storage = FakeMinioStorage()
+        service = ParseArtifactService(db, storage)
+        blocks = [
+            DocumentBlock(
+                text="Alpha",
+                page=1,
+                offset=0,
+                block_id="txt:p:0",
+                char_start=0,
+                char_end=5,
+            ),
+            DocumentBlock(
+                text="Beta",
+                page=1,
+                offset=6,
+                block_id="txt:p:1",
+                char_start=6,
+                char_end=10,
+            ),
+        ]
+
+        result = service.persist_parse_artifacts(
+            workspace_id=workspace.id,
+            file_id=11,
+            bucket_name=workspace.slug,
+            file_uri="/docs/notes.txt",
+            source_doc_bytes=b"source-v2",
+            blocks=blocks,
+            parser_name="TxtParserAdapter",
+            parser_version="1.0",
+            canonical_text_override="Alpha\nBeta",
+            canonical_source={"version": "chunk_source_v1"},
+        )
+
+        md_object = storage.objects[(workspace.slug, result.canonical_md_object_key)]
+        json_object = storage.objects[(workspace.slug, result.canonical_json_object_key)]
+        payload = json.loads(json_object["data"].decode("utf-8"))
+
+        assert md_object["data"].decode("utf-8") == "Alpha\nBeta"
+        assert payload["canonical_source"] == {"version": "chunk_source_v1"}
+        assert payload["canonical_text_hash"] == result.canonical_text_hash
+        assert payload["blocks"][1]["char_start"] == 6
+        assert payload["blocks"][1]["char_end"] == 10
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)

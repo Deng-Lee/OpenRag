@@ -17,6 +17,8 @@ except ImportError:
         return max(1, len(text) // 4)
 
 from openrag.chunking.chunk_models import Chunk
+from openrag.chunking.document_profile_chunker import build_profile_items
+from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
 from openrag.chunking.ragflow_core.metadata import (
     ragflow_add_positions_fields,
     ragflow_tokenize_fields,
@@ -205,6 +207,74 @@ def find_chunk_pos_robust(full_text: str, chunk_text: str, search_from: int) -> 
     if n_pos < 0 or n_pos >= len(full_map):
         return -1
     return full_map[n_pos]
+
+
+def _range_overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    """Return whether half-open ranges [a_start,a_end) and [b_start,b_end) overlap."""
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+def _line_positions_for_span(
+    blocks: list[DocumentBlock], start: int, end: int
+) -> list[tuple[int, float, float, float, float]]:
+    """Return line positions whose character spans intersect the chunk span."""
+    positions: list[tuple[int, float, float, float, float]] = []
+    for block in blocks:
+        line_positions = (block.metadata or {}).get("line_positions")
+        if not isinstance(line_positions, list):
+            continue
+        for line in line_positions:
+            if not _range_overlaps(start, end, line["char_start"], line["char_end"]):
+                continue
+            positions.append(
+                (
+                    int(line["page"]) - 1,
+                    float(line["x0"]),
+                    float(line["x1"]),
+                    float(line["top"]),
+                    float(line["bottom"]),
+                )
+            )
+    positions.sort(key=lambda pos: (pos[0], pos[3], pos[4], pos[1]))
+    return positions
+
+
+def _block_positions_for_covered_blocks(
+    covered: list[DocumentBlock],
+) -> list[tuple[int, float, float, float, float]]:
+    """Return legacy block bbox positions for covered blocks."""
+    positions: list[tuple[int, float, float, float, float]] = []
+    seen_pages: set[int] = set()
+    for cb in covered:
+        if cb.bbox is None or len(cb.bbox) != 4:
+            continue
+        x0, y0, x1, y1 = cb.bbox
+        positions.append((max(0, cb.page - 1), x0, x1, y0, y1))
+        seen_pages.add(cb.page)
+        page_bboxes = (cb.metadata or {}).get("page_bboxes")
+        if isinstance(page_bboxes, dict):
+            for pg_str, bb in page_bboxes.items():
+                pg_1b = int(pg_str)
+                if pg_1b in seen_pages:
+                    continue
+                seen_pages.add(pg_1b)
+                positions.append((pg_1b - 1, bb[0], bb[2], bb[1], bb[3]))
+    return positions
+
+
+def _bbox_union_for_positions(
+    positions: list[tuple], page_1based: int
+) -> tuple[float, float, float, float] | None:
+    """Return bbox union for positions on the requested 1-based page."""
+    page_0based = page_1based - 1
+    page_positions = [pos for pos in positions if pos[0] == page_0based]
+    if not page_positions:
+        return None
+    x0s = [float(pos[1]) for pos in page_positions]
+    x1s = [float(pos[2]) for pos in page_positions]
+    tops = [float(pos[3]) for pos in page_positions]
+    bottoms = [float(pos[4]) for pos in page_positions]
+    return (min(x0s), min(tops), max(x1s), max(bottoms))
 
 
 def _overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -409,6 +479,253 @@ def add_context_docx_like(cks: list[dict[str, Any]], idx: int, context_size: int
     cks[idx]["context_below"] = "".join(parts_below) if parts_below else ""
 
 
+def _finalize_merged_items_to_chunks(
+    text_blocks: list[DocumentBlock],
+    merged_items: list[dict[str, Any]],
+    children_delimiter: str,
+    normalized_document_type: str,
+) -> list[Chunk]:
+    joined_blocks: list[str] = []
+    block_spans: list[tuple[int, int, DocumentBlock]] = []
+    cursor = 0
+    for b in text_blocks:
+        t = (b.text or "").strip()
+        if not t:
+            continue
+        joined_blocks.append(t)
+        block_spans.append((cursor, cursor + len(t), b))
+        cursor += len(t) + 1
+    full_text = "\n".join(joined_blocks)
+
+    def owner_for_pos(pos: int) -> DocumentBlock:
+        if not block_spans:
+            return text_blocks[0]
+        for s, e, b in block_spans:
+            if s <= pos < e:
+                return b
+        if pos < block_spans[0][0]:
+            return block_spans[0][2]
+        return block_spans[-1][2]
+
+    def owner_start_abs(pos: int, owner: DocumentBlock) -> int:
+        base = owner.char_start if owner.char_start is not None else owner.offset
+        for s, e, b in block_spans:
+            if b is owner:
+                rel = pos - s
+                if rel < 0:
+                    rel = 0
+                return base + rel
+        return base + max(0, pos)
+
+    def source_block_start(block: DocumentBlock) -> int:
+        return block.char_start if block.char_start is not None else block.offset
+
+    def profile_text_source_spans(
+        source_blocks: list[DocumentBlock],
+    ) -> list[tuple[int, int, DocumentBlock, int]]:
+        spans: list[tuple[int, int, DocumentBlock, int]] = []
+        cursor = 0
+        for block in source_blocks:
+            raw_text = block.text or ""
+            block_text = raw_text.strip()
+            if not block_text:
+                continue
+            leading = len(raw_text) - len(raw_text.lstrip())
+            abs_start = source_block_start(block) + leading
+            spans.append((cursor, cursor + len(block_text), block, abs_start))
+            cursor += len(block_text) + 1
+        return spans
+
+    def source_span_for_profile_range(
+        source_spans: list[tuple[int, int, DocumentBlock, int]],
+        rel_start: int,
+        rel_end: int,
+        fallback_blocks: list[DocumentBlock],
+        fallback_start_abs: int,
+    ) -> tuple[list[DocumentBlock], DocumentBlock, int, int]:
+        segments: list[tuple[DocumentBlock, int, int]] = []
+        for local_start, local_end, block, abs_start in source_spans:
+            overlap_start = max(rel_start, local_start)
+            overlap_end = min(rel_end, local_end)
+            if overlap_start >= overlap_end:
+                continue
+            segments.append(
+                (
+                    block,
+                    abs_start + (overlap_start - local_start),
+                    abs_start + (overlap_end - local_start),
+                )
+            )
+
+        if not segments:
+            owner = fallback_blocks[0]
+            abs_start = fallback_start_abs + rel_start
+            return fallback_blocks, owner, abs_start, abs_start + (rel_end - rel_start)
+
+        covered_blocks: list[DocumentBlock] = []
+        seen_ids: set[int] = set()
+        for block, _, _ in segments:
+            block_id = id(block)
+            if block_id in seen_ids:
+                continue
+            seen_ids.add(block_id)
+            covered_blocks.append(block)
+        return (
+            covered_blocks,
+            covered_blocks[0],
+            min(start for _, start, _ in segments),
+            max(end for _, _, end in segments),
+        )
+
+    child_split_pattern = ""
+    if children_delimiter:
+        custom_child = [m.group(1) for m in re.finditer(r"`([^`]+)`", children_delimiter)]
+        if custom_child:
+            child_split_pattern = "|".join(
+                re.escape(t) for t in sorted(set(custom_child), key=len, reverse=True)
+            )
+        else:
+            child_split_pattern = children_delimiter
+
+    chunks: list[Chunk] = []
+    search_from = 0
+    fallback_offset = 0
+    generated_idx = 0
+    for item in merged_items:
+        chunk_text = (item.get("text") or "").strip()
+        if not chunk_text:
+            continue
+
+        source_blocks = [
+            b for b in (item.get("source_blocks") or []) if isinstance(b, DocumentBlock)
+        ]
+        if source_blocks:
+            covered = source_blocks
+            owner = covered[0]
+            start_abs = source_block_start(owner)
+            source_spans = profile_text_source_spans(source_blocks)
+        else:
+            pos = find_chunk_pos_robust(full_text, chunk_text, search_from)
+            if pos < 0:
+                pos = fallback_offset
+            search_from = max(pos, search_from)
+            fallback_offset = pos + len(chunk_text)
+            chunk_end_pos = pos + len(chunk_text)
+
+            covered = []
+            for s, e, b in block_spans:
+                if _overlap_len(pos, chunk_end_pos, s, e) > 0:
+                    covered.append(b)
+
+            owner = covered[0] if covered else owner_for_pos(pos)
+            if not covered:
+                covered = [owner]
+            start_abs = owner_start_abs(pos, owner)
+            source_spans = []
+
+        metadata: dict[str, Any] = dict(item.get("metadata") or {})
+        for key in (
+            "section_path",
+            "section_level",
+            "structure_node_type",
+            "parent_heading",
+            "sec_id",
+            "law_target_level",
+            "contains_block_types",
+        ):
+            if key in item and key not in metadata:
+                metadata[key] = item[key]
+        if item.get("context_above"):
+            metadata["context_above"] = item["context_above"]
+        if item.get("context_below"):
+            metadata["context_below"] = item["context_below"]
+        ck_type = str(item.get("ck_type") or "text")
+        metadata["doc_type_kwd"] = ck_type
+        metadata["document_type"] = normalized_document_type
+        if ck_type in ("table", "image"):
+            metadata["ragflow_chunk_type"] = ck_type
+        if item.get("image") is not None:
+            metadata["has_image"] = True
+
+        child_parts = (
+            split_with_pattern(chunk_text, child_split_pattern)
+            if child_split_pattern
+            else [chunk_text]
+        )
+
+        local_cursor = 0
+        for part in child_parts:
+            part_text = (part or "").strip()
+            if not part_text:
+                continue
+            rel = chunk_text.find(part_text, local_cursor)
+            if rel < 0:
+                rel = max(0, local_cursor)
+            local_cursor = rel + len(part_text)
+            if source_blocks:
+                child_covered, child_owner, ps, pe = source_span_for_profile_range(
+                    source_spans,
+                    rel,
+                    rel + len(part_text),
+                    covered,
+                    start_abs,
+                )
+            else:
+                child_covered = covered
+                child_owner = owner
+                ps = start_abs + rel
+                pe = ps + len(part_text)
+            part_meta = metadata.copy()
+            if child_split_pattern:
+                part_meta["mom_with_weight"] = chunk_text
+            part_meta.update(ragflow_tokenize_fields(part_text))
+            line_positions = _line_positions_for_span(child_covered, ps, pe)
+            poss = line_positions
+            if not poss:
+                poss = _block_positions_for_covered_blocks(child_covered)
+            if not poss:
+                ii = generated_idx
+                poss = [(ii, ii, ii, ii, ii)]
+            part_meta.update(ragflow_add_positions_fields(poss))
+
+            page_for_chunk = child_owner.page
+            bbox_for_chunk = child_owner.bbox
+            line_bbox = _bbox_union_for_positions(line_positions, page_for_chunk)
+            if line_bbox is not None:
+                bbox_for_chunk = line_bbox
+            else:
+                same_page_boxes = [
+                    cb.bbox
+                    for cb in child_covered
+                    if cb.page == page_for_chunk and cb.bbox is not None
+                ]
+                if same_page_boxes:
+                    xs0 = [float(bb[0]) for bb in same_page_boxes]
+                    ys0 = [float(bb[1]) for bb in same_page_boxes]
+                    xs1 = [float(bb[2]) for bb in same_page_boxes]
+                    ys1 = [float(bb[3]) for bb in same_page_boxes]
+                    bbox_for_chunk = (min(xs0), min(ys0), max(xs1), max(ys1))
+            chunks.append(
+                Chunk(
+                    text=part_text,
+                    chunk_id=str(uuid.uuid4()),
+                    page=page_for_chunk,
+                    start_offset=ps,
+                    end_offset=pe,
+                    bbox=bbox_for_chunk,
+                    level=child_owner.level,
+                    block_type=(item.get("ck_type") or child_owner.block_type),
+                    source_block_id=child_owner.block_id,
+                    source_char_start=ps,
+                    source_char_end=pe,
+                    metadata=part_meta,
+                )
+            )
+            generated_idx += 1
+
+    return chunks
+
+
 def chunk_semantic_ragflow(
     text_blocks: list[DocumentBlock],
     chunk_size: int,
@@ -417,9 +734,11 @@ def chunk_semantic_ragflow(
     *,
     fixed_size_fallback: Callable[[list[DocumentBlock], int, int], list[Chunk]],
     min_chunk_tokens: int = 0,
+    document_type: str = DEFAULT_DOCUMENT_TYPE,
 ) -> list[Chunk]:
     """Semantic chunking with RAGFlow-like naive merge and docx-like paths."""
     _ = chunk_method
+    normalized_document_type = normalize_document_type(document_type)
     delimiter = os.environ.get("OPENRAG_CHUNK_DELIMITER", "\n!?;。；！？")
     overlapped_percent = int(os.environ.get("OPENRAG_CHUNK_OVERLAPPED_PERCENT", "0"))
     if overlapped_percent < 0:
@@ -438,6 +757,21 @@ def chunk_semantic_ragflow(
     }
     table_context_size = max(0, int(os.environ.get("OPENRAG_TABLE_CONTEXT_SIZE", "0")))
     image_context_size = max(0, int(os.environ.get("OPENRAG_IMAGE_CONTEXT_SIZE", "0")))
+
+    if normalized_document_type != DEFAULT_DOCUMENT_TYPE:
+        profile_items = build_profile_items(
+            text_blocks,
+            normalized_document_type,
+            chunk_size,
+            min_chunk_tokens,
+        )
+        if profile_items:
+            return _finalize_merged_items_to_chunks(
+                text_blocks,
+                profile_items,
+                children_delimiter,
+                normalized_document_type,
+            )
 
     base_sections: list[tuple[str, Optional[bytes], Optional[str]]] = []
     text_sections_for_naive: list[tuple[str, str]] = []
@@ -489,160 +823,18 @@ def chunk_semantic_ragflow(
     ]
     total_text_len = sum(len((b.text or "").strip()) for b in text_blocks)
     if len(non_empty_merged) <= 1 and total_text_len > chunk_size:
-        return fixed_size_fallback(text_blocks, chunk_size, chunk_overlap)
+        fallback_chunks = fixed_size_fallback(text_blocks, chunk_size, chunk_overlap)
+        for chunk in fallback_chunks:
+            chunk.metadata = dict(chunk.metadata or {})
+            chunk.metadata["document_type"] = normalized_document_type
+        return fallback_chunks
 
-    joined_blocks: list[str] = []
-    block_spans: list[tuple[int, int, DocumentBlock]] = []
-    cursor = 0
-    for b in text_blocks:
-        t = (b.text or "").strip()
-        if not t:
-            continue
-        joined_blocks.append(t)
-        block_spans.append((cursor, cursor + len(t), b))
-        cursor += len(t) + 1
-    full_text = "\n".join(joined_blocks)
-
-    def owner_for_pos(pos: int) -> DocumentBlock:
-        if not block_spans:
-            return text_blocks[0]
-        for s, e, b in block_spans:
-            if s <= pos < e:
-                return b
-        if pos < block_spans[0][0]:
-            return block_spans[0][2]
-        return block_spans[-1][2]
-
-    def owner_start_abs(pos: int, owner: DocumentBlock) -> int:
-        base = owner.char_start if owner.char_start is not None else owner.offset
-        for s, e, b in block_spans:
-            if b is owner:
-                rel = pos - s
-                if rel < 0:
-                    rel = 0
-                return base + rel
-        return base + max(0, pos)
-
-    chunks: list[Chunk] = []
-    search_from = 0
-    fallback_offset = 0
-    generated_idx = 0
-    for item in merged_items:
-        chunk_text = (item.get("text") or "").strip()
-        if not chunk_text:
-            continue
-        pos = find_chunk_pos_robust(full_text, chunk_text, search_from)
-        if pos < 0:
-            pos = fallback_offset
-        search_from = max(pos, search_from)
-        fallback_offset = pos + len(chunk_text)
-        chunk_end_pos = pos + len(chunk_text)
-
-        covered: list[DocumentBlock] = []
-        for s, e, b in block_spans:
-            if _overlap_len(pos, chunk_end_pos, s, e) > 0:
-                covered.append(b)
-
-        owner = covered[0] if covered else owner_for_pos(pos)
-        if not covered:
-            covered = [owner]
-        start_abs = owner_start_abs(pos, owner)
-        end_abs = start_abs + len(chunk_text)
-
-        metadata: dict[str, Any] = {}
-        if item.get("context_above"):
-            metadata["context_above"] = item["context_above"]
-        if item.get("context_below"):
-            metadata["context_below"] = item["context_below"]
-        ck_type = str(item.get("ck_type") or "text")
-        metadata["doc_type_kwd"] = ck_type
-        if ck_type in ("table", "image"):
-            metadata["ragflow_chunk_type"] = ck_type
-        if item.get("image") is not None:
-            metadata["has_image"] = True
-
-        child_split_pattern = ""
-        if children_delimiter:
-            custom_child = [m.group(1) for m in re.finditer(r"`([^`]+)`", children_delimiter)]
-            if custom_child:
-                child_split_pattern = "|".join(
-                    re.escape(t) for t in sorted(set(custom_child), key=len, reverse=True)
-                )
-            else:
-                child_split_pattern = children_delimiter
-
-        child_parts = (
-            split_with_pattern(chunk_text, child_split_pattern)
-            if child_split_pattern
-            else [chunk_text]
-        )
-
-        local_cursor = 0
-        for part in child_parts:
-            part_text = (part or "").strip()
-            if not part_text:
-                continue
-            rel = chunk_text.find(part_text, local_cursor)
-            if rel < 0:
-                rel = max(0, local_cursor)
-            local_cursor = rel + len(part_text)
-            ps = start_abs + rel
-            pe = ps + len(part_text)
-            part_meta = metadata.copy()
-            if child_split_pattern:
-                part_meta["mom_with_weight"] = chunk_text
-            part_meta.update(ragflow_tokenize_fields(part_text))
-            poss: list[tuple[float, float, float, float, float]] = []
-            seen_pages: set[int] = set()
-            for cb in covered:
-                if cb.bbox is None or len(cb.bbox) != 4:
-                    continue
-                x0, y0, x1, y1 = cb.bbox
-                poss.append((max(0, cb.page - 1), x0, x1, y0, y1))
-                seen_pages.add(cb.page)
-                page_bboxes = (cb.metadata or {}).get("page_bboxes")
-                if isinstance(page_bboxes, dict):
-                    for pg_str, bb in page_bboxes.items():
-                        pg_1b = int(pg_str)
-                        if pg_1b in seen_pages:
-                            continue
-                        seen_pages.add(pg_1b)
-                        poss.append((pg_1b - 1, bb[0], bb[2], bb[1], bb[3]))
-            if not poss:
-                ii = generated_idx
-                poss = [(ii, ii, ii, ii, ii)]
-            part_meta.update(ragflow_add_positions_fields(poss))
-
-            page_for_chunk = owner.page
-            bbox_for_chunk = owner.bbox
-            same_page_boxes = [
-                cb.bbox for cb in covered if cb.page == page_for_chunk and cb.bbox is not None
-            ]
-            if same_page_boxes:
-                xs0 = [float(bb[0]) for bb in same_page_boxes]
-                ys0 = [float(bb[1]) for bb in same_page_boxes]
-                xs1 = [float(bb[2]) for bb in same_page_boxes]
-                ys1 = [float(bb[3]) for bb in same_page_boxes]
-                bbox_for_chunk = (min(xs0), min(ys0), max(xs1), max(ys1))
-            chunks.append(
-                Chunk(
-                    text=part_text,
-                    chunk_id=str(uuid.uuid4()),
-                    page=page_for_chunk,
-                    start_offset=ps,
-                    end_offset=pe,
-                    bbox=bbox_for_chunk,
-                    level=owner.level,
-                    block_type=(item.get("ck_type") or owner.block_type),
-                    source_block_id=owner.block_id,
-                    source_char_start=ps,
-                    source_char_end=pe,
-                    metadata=part_meta,
-                )
-            )
-            generated_idx += 1
-
-    return chunks
+    return _finalize_merged_items_to_chunks(
+        text_blocks,
+        merged_items,
+        children_delimiter,
+        normalized_document_type,
+    )
 
 
 def ragflow_semantic_chunk(

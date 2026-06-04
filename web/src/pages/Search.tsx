@@ -28,15 +28,33 @@ import {
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { searchAPI, workspacesAPI, authAPI, filesAPI } from '../services/api';
-import type { File, SearchResponse, SearchResult, Workspace } from '../types';
-import ChunkSourcePreviewModal from '../components/ChunkSourcePreviewModal';
+import { searchAPI, workspacesAPI, authAPI } from '../services/api';
+import type { SearchResponse, SearchResult, Workspace } from '../types';
 import { buildAppMenuItems } from '../utils/app-menu';
+import './Files.css';
 
 const { Header, Content, Sider } = Layout;
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
+const SIDER_WIDTH = 300;
 
 type SearchMode = 'semantic' | 'hierarchical';
+type SearchSnapshot = {
+  workspaceId: number;
+  formValues: Record<string, unknown>;
+  response: SearchResponse;
+};
+
+const SEARCH_SNAPSHOT_KEY = 'openrag.search.snapshot';
+
+function readSearchSnapshot(): SearchSnapshot | null {
+  const raw = sessionStorage.getItem(SEARCH_SNAPSHOT_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SearchSnapshot;
+  } catch {
+    return null;
+  }
+}
 
 export default function SearchPage() {
   const { t, i18n } = useTranslation();
@@ -47,21 +65,18 @@ export default function SearchPage() {
   const [currentWorkspace, setCurrentWorkspace] = useState<Workspace | null>(null);
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<SearchResponse | null>(null);
-  const [chunkPreviewOpen, setChunkPreviewOpen] = useState(false);
-  const [chunkPreviewFile, setChunkPreviewFile] = useState<File | null>(null);
-  const [chunkPreviewRow, setChunkPreviewRow] = useState<SearchResult | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
 
-  const openChunkSourcePreview = async (row: SearchResult) => {
-    if (!row.file_id) return;
-    try {
-      const f = await filesAPI.get(row.file_id);
-      setChunkPreviewFile(f);
-      setChunkPreviewRow(row);
-      setChunkPreviewOpen(true);
-    } catch {
-      message.error(t('searchPage.preview_open_failed'));
-    }
+  const openChunkDetailPage = (row: SearchResult) => {
+    if (!currentWorkspace?.id || !row.file_id) return;
+    const params = new URLSearchParams();
+    if (row.chunk_id) params.set('chunkId', row.chunk_id);
+    if (row.chunk_index != null) params.set('chunkIndex', String(row.chunk_index));
+    const query = params.toString();
+    navigate(
+      `/workspaces/${currentWorkspace.id}/files/${row.file_id}/chunks${query ? `?${query}` : ''}`,
+      { state: { from: 'search' } }
+    );
   };
 
   const toggleLanguage = (checked: boolean) => {
@@ -97,6 +112,14 @@ export default function SearchPage() {
       .then((user) => setIsAdmin(user.is_admin === true))
       .catch(console.error);
   }, []);
+
+  useEffect(() => {
+    if (!currentWorkspace?.id) return;
+    const snapshot = readSearchSnapshot();
+    if (snapshot?.workspaceId !== currentWorkspace.id) return;
+    form.setFieldsValue(snapshot.formValues);
+    setResponse(snapshot.response);
+  }, [currentWorkspace, form]);
 
   const handleWorkspaceChange = (workspace: Workspace) => {
     setCurrentWorkspace(workspace);
@@ -136,6 +159,7 @@ export default function SearchPage() {
         query,
         top_k: Number(values.top_k) || 10,
         workspace_id: currentWorkspace.id,
+        vector_similarity_weight: Number(values.vector_similarity_weight ?? 0.7),
         use_rerank: Boolean(values.use_rerank),
         use_contextual_retrieval: Boolean(values.use_contextual_retrieval),
         use_l1_llm_navigation: Boolean(values.use_l1_llm_navigation),
@@ -149,6 +173,14 @@ export default function SearchPage() {
           ? await searchAPI.hierarchical(payload)
           : await searchAPI.search(payload);
       setResponse(res);
+      sessionStorage.setItem(
+        SEARCH_SNAPSHOT_KEY,
+        JSON.stringify({
+          workspaceId: currentWorkspace.id,
+          formValues: values,
+          response: res,
+        })
+      );
       if (!res.results?.length) {
         message.info(t('searchPage.none'));
       }
@@ -241,22 +273,25 @@ export default function SearchPage() {
       title: t('searchPage.col_text'),
       dataIndex: 'text',
       key: 'text',
-      ellipsis: true,
       render: (text: string, row: SearchResult) => (
-        <Paragraph
-          ellipsis={{ rows: 2, tooltip: text }}
-          style={{ marginBottom: 0, cursor: 'pointer', color: '#1677ff' }}
-          onClick={() => openChunkSourcePreview(row)}
+        <button
+          type="button"
+          className="search-result-text-button"
+          onClick={() => openChunkDetailPage(row)}
         >
           {text || ''}
-        </Paragraph>
+        </button>
       ),
     },
   ];
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider style={{ position: 'fixed', height: '100vh', left: 0, top: 0, bottom: 0 }}>
+      <Sider
+        width={SIDER_WIDTH}
+        className="app-sider-smooth"
+        style={{ position: 'fixed', height: '100vh', left: 0, top: 0, bottom: 0 }}
+      >
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div
             style={{
@@ -297,7 +332,7 @@ export default function SearchPage() {
           </div>
         </div>
       </Sider>
-      <Layout style={{ marginLeft: 200 }}>
+      <Layout className="app-main-layout-smooth" style={{ marginLeft: SIDER_WIDTH }}>
         <Header
           style={{
             background: '#fff',
@@ -334,6 +369,7 @@ export default function SearchPage() {
               onFinish={onFinish}
               initialValues={{
                 top_k: 10,
+                vector_similarity_weight: 0.7,
                 search_mode: 'semantic' as SearchMode,
                 use_rerank: true,
                 use_contextual_retrieval: false,
@@ -354,6 +390,9 @@ export default function SearchPage() {
               <Space wrap size="large" style={{ marginBottom: 16 }}>
                 <Form.Item name="top_k" label={t('searchPage.top_k')} style={{ marginBottom: 0 }}>
                   <InputNumber min={1} max={100} />
+                </Form.Item>
+                <Form.Item name="vector_similarity_weight" label={t('searchPage.vector_weight')} style={{ marginBottom: 0 }}>
+                  <InputNumber min={0} max={1} step={0.1} precision={2} />
                 </Form.Item>
                 <Form.Item name="search_mode" label={t('searchPage.mode')} style={{ marginBottom: 0 }}>
                   <Radio.Group optionType="button" buttonStyle="solid">
@@ -473,16 +512,6 @@ export default function SearchPage() {
         </Content>
       </Layout>
 
-      <ChunkSourcePreviewModal
-        open={chunkPreviewOpen}
-        file={chunkPreviewFile}
-        chunk={chunkPreviewRow}
-        onClose={() => {
-          setChunkPreviewOpen(false);
-          setChunkPreviewFile(null);
-          setChunkPreviewRow(null);
-        }}
-      />
     </Layout>
   );
 }

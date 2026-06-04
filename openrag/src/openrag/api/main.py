@@ -17,6 +17,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from openrag.api.deps import get_db
 from openrag.api.files_api import router as files_router
+from openrag.api.workspace_file_api import router as workspace_files_router
+from openrag.api.embed_preview_api import router as embed_preview_router
 from openrag.api.search_api import router as search_router
 from openrag.api.users_api import router as users_router
 from openrag.api.teams_api import router as teams_router
@@ -211,6 +213,8 @@ app.include_router(teams_router)
 app.include_router(workspaces_router)
 app.include_router(tasks_router)
 app.include_router(files_router)
+app.include_router(workspace_files_router)
+app.include_router(embed_preview_router)
 app.include_router(share_router)
 app.include_router(search_router)
 app.include_router(broker_router)

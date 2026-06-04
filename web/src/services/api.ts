@@ -16,6 +16,8 @@ import type {
   ServiceTokenCreated,
   WorkspaceBindingRequest,
   BindingPatchRequest,
+  DocumentChunkListResponse,
+  DocumentType,
   Role,
   RoleCreate,
   RoleUpdate,
@@ -98,12 +100,19 @@ export const filesAPI = {
     const response = await api.get('/files/', { params });
     return response.data.items ? response.data.items : (Array.isArray(response.data) ? response.data : []);
   },
-  upload: async (file: globalThis.File, parserType: string = 'auto', workspaceId: number = 1, path: string = '/'): Promise<File> => {
+  upload: async (
+    file: globalThis.File,
+    parserType: string = 'auto',
+    workspaceId: number = 1,
+    path: string = '/',
+    documentType: DocumentType = 'general'
+  ): Promise<File> => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('parser_type', parserType);
     formData.append('workspace_id', workspaceId.toString());
     formData.append('path', path);
+    formData.append('document_type', documentType);
     const response = await api.post('/files/upload', formData);
     return response.data;
   },
@@ -160,8 +169,11 @@ export const filesAPI = {
     const response = await api.put(`/files/${id}/move`, { new_path: newPath });
     return response.data;
   },
-  reprocess: async (id: number, parserType?: string): Promise<File> => {
-    const response = await api.post(`/files/${id}/reprocess`, { parser_type: parserType });
+  reprocess: async (id: number, parserType?: string, documentType?: DocumentType): Promise<File> => {
+    const body: { parser_type?: string; document_type?: DocumentType } = {};
+    if (parserType !== undefined) body.parser_type = parserType;
+    if (documentType !== undefined) body.document_type = documentType;
+    const response = await api.post(`/files/${id}/reprocess`, body);
     return response.data;
   },
   createDirectory: async (path: string, workspaceId: number): Promise<File> => {
@@ -184,6 +196,32 @@ export const filesAPI = {
   fetchPreview: async (id: number): Promise<{ format: 'html' | 'text'; content: string }> => {
     const response = await api.get(`/files/${id}/preview`);
     return response.data as { format: 'html' | 'text'; content: string };
+  },
+  listChunks: async (
+    workspaceId: number,
+    fileId: number,
+    params?: { skip?: number; limit?: number; q?: string }
+  ): Promise<DocumentChunkListResponse> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/chunks`, { params });
+    return response.data as DocumentChunkListResponse;
+  },
+  fetchWorkspaceContentBlob: async (workspaceId: number, fileId: number): Promise<Blob> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/content`, { responseType: 'blob' });
+    return response.data as Blob;
+  },
+  fetchWorkspacePreview: async (
+    workspaceId: number,
+    fileId: number
+  ): Promise<{ format: 'html' | 'text'; content: string }> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/preview`);
+    return response.data as { format: 'html' | 'text'; content: string };
+  },
+  fetchWorkspaceChunkSource: async (
+    workspaceId: number,
+    fileId: number
+  ): Promise<{ format: 'text'; content: string }> => {
+    const response = await api.get(`/workspaces/${workspaceId}/files/${fileId}/chunk-source`);
+    return response.data as { format: 'text'; content: string };
   },
 };
 

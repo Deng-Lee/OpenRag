@@ -45,6 +45,9 @@ spec:
           ports:
             - containerPort: 80
               name: http
+          env:
+            - name: PREVIEW_FRAME_ANCESTORS
+              value: "'self' http://192.168.100.33:2026 http://192.168.100.32:2026 http://172.16.31.61:2026 http://172.16.31.156:2026"
           volumeMounts:
             - name: web-runtime-config
               mountPath: /usr/share/nginx/html/app-config.js
