@@ -29,7 +29,7 @@ flowchart LR
 ```
 
 1. **管理员**在 Web 端打开 **服务令牌**（`/service-tokens`），创建令牌并授权绑定一个或多个工作区（每个工作区独立设置 `read` 或 `write` 权限）。
-2. 记录返回的完整密钥（`sk-` 前缀）；仅创建时可见明文，后续只能吊销或改权限。
+2. 记录返回的完整密钥（`sk-` 前缀）；创建响应会返回明文，后续令牌创建者或管理员也可通过管理端点查看完整密钥。
 3. 外部系统保存密钥于 **Secret 管理**（环境变量、Vault、K8s Secret），禁止写入前端或版本库。
 4. 调用时统一设置请求头：`X-OpenRag-Token: <完整密钥>`。
 5. URL 中的工作区标识为工作区的 **`name`（全局唯一）**，含中文或空格时需 **URL 编码**；令牌须已绑定该工作区，否则 **403**。
@@ -44,19 +44,27 @@ flowchart LR
 
 | 前缀 | 说明 |
 |------|------|
+| `/users` | 注册、登录、当前用户信息、用户角色 |
+| `/teams` | 团队 CRUD 与团队成员管理 |
 | `/workspaces` | 工作区 CRUD、成员 |
-| `/files` | 文件树、上传、权限相关子路径 |
-| `/search` | 语义检索（JWT） |
-| `/tasks`、`/broker` | 任务与调度运维 |
+| `/files` | 文件上传、目录创建、列表筛选、内容/预览、移动、删除、重处理、文件级权限 |
+| `/workspaces/{workspace_id}/files` | 强工作区身份的文件 chunks、chunk source、内容与预览读取 |
+| `/search` | 语义检索、分层检索、chunk 上下文 |
+| `/workspaces/{workspace_id}/tasks`、`/broker` | 工作区任务查询/重试/取消与 worker 调度运维 |
+| `/share` | 文件分享链接创建、列表、访问与吊销 |
 | `/roles` | 角色与授权（管理用） |
+| `/traces`、`/eval` | 文档处理 / 检索可观测与检索质量评测 |
 | `/service-tokens` | 服务令牌管理（CRUD、绑定、吊销）——见第二部分 |
+| `/embed/v1` | iframe 文档预览内部只读 API，仅配合短期 preview token 使用 |
+
+JWT 文件上传 `POST /files/upload` 还支持 `document_type`（`general`、`manual`、`laws`），用于控制后续分块策略；`POST /files/{file_id}/reprocess` 可在重处理时更新或保留该值。服务令牌上传接口当前只暴露 `parser_type`，新文件默认按 `general` 处理。
 
 完整契约：**部署后打开** `https://<api-host>/docs` 或 `https://<domain>/api/docs`（若使用 Nginx `/api` 代理）。
 
 ### 1.4 网络、TLS 与限流
 
 - 生产环境应对公网 **HTTPS** 终止（Ingress / 网关），后端可只接收集群内 HTTP。
-- 上传体积受 `MAX_UPLOAD_SIZE` 等配置约束。
+- 上传体积当前由后端 `MAX_FILE_SIZE` 约束为 **100 MB**。
 - 对 `/service/v1` 建议在网关侧做 **IP allowlist**、**速率限制** 与密钥轮换。
 
 ### 1.5 与前端同源部署时的基地址
@@ -121,7 +129,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 目录树、列子项、按前缀查询、文件元数据、语义检索、按文件名搜索、创建预览链接 | **read** 或 **write** |
 | 上传新文件、覆盖已有文件 | **write** |
 
-只读令牌调用写接口 → **403**，`detail`：`Write permission required`。
+只读令牌调用写接口 → **403**，`detail`：`Token permission insufficient`。
 多工作区检索中，`write` 绑定同样视为具备读取权限。
 
 ### 2.3 前置概念
@@ -204,7 +212,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 }
 ```
 
-`secret` 仅在创建时返回完整值，后续不可再获取明文（可通过 `GET /service-tokens/{id}/secret` 查看）。
+`secret` 会在创建时返回完整值；后续令牌创建者或管理员可通过 `GET /service-tokens/{id}/secret` 查看完整密钥。
 
 #### GET `/service-tokens` — 列出令牌
 
@@ -500,6 +508,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 **`parser_type` 支持值：** `auto`、`pdf`、`docx`、`xlsx`、`pptx`、`txt`、`md`、`html`、`json`、`csv`、`epub`
 
+该 service-token 上传接口不接收 `document_type`；新文件会按默认 `general` 文档类型进入后续分块流水线。如需在上传时指定 `manual` 或 `laws`，使用 JWT `POST /files/upload`。
+
 **支持处理的 MIME 类型：**
 
 | MIME 类型 | 对应文件格式 |
@@ -563,7 +573,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `file` | file | **是** | — | 新文件内容 |
 | `parser_type` | string | 否 | `auto` | 重新处理的解析器类型 |
 
-**行为：** 覆盖 MinIO 存储，清除原有 chunks/向量，重新创建 `process_document` 任务。
+**行为：** 覆盖 MinIO 存储，清除原有 chunks/向量，重新创建 `process_document` 任务；不会通过请求参数修改原文件的 `document_type`。
 
 **成功：** **200 OK**
 
@@ -1142,6 +1152,8 @@ print(r.json())
 | **400** | `url_prefix and path_prefix must be the same when both provided` | 两个前缀参数值不一致 |
 | **400** | `Cannot replace directory content` | 覆盖路径指向目录 |
 | **400** | `Cannot modify bindings on a revoked token` | 修改已吊销令牌的绑定 |
+| **400** | `Duplicate workspace binding` | 创建令牌时请求体中重复绑定同一工作区 |
+| **400** | `Invalid document_type. Supported types: ...` | JWT 上传或重处理时文档内容类型不在支持列表 |
 | **400** | `File type ... is not supported for processing` | 覆盖时文件 MIME 不在支持列表 |
 | **400** | `workspace_names is required for multi_space search` | 多工作区检索缺少目标工作区数组 |
 | **400** | `File is a directory` | 创建 preview link 时 `file_id` 指向目录 |
@@ -1149,6 +1161,7 @@ print(r.json())
 | **401** | `Invalid or missing service token` | 缺头、密钥错、已吊销 |
 | **401** | `Preview token required` | iframe 内部预览 API 缺少 `X-OpenRag-Preview-Token` |
 | **401** | `Invalid preview token` | preview token 无效、过期或签名错误 |
+| **403** | `Token has no workspace bindings` | 令牌存在但没有任何工作区绑定 |
 | **403** | `Token not authorized for this workspace` | 单工作区接口中，令牌未绑定该工作区 |
 | **403** | `Token permission insufficient` | 令牌对绑定的工作区权限不足 |
 | **404** | `Workspace not found` | 单工作区接口中，工作区名不存在 |
@@ -1156,7 +1169,7 @@ print(r.json())
 | **404** | `File not found` | 文件路径不存在 |
 | **404** | `Chunk not found` | 创建 preview link 时 chunk 不属于该 workspace/file |
 | **409** | `File already exists at <uri>` | 上传时目标路径已有文件 |
-| **409** | `Binding already exists` | 添加已存在的绑定 |
+| **409** | `Token already has a binding for this workspace` | 添加已存在的绑定 |
 | **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过 100 MB |
 | **500** | — | 内部错误或检索执行失败 |
 
@@ -1199,4 +1212,5 @@ print(r.json())
 ### 2.12 相关脚本与设计
 
 - 数据库迁移脚本：`openrag/scripts/sql/2026-05-06-service-token-multi-workspace.sql`
+- 通用目录批量导入脚本（JWT `POST /files/upload`）：`openrag/scripts/bulk_import_folder.py`，可保持本地相对目录结构上传，并支持 `--dry-run` 预览。
 - 设计背景：`docs/superpowers/specs/2026-05-06-service-token-multi-workspace-design.md`

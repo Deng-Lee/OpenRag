@@ -61,7 +61,7 @@ RUN cp -a /root/.local/lib/python3.11/site-packages/. /usr/local/lib/python3.11/
     && rm -rf /root/.local
 
 COPY openrag/src/ ./src/
-COPY openrag/rag/res/deepdoc/ ./src/rag/res/deepdoc/
+COPY openrag/rag/res/deepdoc/ ./rag/res/deepdoc/
 COPY openrag/run_api.py .
 COPY openrag/setup.py .
 COPY openrag/scripts/verify_worker_ragflow_bundle.py ./scripts/
@@ -80,11 +80,11 @@ required = [
     "tsr.onnx",
     "updown_concat_xgb.model",
 ]
-base = Path("/app/src/rag/res/deepdoc")
+base = Path("/app/rag/res/deepdoc")
 missing = [name for name in required if not (base / name).exists()]
 if missing:
     raise SystemExit(
-        "Missing offline ragflow model files under /app/src/rag/res/deepdoc: "
+        "Missing offline ragflow model files under /app/rag/res/deepdoc: "
         + ", ".join(missing)
         + ". Run: python openrag/scripts/prepare_ragflow_models.py"
     )

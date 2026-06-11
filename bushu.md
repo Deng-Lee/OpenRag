@@ -186,6 +186,35 @@ docker build --build-arg BUILD_PROXY=$env:BUILD_PROXY `
   -t "openrag/api:$($env:TAG)" .
 ```
 
+构建 Worker 镜像前，先确认离线 RAGFlow OCR 模型已经准备好，并且 Dockerfile 会把模型放到运行时实际查找的 `/app/rag/res/deepdoc`：
+
+```powershell
+$deepdocDir = "openrag\rag\res\deepdoc"
+$requiredDeepdoc = @(
+  "det.onnx",
+  "rec.onnx",
+  "ocr.res",
+  "layout.onnx",
+  "tsr.onnx",
+  "updown_concat_xgb.model"
+)
+
+foreach ($f in $requiredDeepdoc) {
+  $p = Join-Path $deepdocDir $f
+  if (-not (Test-Path $p) -or (Get-Item $p).Length -le 0) {
+    throw "缺少离线 RAGFlow 模型文件: $p。先执行 python openrag\scripts\prepare_ragflow_models.py，或手工补齐模型文件。"
+  }
+}
+
+Select-String -Path docker\Dockerfile.worker -Pattern "COPY openrag/rag/res/deepdoc/ ./rag/res/deepdoc/|/app/rag/res/deepdoc"
+```
+
+期望：
+
+- 6 个必需文件都存在且非空。
+- `docker/Dockerfile.worker` 中模型复制目标是 `./rag/res/deepdoc/`。
+- 构建期检查路径是 `/app/rag/res/deepdoc`，不要使用 `/app/src/rag/res/deepdoc`。
+
 构建 Worker 镜像：
 
 ```powershell
@@ -210,9 +239,10 @@ docker image inspect "openrag/api:$($env:TAG)" | Out-Null
 docker image inspect "openrag/task-worker:$($env:TAG)" | Out-Null
 docker image inspect "openrag/web:$($env:TAG)" | Out-Null
 docker images | Select-String "openrag"
+docker run --rm "openrag/task-worker:$($env:TAG)" sh -c 'ls -lh /app/rag/res/deepdoc && for f in det.onnx rec.onnx ocr.res layout.onnx tsr.onnx updown_concat_xgb.model; do test -s "/app/rag/res/deepdoc/$f" || exit 1; done'
 ```
 
-三条 `docker image inspect` 都不能报错，`docker images` 中必须能看到本次 tag。
+三条 `docker image inspect` 都不能报错，`docker images` 中必须能看到本次 tag，Worker 容器内 `/app/rag/res/deepdoc` 必须包含完整离线 OCR / layout / tsr 模型文件。
 
 ## 5. 拉取第三方镜像
 
@@ -859,7 +889,7 @@ kubectl -n openrag logs deploy/openrag-task-worker --tail=100
 验收环境变量：
 
 ```bash
-kubectl -n openrag exec deploy/openrag-task-worker -- env | grep -E "STORAGE_|MILVUS_|ELASTICSEARCH|OPENAI_BASE_URL|EMBEDDING_MODEL|EMBEDDING_DIMENSION|L1_NAV_MODEL"
+kubectl -n openrag exec deploy/openrag-task-worker -- env | grep -E "STORAGE_|MILVUS_|ELASTICSEARCH|OPENAI_BASE_URL|EMBEDDING_MODEL|EMBEDDING_DIMENSION|L1_NAV_MODEL|OPENRAG_PDF_BACKEND|OPENRAG_DISABLE_HF_DOWNLOAD|RAG_PROJECT_BASE"
 ```
 
 期望与 API 一致：
@@ -875,7 +905,41 @@ OPENAI_BASE_URL=http://litellm.dev.guozhijishu.com/v1
 EMBEDDING_MODEL=Qwen3-Embedding-4B
 EMBEDDING_DIMENSION=2560
 L1_NAV_MODEL=DeepSeek-V4-Flash
+OPENRAG_PDF_BACKEND=ragflow
+OPENRAG_DISABLE_HF_DOWNLOAD=true
+RAG_PROJECT_BASE=/app
 ```
+
+验收离线 RAGFlow OCR 模型路径：
+
+```bash
+kubectl -n openrag exec deploy/openrag-task-worker -c worker -- sh -c '
+echo "base=$RAG_PROJECT_BASE"
+ls -lh /app/rag/res/deepdoc
+for f in det.onnx rec.onnx ocr.res layout.onnx tsr.onnx updown_concat_xgb.model; do
+  test -s "/app/rag/res/deepdoc/$f" && echo "OK $f" || { echo "MISSING $f"; exit 1; }
+done
+'
+```
+
+验收 OCR 本地模型初始化：
+
+```bash
+kubectl -n openrag exec -i deploy/openrag-task-worker -c worker -- python - <<'PY'
+from common.file_utils import get_project_base_directory
+from openrag.parsers.ragflow.vision.ocr import OCR
+
+print("base=", get_project_base_directory())
+OCR()
+print("OCR init OK")
+PY
+```
+
+期望：
+
+- 模型文件位于 `/app/rag/res/deepdoc`。
+- `OCR init OK` 正常输出。
+- 如果出现 `not find model file path /app/rag/res/deepdoc/det.onnx`，说明 Worker 镜像模型路径错误，需要重新按第 4 步构建并部署 Worker 镜像。
 
 说明：
 
@@ -1000,7 +1064,23 @@ kubectl -n openrag describe pod -l app=openrag-web | grep -Ei "Image:|Image ID:|
 
 ```bash
 kubectl -n openrag exec deploy/openrag-api -- env | grep -E "STORAGE_|MILVUS_|ELASTICSEARCH|OPENAI_BASE_URL|EMBEDDING_MODEL|EMBEDDING_DIMENSION|L1_NAV_MODEL"
-kubectl -n openrag exec deploy/openrag-task-worker -- env | grep -E "STORAGE_|MILVUS_|ELASTICSEARCH|OPENAI_BASE_URL|EMBEDDING_MODEL|EMBEDDING_DIMENSION|L1_NAV_MODEL"
+kubectl -n openrag exec deploy/openrag-task-worker -- env | grep -E "STORAGE_|MILVUS_|ELASTICSEARCH|OPENAI_BASE_URL|EMBEDDING_MODEL|EMBEDDING_DIMENSION|L1_NAV_MODEL|OPENRAG_PDF_BACKEND|OPENRAG_DISABLE_HF_DOWNLOAD|RAG_PROJECT_BASE"
+```
+
+检查 Worker 离线 OCR 模型：
+
+```bash
+kubectl -n openrag exec deploy/openrag-task-worker -c worker -- sh -c '
+for f in det.onnx rec.onnx ocr.res layout.onnx tsr.onnx updown_concat_xgb.model; do
+  test -s "/app/rag/res/deepdoc/$f" && echo "OK $f" || { echo "MISSING $f"; exit 1; }
+done
+'
+
+kubectl -n openrag exec -i deploy/openrag-task-worker -c worker -- python - <<'PY'
+from openrag.parsers.ragflow.vision.ocr import OCR
+OCR()
+print("OCR init OK")
+PY
 ```
 
 检查健康接口：
@@ -1046,7 +1126,8 @@ mcli ls new-minio/rag-kb/milvus
 11. API /health 正常。
 12. Web 可访问。
 13. Web 反向代理 /api/health 正常。
-14. 上传、解析、入库、检索链路成功。
+14. Worker 的 `/app/rag/res/deepdoc` 模型文件完整，`OCR init OK`。
+15. 上传、解析、入库、检索链路成功。
 ```
 
 ## 26. 业务链路验收
@@ -1057,11 +1138,12 @@ mcli ls new-minio/rag-kb/milvus
 1. 打开 OpenRag Web。
 2. 登录。
 3. 查看已有 workspace 和文件。
-4. 上传一个小文件，例如 PDF 或 TXT。
-5. 观察 Worker 日志，确认任务被消费。
-6. 在 MinIO 的 rag-kb/openrag/<workspace>/ 下确认新增对象。
-7. 执行一次检索或问答。
-8. 确认 Milvus、Elasticsearch、Postgres 没有持续异常日志。
+4. 上传一个小 Markdown 文件，确认解析、入库成功。
+5. 上传一个小 PDF 文件，确认 RAGFlow OCR 初始化和 PDF 解析成功。
+6. 观察 Worker 日志，确认任务被消费。
+7. 在 MinIO 的 rag-kb/openrag/<workspace>/ 下确认新增对象。
+8. 执行一次检索或问答。
+9. 确认 Milvus、Elasticsearch、Postgres 没有持续异常日志。
 ```
 
 Worker 日志：
@@ -1085,6 +1167,7 @@ mcli ls --recursive new-minio/rag-kb/openrag | tail -50
 验收标准：
 
 - 上传文件后 Worker 有处理日志。
+- PDF 解析不出现 `OCR local model init failed` 或 `not find model file path /app/rag/res/deepdoc/det.onnx`。
 - MinIO 中出现新增业务对象。
 - 检索或问答能返回结果。
 - 如果登录返回 `401`，说明网络链路已经到达 API，应检查用户表、激活状态和密码，不要优先怀疑 K8s 网络。
@@ -1183,7 +1266,31 @@ kubectl -n openrag get secret openrag-secrets -o yaml | grep OPENAI_API_KEY
 - `Qwen3-Embedding-4B` 的 `EMBEDDING_DIMENSION` 是 `2560`。
 - 如果模型网关使用自签证书或特殊路径，需要按网关要求调整配置。
 
-### 27.6 Web 能打开但 API 不通
+### 27.6 PDF 解析提示 OCR 本地模型初始化失败
+
+典型错误：
+
+```text
+OCR local model init failed and OPENRAG_DISABLE_HF_DOWNLOAD is enabled
+not find model file path /app/rag/res/deepdoc/det.onnx
+```
+
+排查：
+
+```bash
+kubectl -n openrag exec deploy/openrag-task-worker -c worker -- env | grep -E "OPENRAG_PDF_BACKEND|OPENRAG_DISABLE_HF_DOWNLOAD|RAG_PROJECT_BASE"
+kubectl -n openrag exec deploy/openrag-task-worker -c worker -- sh -c 'ls -lh /app/rag/res/deepdoc /app/src/rag/res/deepdoc 2>/dev/null || true'
+kubectl -n openrag logs deploy/openrag-task-worker -c worker --since=30m --tail=1000 | grep -Ei "OCR local model|not find model file|deepdoc|Traceback"
+```
+
+处理：
+
+- `RAG_PROJECT_BASE=/app` 时，OCR 代码会查找 `/app/rag/res/deepdoc`。
+- Worker 镜像必须把 `openrag/rag/res/deepdoc/` 复制到 `/app/rag/res/deepdoc/`。
+- 如果模型只出现在 `/app/src/rag/res/deepdoc`，说明 Worker 镜像路径错误，应修正 `docker/Dockerfile.worker` 后重新构建、导入并部署 Worker 镜像。
+- 只能临时应急时，才在当前 Worker Pod 内建立 `/app/rag/res/deepdoc -> /app/src/rag/res/deepdoc` 软链；Pod 重建后该软链会丢失，不能作为长期方案。
+
+### 27.7 Web 能打开但 API 不通
 
 排查：
 
