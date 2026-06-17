@@ -38,11 +38,13 @@ def _stub_app_startup():
     the test engine keeps that from blocking on an unreachable DB. The background
     scheduler is stubbed so no 60s job thread touches the shared in-memory DB.
     """
-    with patch("openrag.database.get_engine", return_value=engine), patch(
-        "openrag.api.deps.get_engine", return_value=engine
-    ), patch("openrag.scheduler.start_scheduler", lambda: None), patch(
-        "openrag.scheduler.stop_scheduler", lambda: None
-    ):
+    import openrag.database
+
+    # Poison the lazy engine singleton so EVERY get_engine() caller (init_db and
+    # deps.get_db, whatever the import path) resolves to the in-memory SQLite engine.
+    with patch.object(openrag.database, "_engine", engine), patch(
+        "openrag.scheduler.start_scheduler", lambda: None
+    ), patch("openrag.scheduler.stop_scheduler", lambda: None):
         yield
 
 

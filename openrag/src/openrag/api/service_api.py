@@ -306,6 +306,8 @@ async def service_upload_document(
 ) -> dict[str, Any]:
     ws = require_workspace_for_name(db, workspace_name)
     assert_token_workspace_permission(ctx, ws.id, "write")
+    # When create_dirs is set we materialise the parent path first, so the strict
+    # parent-existence check inside ingest_new_file can be safely relaxed below.
     if create_dirs:
         ensure_directory_path(db, ws, path)
     body = await file.read()

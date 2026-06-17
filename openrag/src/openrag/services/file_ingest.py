@@ -194,20 +194,24 @@ def ensure_directory_path(
     """Idempotently create ``logical_path`` and all missing ancestors (``mkdir -p``).
 
     Returns the deepest directory row. Seeds the workspace root ``/`` if missing.
-    Safe under concurrency: a lost insert race is retried once, after which every
-    level already exists and no inserts are attempted.
+    Safe under concurrency: a lost insert race rolls back and retries; after a
+    racing writer commits a level, our retry finds it and performs no insert.
+
+    Commits in its own transaction: directories are durable like ``mkdir -p`` (an
+    empty KB dir is a valid end state), and isolating the commit keeps these rows
+    safe from a caller's internal rollbacks.
     """
     path = validate_path(logical_path)
-    try:
-        deepest = _ensure_directory_path_one_pass(db, workspace, path)
-    except IntegrityError:
-        db.rollback()
-        deepest = _ensure_directory_path_one_pass(db, workspace, path)
-    # Commit directory creation in its own transaction: directories are durable
-    # like ``mkdir -p`` (an empty KB dir is a valid end state), and isolating the
-    # commit keeps these rows safe from a caller's internal rollbacks.
-    db.commit()
-    return deepest
+    last_exc: Optional[IntegrityError] = None
+    for _ in range(3):
+        try:
+            deepest = _ensure_directory_path_one_pass(db, workspace, path)
+            db.commit()
+            return deepest
+        except IntegrityError as exc:  # concurrent create of the same level
+            last_exc = exc
+            db.rollback()
+    raise last_exc  # exhausted retries under sustained contention
 
 
 def _safe_start_upload_run(
