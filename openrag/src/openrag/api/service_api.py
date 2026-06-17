@@ -21,7 +21,12 @@ from openrag.config import get_preview_public_web_base_url
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as DbFile
 from openrag.models.workspace import Workspace
-from openrag.services.file_ingest import ingest_new_file, replace_file_content, validate_path
+from openrag.services.file_ingest import (
+    ensure_directory_path,
+    ingest_new_file,
+    replace_file_content,
+    validate_path,
+)
 from openrag.services.preview_token_service import create_preview_token, decode_preview_token
 from openrag.services.service_token_service import (
     ServiceTokenContext,
@@ -292,11 +297,17 @@ async def service_upload_document(
     path: str = Form(..., description="Parent directory logical path"),
     file: UploadFile = File(...),
     parser_type: str = Form(default="auto"),
+    create_dirs: bool = Form(
+        default=False,
+        description="Create missing parent directories (mkdir -p) before upload",
+    ),
     ctx: ServiceTokenContext = Depends(get_service_token_context),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     ws = require_workspace_for_name(db, workspace_name)
     assert_token_workspace_permission(ctx, ws.id, "write")
+    if create_dirs:
+        ensure_directory_path(db, ws, path)
     body = await file.read()
     file_record, task_record = ingest_new_file(
         db,
@@ -307,7 +318,7 @@ async def service_upload_document(
         file_content=body,
         content_type=file.content_type,
         parser_type=parser_type,
-        require_parent_dir=True,
+        require_parent_dir=not create_dirs,
         duplicate_status_code=status.HTTP_409_CONFLICT,
     )
     return _upload_response_dict(file_record, task_record.id if task_record else None)
