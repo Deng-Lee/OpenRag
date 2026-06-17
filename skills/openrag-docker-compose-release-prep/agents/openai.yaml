@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenRag Compose 发布准备"
+  short_description: "准备并上传 OpenRag Compose 发布制品"
+  default_prompt: "使用 $openrag-docker-compose-release-prep 准备并上传 OpenRag Docker Compose 发布制品。"
