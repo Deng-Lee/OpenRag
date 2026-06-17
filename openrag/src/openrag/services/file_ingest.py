@@ -211,7 +211,12 @@ def ensure_directory_path(
         except IntegrityError as exc:  # concurrent create of the same level
             last_exc = exc
             db.rollback()
-    raise last_exc  # exhausted retries under sustained contention
+    # Exhausted retries under sustained contention: surface a clean, retryable
+    # error rather than leaking a raw IntegrityError (which would become a 500).
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Directory creation contended; please retry",
+    ) from last_exc
 
 
 def _safe_start_upload_run(
