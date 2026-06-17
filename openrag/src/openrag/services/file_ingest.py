@@ -8,6 +8,7 @@ import uuid
 from typing import Optional, Tuple
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
@@ -134,6 +135,88 @@ def build_file_uri(path: str, filename: str) -> str:
     if normalized_path and normalized_path != "/":
         return f"{normalized_path}/{filename}"
     return f"/{filename}"
+
+
+def _get_or_create_directory_row(
+    db: Session,
+    workspace: Workspace,
+    uri: str,
+    name: str,
+) -> FileModel:
+    """Return the directory row at ``uri`` in ``workspace``, creating it if absent.
+
+    Mirrors ``files_api.create_directory`` (DB-only virtual directory; no MinIO
+    object). Raises 409 if ``uri`` already exists as a *file* rather than a
+    directory. May raise ``IntegrityError`` on a concurrent insert race; the
+    public wrapper handles that by rolling back and retrying.
+    """
+    row = (
+        db.query(FileModel)
+        .filter(FileModel.workspace_id == workspace.id, FileModel.uri == uri)
+        .first()
+    )
+    if row is not None:
+        if not row.is_directory:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Path component already exists as a file: {uri}",
+            )
+        return row
+    row = FileModel(
+        uri=uri,
+        name=name,
+        owner_id=workspace.owner_id,
+        workspace_id=workspace.id,
+        is_directory=True,
+        size=0,
+    )
+    db.add(row)
+    db.flush()  # assigns row.id; may raise IntegrityError on a race
+    return row
+
+
+def _ensure_directory_path_one_pass(
+    db: Session, workspace: Workspace, path: str
+) -> FileModel:
+    """Create root + each path component as a directory; return the deepest row."""
+    deepest = _get_or_create_directory_row(db, workspace, "/", "root")
+    if path != "/":
+        cumulative = ""
+        for part in [p for p in path.split("/") if p]:
+            cumulative = f"{cumulative}/{part}"
+            deepest = _get_or_create_directory_row(db, workspace, cumulative, part)
+    return deepest
+
+
+def ensure_directory_path(
+    db: Session, workspace: Workspace, logical_path: str
+) -> FileModel:
+    """Idempotently create ``logical_path`` and all missing ancestors (``mkdir -p``).
+
+    Returns the deepest directory row. Seeds the workspace root ``/`` if missing.
+    Safe under concurrency: a lost insert race rolls back and retries; after a
+    racing writer commits a level, our retry finds it and performs no insert.
+
+    Commits in its own transaction: directories are durable like ``mkdir -p`` (an
+    empty KB dir is a valid end state), and isolating the commit keeps these rows
+    safe from a caller's internal rollbacks.
+    """
+    path = validate_path(logical_path)
+    last_exc: Optional[IntegrityError] = None
+    for _ in range(3):
+        try:
+            deepest = _ensure_directory_path_one_pass(db, workspace, path)
+            db.commit()
+            return deepest
+        except IntegrityError as exc:  # concurrent create of the same level
+            last_exc = exc
+            db.rollback()
+    # Exhausted retries under sustained contention: surface a clean, retryable
+    # error rather than leaking a raw IntegrityError (which would become a 500).
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Directory creation contended; please retry",
+    ) from last_exc
 
 
 def _safe_start_upload_run(

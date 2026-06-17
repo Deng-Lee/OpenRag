@@ -502,9 +502,10 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
-| `path` | string | **是** | — | **父目录**逻辑路径；须已存在，不会自动创建缺失目录 |
+| `path` | string | **是** | — | **父目录**逻辑路径；默认须已存在（除非传 `create_dirs=true`） |
 | `file` | file | **是** | — | 上传文件 |
 | `parser_type` | string | 否 | `auto` | 解析器类型 |
+| `create_dirs` | bool | 否 | `false` | 为 `true` 时先自动创建 `path` 及其所有缺失父目录（`mkdir -p`）再上传；缺省 `false` 时父目录须已存在，否则 **400** |
 
 **`parser_type` 支持值：** `auto`、`pdf`、`docx`、`xlsx`、`pptx`、`txt`、`md`、`html`、`json`、`csv`、`epub`
 
@@ -1185,7 +1186,7 @@ print(r.json())
 | 多工作区检索返回 200，但某些工作区没有结果 | 工作区不存在，或当前 service token 没有该工作区 read/write 权限 | 查看 `skipped_workspaces` 中的 `reason` 和 `message`，补齐绑定或修正工作区名称 |
 | 404 `Directory not found` | `path_prefix` 或 `path` 在库中不存在 | 确认目录路径已通过上传或 Web 端创建 |
 | 409 `File already exists` | 上传路径已有同名文件 | 改用 PUT 覆盖 |
-| 400 `Parent directory does not exist` | 上传时父目录未创建 | 先通过 Web 端或 POST `/files/directories`（JWT）创建目录 |
+| 400 `Parent directory does not exist` | 上传时父目录未创建 | 上传时带 `create_dirs=true` 自动建目录；或先通过 Web 端 / JWT `POST /files/directories` 创建目录 |
 | 检索返回 0 结果 | 文件 `processing_status` 非 `completed` | 等待文件处理完成再检索 |
 | 文件名搜索返回 0 结果 | 文件名不匹配或 `path_prefix` 限定范围内无文件 | 尝试缩短关键词或扩大 path_prefix 范围 |
 | 创建 preview link 返回 404 `File not found` 或 `Chunk not found` | 前端传回的 `file_id`、`chunk_id` 与当前工作区或文件不匹配 | 使用 search 响应原样传递这些字段，不要按文件名或路径自行定位 chunk |

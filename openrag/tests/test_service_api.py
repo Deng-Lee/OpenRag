@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -15,6 +16,7 @@ from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
 from openrag.models import Base, DocumentChunk, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
 from openrag.security import hash_password
+from openrag.services.file_ingest import ensure_directory_path
 from openrag.services.preview_token_service import decode_preview_token
 from openrag.storage.minio_storage import MinioStorage
 
@@ -26,6 +28,24 @@ engine = create_engine(
     poolclass=StaticPool,
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture(autouse=True)
+def _stub_app_startup():
+    """Make app startup hit the test's in-memory SQLite instead of a real Postgres so
+    ``TestClient`` tests run without external infra. Startup calls ``get_db()`` directly
+    (bypassing the dependency override) and runs ``SELECT 1``; pointing ``get_engine`` at
+    the test engine keeps that from blocking on an unreachable DB. The background
+    scheduler is stubbed so no 60s job thread touches the shared in-memory DB.
+    """
+    import openrag.database
+
+    # Poison the lazy engine singleton so EVERY get_engine() caller (init_db and
+    # deps.get_db, whatever the import path) resolves to the in-memory SQLite engine.
+    with patch.object(openrag.database, "_engine", engine), patch(
+        "openrag.scheduler.start_scheduler", lambda: None
+    ), patch("openrag.scheduler.stop_scheduler", lambda: None):
+        yield
 
 
 @pytest.fixture(scope="function")
@@ -97,7 +117,7 @@ def client(db: Session):
         try:
             yield db
         finally:
-            pass
+            db.rollback()
 
     prev = app.dependency_overrides.get(get_db)
     app.dependency_overrides[get_db] = override_get_db
@@ -985,3 +1005,109 @@ def test_service_replace_document_200(
     assert r.status_code == 200
     assert r.json()["path"] == "/rep.txt"
     assert r.json().get("task_id") is not None
+
+
+def test_ensure_directory_path_creates_nested_dirs(db: Session, workspace: Workspace, owner: User) -> None:
+    leaf = ensure_directory_path(db, workspace, "/personal/u1/kb1")
+    assert leaf.uri == "/personal/u1/kb1"
+    assert leaf.is_directory is True
+    for uri in ("/", "/personal", "/personal/u1", "/personal/u1/kb1"):
+        row = (
+            db.query(File)
+            .filter(File.workspace_id == workspace.id, File.uri == uri, File.is_directory.is_(True))
+            .first()
+        )
+        assert row is not None, f"missing directory row {uri}"
+
+
+def test_ensure_directory_path_is_idempotent(db: Session, workspace: Workspace, owner: User) -> None:
+    ensure_directory_path(db, workspace, "/a/b")
+    ensure_directory_path(db, workspace, "/a/b")
+    for uri in ("/a", "/a/b"):
+        count = (
+            db.query(File)
+            .filter(File.workspace_id == workspace.id, File.uri == uri)
+            .count()
+        )
+        assert count == 1, f"{uri} duplicated: {count} rows"
+
+
+def test_ensure_directory_path_seeds_root(db: Session, workspace: Workspace, owner: User) -> None:
+    assert (
+        db.query(File).filter(File.workspace_id == workspace.id, File.uri == "/").first()
+        is None
+    )
+    ensure_directory_path(db, workspace, "/x")
+    root = db.query(File).filter(File.workspace_id == workspace.id, File.uri == "/").first()
+    assert root is not None and root.is_directory is True
+
+
+def test_ensure_directory_path_rejects_file_in_path(db: Session, workspace: Workspace, owner: User) -> None:
+    db.add(File(uri="/a", name="a", owner_id=owner.id, workspace_id=workspace.id, is_directory=False, size=3))
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        ensure_directory_path(db, workspace, "/a/b")
+    assert exc.value.status_code == 409
+
+
+def test_service_upload_create_dirs_materialises_parents(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_write_headers
+) -> None:
+    # No directories seeded at all — not even root.
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("n.txt", b"hello", "text/plain")}
+        data = {"path": "/personal/u1/kb1", "parser_type": "auto", "create_dirs": "true"}
+        r = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+    assert r.status_code == 201, r.text
+    assert r.json()["path"] == "/personal/u1/kb1/n.txt"
+    for uri in ("/personal", "/personal/u1", "/personal/u1/kb1"):
+        row = (
+            db.query(File)
+            .filter(File.workspace_id == workspace.id, File.uri == uri, File.is_directory.is_(True))
+            .first()
+        )
+        assert row is not None, f"expected directory {uri} to be created"
+
+
+def test_service_upload_without_create_dirs_still_400(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_write_headers
+) -> None:
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("n.txt", b"hello", "text/plain")}
+        data = {"path": "/personal/u1/kb1", "parser_type": "auto"}  # no create_dirs -> strict
+        r = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Parent directory does not exist"
+
+
+def test_service_upload_create_dirs_file_is_navigable(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_write_headers
+) -> None:
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("n.txt", b"hello", "text/plain")}
+        data = {"path": "/personal/u1/kb1", "create_dirs": "true"}
+        up = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+        assert up.status_code == 201, up.text
+        children = client.get(
+            f"/service/v1/workspaces/{workspace.name}/children",
+            params={"path": "/personal/u1/kb1"},
+            headers=service_token_write_headers,
+        )
+    assert children.status_code == 200, children.text
+    names = [item.get("name") for item in children.json()]
+    assert "n.txt" in names
