@@ -46,8 +46,7 @@ try {
     --exclude=".worktrees" `
     --exclude=".claude" `
     --exclude=".pytest_cache" `
-    --exclude=".uv-cache" `
-    --exclude=".uv-cache-test" `
+    --exclude=".uv-cache*" `
     --exclude="venv" `
     --exclude=".venv" `
     --exclude="openrag/venv" `
