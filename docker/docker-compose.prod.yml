@@ -87,7 +87,11 @@ services:
       retries: 3
 
   # Internal Trace / Eval dashboard. Expose only in trusted networks.
+  # Opt-in only: gated behind the `trace-dashboard` profile so a plain
+  # `docker compose up` does NOT start it. Enable with `--profile trace-dashboard`.
   trace-dashboard:
+    profiles:
+      - trace-dashboard
     build:
       context: ..
       dockerfile: tools/trace_dashboard/Dockerfile
