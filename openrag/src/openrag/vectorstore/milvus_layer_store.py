@@ -14,7 +14,10 @@ from pymilvus import (
     utility,
 )
 
-from openrag.vectorstore.milvus_store import non_vector_output_field_names
+from openrag.vectorstore.milvus_store import (
+    non_vector_output_field_names,
+    truncate_to_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +145,7 @@ class MilvusLayerStore:
             layer_ids.append(_layer_row_id(file_id, layer))
             file_ids.append(file_id)
             layers.append(layer)
-            texts.append(t[:_TEXT_MAX_LEN])
+            texts.append(truncate_to_bytes(t, _TEXT_MAX_LEN))
             embeddings.append(emb)
             rows += 1
 

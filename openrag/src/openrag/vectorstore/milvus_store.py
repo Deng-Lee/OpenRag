@@ -27,6 +27,22 @@ _TEXT_MAX_LEN = 65535
 _MAX_FILE_IDS_IN_EXPR = 512
 
 
+def truncate_to_bytes(text: str, max_bytes: int = _TEXT_MAX_LEN) -> str:
+    """Truncate ``text`` so its UTF-8 encoding fits within ``max_bytes``.
+
+    Milvus enforces VARCHAR ``max_length`` in UTF-8 *bytes*, not characters.
+    A character-based slice (``text[:max_bytes]``) overflows for any non-ASCII
+    content, so encode, slice on the byte boundary, then drop any partial
+    trailing multibyte sequence via ``errors="ignore"``.
+    """
+    if text is None:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def non_vector_output_field_names(schema_fields: list) -> list[str]:
     """Scalar field names safe for Milvus ``search(..., output_fields=...)``.
 
@@ -161,7 +177,7 @@ class MilvusStore:
             chunk_ids.append(str(getattr(chunk, "chunk_id", ""))[:64])
             file_ids.append(file_id)
             text = getattr(chunk, "text", str(chunk))
-            texts.append(text[:_TEXT_MAX_LEN])
+            texts.append(truncate_to_bytes(text, _TEXT_MAX_LEN))
             embeddings.append(emb)
             pages.append(getattr(chunk, "page", 0))
             levels.append(getattr(chunk, "level", 0))

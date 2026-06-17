@@ -233,12 +233,15 @@ async def _run(args: argparse.Namespace) -> int:
 
         sem = asyncio.Semaphore(args.workers)
 
-        async def guarded(fp: Path) -> tuple[str, bool, str]:
+        total = len(files)
+
+        async def guarded(index: int, fp: Path) -> tuple[str, bool, str]:
             try:
                 rel = fp.relative_to(root)
             except ValueError:
                 return (str(fp), False, "不在 root 之下")
             async with sem:
+                print(f"[{index}/{total}] 正在导入 {rel.as_posix()}", flush=True)
                 return await _upload_one(
                     client,
                     api_base,
@@ -252,7 +255,9 @@ async def _run(args: argparse.Namespace) -> int:
                 )
 
         ok, fail = 0, 0
-        for coro in asyncio.as_completed([guarded(f) for f in files]):
+        for coro in asyncio.as_completed(
+            [guarded(index, f) for index, f in enumerate(files, start=1)]
+        ):
             rel, success, msg = await coro
             if success:
                 ok += 1
