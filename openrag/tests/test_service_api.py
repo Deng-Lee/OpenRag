@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -15,6 +16,7 @@ from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
 from openrag.models import Base, DocumentChunk, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
 from openrag.security import hash_password
+from openrag.services.file_ingest import ensure_directory_path
 from openrag.services.preview_token_service import decode_preview_token
 from openrag.storage.minio_storage import MinioStorage
 
@@ -985,3 +987,46 @@ def test_service_replace_document_200(
     assert r.status_code == 200
     assert r.json()["path"] == "/rep.txt"
     assert r.json().get("task_id") is not None
+
+
+def test_ensure_directory_path_creates_nested_dirs(db: Session, workspace: Workspace, owner: User) -> None:
+    leaf = ensure_directory_path(db, workspace, "/personal/u1/kb1")
+    assert leaf.uri == "/personal/u1/kb1"
+    assert leaf.is_directory is True
+    for uri in ("/", "/personal", "/personal/u1", "/personal/u1/kb1"):
+        row = (
+            db.query(File)
+            .filter(File.workspace_id == workspace.id, File.uri == uri, File.is_directory.is_(True))
+            .first()
+        )
+        assert row is not None, f"missing directory row {uri}"
+
+
+def test_ensure_directory_path_is_idempotent(db: Session, workspace: Workspace, owner: User) -> None:
+    ensure_directory_path(db, workspace, "/a/b")
+    ensure_directory_path(db, workspace, "/a/b")
+    for uri in ("/a", "/a/b"):
+        count = (
+            db.query(File)
+            .filter(File.workspace_id == workspace.id, File.uri == uri)
+            .count()
+        )
+        assert count == 1, f"{uri} duplicated: {count} rows"
+
+
+def test_ensure_directory_path_seeds_root(db: Session, workspace: Workspace, owner: User) -> None:
+    assert (
+        db.query(File).filter(File.workspace_id == workspace.id, File.uri == "/").first()
+        is None
+    )
+    ensure_directory_path(db, workspace, "/x")
+    root = db.query(File).filter(File.workspace_id == workspace.id, File.uri == "/").first()
+    assert root is not None and root.is_directory is True
+
+
+def test_ensure_directory_path_rejects_file_in_path(db: Session, workspace: Workspace, owner: User) -> None:
+    db.add(File(uri="/a", name="a", owner_id=owner.id, workspace_id=workspace.id, is_directory=False, size=3))
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        ensure_directory_path(db, workspace, "/a/b")
+    assert exc.value.status_code == 409
