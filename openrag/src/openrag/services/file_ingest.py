@@ -415,6 +415,13 @@ def ingest_new_file(
             _assert_parent_directory_exists(db, workspace.id, parent_logical_path)
 
         validated_path = validate_path(parent_logical_path)
+        if not require_parent_dir:
+            # Auto-create the parent directory chain so the directory tree (web
+            # lazy-load and the service-token /tree, /children endpoints) can show
+            # these folders. Idempotent + concurrency-safe; mirrors the create_dirs
+            # path in service_api. Runs before the file row is written, so a failure
+            # here aborts the upload without leaving a parentless "orphan" file.
+            ensure_directory_path(db, workspace, validated_path)
         file_uri = build_file_uri(validated_path, upload_filename)
 
         existing_file = (
