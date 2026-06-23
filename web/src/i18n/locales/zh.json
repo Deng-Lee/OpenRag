@@ -218,7 +218,21 @@
       "select_dir": "选择目录",
       "modal_title": "选择上传目录",
       "root": "根目录 (/)",
-      "path_tip": "从当前工作区的目录树中选择；默认与左侧选中的目录一致。"
+      "path_tip": "从当前工作区的目录树中选择；默认与左侧选中的目录一致。",
+      "drag_hint": "点击上传单个文件，或将文件/文件夹拖拽到此处（文件夹会保持目录结构）",
+      "progress": "正在上传 {{done}}/{{total}}",
+      "summary": "上传完成：成功 {{uploaded}}，跳过 {{skipped}}，失败 {{failed}}",
+      "tag_failed": "失败",
+      "tag_skipped": "跳过",
+      "uploading_busy": "正在上传中，请等待当前任务完成",
+      "no_workspace": "请先选择工作区",
+      "empty_folder": "空文件夹不支持上传",
+      "no_uploadable": "没有可上传的文件（已全部过滤）",
+      "skip_junk": "隐藏/系统文件，已跳过",
+      "skip_unsupported": "不支持的类型{{ext}}，已跳过",
+      "skip_too_large": "超过 100MB，已跳过",
+      "skip_duplicate": "已存在，已跳过",
+      "upload_failed": "上传失败（{{code}}）"
     },
     "fields": {
       "parser_type": "解析器类型",

@@ -218,7 +218,21 @@
       "select_dir": "Choose folder",
       "modal_title": "Choose upload folder",
       "root": "Root (/)",
-      "path_tip": "Pick a folder from the workspace tree; defaults to the folder selected in the left panel."
+      "path_tip": "Pick a folder from the workspace tree; defaults to the folder selected in the left panel.",
+      "drag_hint": "Click to upload a single file, or drag files/a folder here (folder structure is preserved)",
+      "progress": "Uploading {{done}}/{{total}}",
+      "summary": "Done: {{uploaded}} uploaded, {{skipped}} skipped, {{failed}} failed",
+      "tag_failed": "Failed",
+      "tag_skipped": "Skipped",
+      "uploading_busy": "An upload is in progress; please wait for it to finish",
+      "no_workspace": "Please select a workspace first",
+      "empty_folder": "Empty folders cannot be uploaded",
+      "no_uploadable": "No uploadable files (all filtered out)",
+      "skip_junk": "Hidden/system file, skipped",
+      "skip_unsupported": "Unsupported type {{ext}}, skipped",
+      "skip_too_large": "Exceeds 100MB, skipped",
+      "skip_duplicate": "Already exists, skipped",
+      "upload_failed": "Upload failed ({{code}})"
     },
     "fields": {
       "parser_type": "Parser Type",
