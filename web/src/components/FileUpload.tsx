@@ -1,11 +1,26 @@
-import { useState, useEffect, useMemo } from 'react';
-import { Upload, message, Select, Space, Card, Form, Input, Button, Modal, Tree } from 'antd';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { Upload, message, Select, Space, Card, Form, Input, Button, Modal, Tree, Progress, List } from 'antd';
 import { InboxOutlined, FolderOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { useTranslation } from 'react-i18next';
 import { filesAPI } from '../services/api';
 import type { DocumentType, File } from '../types';
+import {
+  precheck,
+  remoteParentDir,
+  isDuplicateError,
+  walkEntry,
+  type PickedFile,
+  type SkipReason,
+} from '../utils/folderUpload';
+
+type ItemStatus = 'uploaded' | 'skipped' | 'failed';
+interface ItemResult {
+  rel: string;
+  status: ItemStatus;
+  reason?: string;
+}
 
 const { Dragger } = Upload;
 const { Option } = Select;
@@ -131,6 +146,156 @@ export default function FileUpload({
     [fetchedFiles, t]
   );
 
+  // —— 文件夹拖拽上传：在现有上传区 drop 时自动识别目录并接管（不动 input、不加 directory:true）——
+  const uploadPathRef = useRef(uploadPath);
+  const workspaceIdRef = useRef(workspaceId);
+  const documentTypeRef = useRef(documentType);
+  const uploadingRef = useRef(false); // 重入锁：同步读写，不靠 effect
+  const runFolderUploadRef = useRef<(items: PickedFile[]) => Promise<void>>(async () => {});
+  const dropZoneRef = useRef<HTMLDivElement>(null);
+  const [folderProgress, setFolderProgress] = useState<{ total: number; done: number } | null>(null);
+
+  // 渲染期同步赋值——事件触发时一定拿到最新闭包/值
+  uploadPathRef.current = uploadPath;
+  workspaceIdRef.current = workspaceId;
+  documentTypeRef.current = documentType;
+
+  const skipReasonText = (reason: SkipReason, ext?: string): string => {
+    if (reason === 'unsupported') return t('files.upload.skip_unsupported', { ext: ext ? `.${ext}` : '' });
+    if (reason === 'too_large') return t('files.upload.skip_too_large');
+    return t('files.upload.skip_junk');
+  };
+
+  // 命令式 Modal：脱离组件树，父级上传弹窗关闭后汇总仍可见
+  const showFolderSummary = (
+    counts: { uploaded: number; skipped: number; failed: number },
+    results: ItemResult[]
+  ) => {
+    const detail = results.filter((r) => r.status !== 'uploaded');
+    Modal.info({
+      title: t('files.upload.summary', counts),
+      width: 520,
+      content: detail.length ? (
+        <div style={{ maxHeight: 320, overflow: 'auto' }}>
+          <List
+            size="small"
+            dataSource={detail}
+            renderItem={(r) => (
+              <List.Item>
+                <span style={{ color: r.status === 'failed' ? '#cf1322' : '#8c8c8c' }}>
+                  [{r.status === 'failed' ? t('files.upload.tag_failed') : t('files.upload.tag_skipped')}] {r.rel}
+                  {r.reason ? ` — ${r.reason}` : ''}
+                </span>
+              </List.Item>
+            )}
+          />
+        </div>
+      ) : null,
+    });
+  };
+
+  async function runFolderUpload(items: PickedFile[]) {
+    if (uploadingRef.current) return;
+    uploadingRef.current = true; // 同步占锁，关闭防重入窗口
+    try {
+      if (items.length === 0) {
+        message.info(t('files.upload.empty_folder'));
+        return;
+      }
+      const { accepted, skipped } = precheck(items);
+      const results: ItemResult[] = skipped.map((s) => ({
+        rel: s.rel,
+        status: 'skipped' as const,
+        reason: skipReasonText(s.reason, s.ext),
+      }));
+      if (accepted.length === 0) {
+        message.info(t('files.upload.no_uploadable'));
+        showFolderSummary({ uploaded: 0, skipped: results.length, failed: 0 }, results);
+        return;
+      }
+
+      const total = accepted.length;
+      let done = 0;
+      let cursor = 0;
+      setUploading(true);
+      setFolderProgress({ total, done });
+
+      const CONCURRENCY = 5;
+      const worker = async () => {
+        while (cursor < accepted.length) {
+          const it = accepted[cursor++];
+          const path = remoteParentDir(uploadPathRef.current, it.relativePath);
+          try {
+            await filesAPI.upload(it.file, 'auto', workspaceIdRef.current, path, documentTypeRef.current);
+            results.push({ rel: it.relativePath, status: 'uploaded' });
+          } catch (error: unknown) {
+            const err = error as { response?: { status?: number; data?: { detail?: string } } };
+            const code = err.response?.status;
+            const detailMsg = String(err.response?.data?.detail ?? '');
+            if (isDuplicateError(code, detailMsg)) {
+              results.push({ rel: it.relativePath, status: 'skipped', reason: t('files.upload.skip_duplicate') });
+            } else {
+              results.push({
+                rel: it.relativePath,
+                status: 'failed',
+                reason: detailMsg || t('files.upload.upload_failed', { code: code ?? '-' }),
+              });
+            }
+          } finally {
+            done++;
+            setFolderProgress({ total, done });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker()));
+
+      const counts = {
+        uploaded: results.filter((r) => r.status === 'uploaded').length,
+        skipped: results.filter((r) => r.status === 'skipped').length,
+        failed: results.filter((r) => r.status === 'failed').length,
+      };
+      showFolderSummary(counts, results);
+      onUploadSuccess();
+    } finally {
+      uploadingRef.current = false;
+      setUploading(false);
+      setFolderProgress(null);
+    }
+  }
+  runFolderUploadRef.current = runFolderUpload;
+
+  // capture 阶段拦截 drop：含目录则接管，先于 rc-upload 执行
+  useEffect(() => {
+    const el = dropZoneRef.current;
+    if (!el) return;
+    const onDrop = (e: DragEvent) => {
+      const items = Array.from(e.dataTransfer?.items ?? []);
+      const entries = items
+        .map((it) => (it as unknown as { webkitGetAsEntry?: () => unknown }).webkitGetAsEntry?.() ?? null)
+        .filter(Boolean) as Array<{ isDirectory?: boolean }>;
+      const hasDirectory = entries.some((en) => en?.isDirectory);
+      if (!hasDirectory) return; // 纯文件 / 旧浏览器无法识别目录 → 交给现有单文件链路
+
+      e.preventDefault();
+      e.stopPropagation();
+      if (uploadingRef.current) {
+        message.warning(t('files.upload.uploading_busy'));
+        return;
+      }
+      if (!workspaceIdRef.current) {
+        message.warning(t('files.upload.no_workspace'));
+        return;
+      }
+      void (async () => {
+        const picked: PickedFile[] = [];
+        for (const en of entries) await walkEntry(en, '', picked);
+        await runFolderUploadRef.current(picked);
+      })();
+    };
+    el.addEventListener('drop', onDrop, { capture: true });
+    return () => el.removeEventListener('drop', onDrop, { capture: true } as EventListenerOptions);
+  }, [t]);
+
   const props: UploadProps = {
     name: 'file',
     multiple: false,
@@ -213,13 +378,25 @@ export default function FileUpload({
           </Form.Item>
         </Form>
 
-        <Dragger {...props}>
-          <p className="ant-upload-drag-icon">
-            <InboxOutlined />
-          </p>
-          <p className="ant-upload-text">点击或拖拽文件到此处上传</p>
-          <p className="ant-upload-hint">支持 PDF、Word、Excel、PPT、TXT、Markdown 等格式</p>
-        </Dragger>
+        <div ref={dropZoneRef}>
+          <Dragger {...props}>
+            <p className="ant-upload-drag-icon">
+              <InboxOutlined />
+            </p>
+            <p className="ant-upload-text">{t('files.upload.drag_hint')}</p>
+            <p className="ant-upload-hint">支持 PDF、Word、Excel、PPT、TXT、Markdown 等格式</p>
+          </Dragger>
+        </div>
+        {folderProgress && (
+          <Progress
+            percent={
+              folderProgress.total ? Math.round((folderProgress.done / folderProgress.total) * 100) : 0
+            }
+            format={() =>
+              t('files.upload.progress', { done: folderProgress.done, total: folderProgress.total })
+            }
+          />
+        )}
       </Space>
 
       <Modal
