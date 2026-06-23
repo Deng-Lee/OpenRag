@@ -12,15 +12,15 @@
 ----
 - **幂等**：可反复运行；已存在的目录不会重复创建。
 - **安全**：默认 dry-run（只预览、不写库）；必须显式 ``--apply`` 才写入。
-- **一致**：复用应用自身的 ``ensure_directory_path``（与上传 / 新建目录同一套
-  路径校验、并发处理、提交语义），不手写 SQL。
+- **版本健壮**：新版本若存在 ``ensure_directory_path`` 就复用它；旧版本（如 1.1.x，
+  尚无该函数）自动回退为**直接按 File 模型建目录行**——两条路结果一致。
 - **离线**：仅依赖**已安装的 openrag 包 + Python 标准库**，无需联网、无需 pip
-  安装——可直接在已部署的 api / worker 容器内运行（内网友好）。
+  安装——可直接在已部署的 api / worker 容器（或 K8s Pod）内运行（内网友好）。
 
 数据库
 ------
 复用应用配置（``POSTGRES_*`` 环境变量 / ``docker/.env`` / ``openrag/.env``），
-与 api / worker 同一个库。在容器内运行时无需额外配置。
+与 api / worker 同一个库。在容器 / Pod 内运行时无需额外配置。
 
 用法（详见 docs/2026-06-23-backfill-runbook.md）
 -----------------------------------------------
@@ -37,18 +37,22 @@ from __future__ import annotations
 import argparse
 from typing import List, Set
 
-from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 
 from openrag.database import SessionLocal, get_engine
 from openrag.models.file import File
 from openrag.models.workspace import Workspace
-from openrag.services.file_ingest import ensure_directory_path
+
+# 新版本走应用自身的 mkdir -p；旧版本（无此函数）回退到 _create_dir_row_inline。
+try:
+    from openrag.services.file_ingest import ensure_directory_path  # type: ignore
+except Exception:  # pragma: no cover - 取决于部署版本
+    ensure_directory_path = None  # type: ignore
 
 
 def _ancestor_dirs(file_uri: str) -> List[str]:
     """该文件 uri 需要的所有祖先目录路径（不含根 ``/``），由浅到深。
 
-    与 ``ensure_directory_path`` 内部一致：取父目录、按 ``/`` 切段累积。
     例：``/a/b/c.md`` -> ``['/a', '/a/b']``。
     """
     u = (file_uri or "").replace("\\", "/")
@@ -62,7 +66,6 @@ def _ancestor_dirs(file_uri: str) -> List[str]:
 
 
 def _immediate_parent(file_uri: str) -> str:
-    """文件的直接父目录逻辑路径；根下文件返回 ``/``。"""
     u = (file_uri or "").replace("\\", "/")
     parent = u.rsplit("/", 1)[0]
     return parent or "/"
@@ -75,6 +78,27 @@ def _existing_dir_uris(db, workspace_id: int) -> Set[str]:
             File.workspace_id == workspace_id, File.is_directory.is_(True)
         )
     }
+
+
+def _create_dir_row_inline(db, ws: Workspace, uri: str) -> None:
+    """旧版本回退：直接建一行目录。复用部署版 File 模型的列默认值。
+
+    每行独立提交，重复（唯一约束冲突）则跳过——天然幂等。
+    """
+    name = uri.rsplit("/", 1)[-1] or "root"  # 根 "/" 用 name="root"
+    row = File(
+        uri=uri,
+        name=name,
+        owner_id=ws.owner_id,
+        workspace_id=ws.id,
+        is_directory=True,
+        size=0,
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # 已存在 / 并发创建 → 跳过
 
 
 def _target_workspaces(db, workspace_ids: List[int], all_workspaces: bool) -> List[Workspace]:
@@ -100,25 +124,32 @@ def process_workspace(db, ws: Workspace, apply: bool) -> dict:
     missing = sorted(needed - existing_dirs)
     # 应为目录的路径已被同名「文件」占用 → 无法建目录，需人工确认
     conflicts = sorted(d for d in missing if d in file_uris)
+    creatable = [d for d in missing if d not in file_uris]
 
+    mode_note = "" if ensure_directory_path is not None else "  [回退: 直接建目录行]"
     print(
         f"[ws {ws.id} / {ws.slug}] 文件 {len(files)} 个, "
-        f"已有目录 {len(existing_dirs)} 个, 缺失目录 {len(missing)} 个"
+        f"已有目录 {len(existing_dirs)} 个, 缺失目录 {len(missing)} 个{mode_note}"
     )
     for m in missing:
-        flag = "   <= 冲突: 已被同名文件占用" if m in file_uris else ""
+        flag = "   <= 冲突: 已被同名文件占用，跳过" if m in file_uris else ""
         print(f"    + {m}{flag}")
 
     created = 0
     skipped: List[tuple] = []
-    if apply:
-        # 对每个不同的「直接父目录」调用 mkdir -p；幂等地建出所有缺失祖先。
-        parents = sorted({_immediate_parent(f.uri) for f in files} - {"/"})
-        for p in parents:
-            try:
-                ensure_directory_path(db, ws, p)
-            except HTTPException as exc:  # 409 路径被文件占用 / 503 持续争用
-                skipped.append((p, str(exc.detail)))
+    if apply and creatable:
+        if ensure_directory_path is not None:
+            # 新版本：对每个不同的「直接父目录」调用 mkdir -p（建全部缺失祖先）。
+            parents = sorted({_immediate_parent(f.uri) for f in files} - {"/"})
+            for p in parents:
+                try:
+                    ensure_directory_path(db, ws, p)
+                except Exception as exc:  # HTTPException(409 占用 / 503 争用) 等
+                    skipped.append((p, getattr(exc, "detail", str(exc))))
+        else:
+            # 旧版本：浅到深直接建目录行。
+            for uri in sorted(creatable, key=lambda u: u.count("/")):
+                _create_dir_row_inline(db, ws, uri)
         created = len(_existing_dir_uris(db, ws.id) - existing_dirs)
         tail = f", 跳过 {len(skipped)} 个" if skipped else ""
         print(f"    => 实际创建目录 {created} 个{tail}")
@@ -153,7 +184,8 @@ def main() -> int:
     SessionLocal.configure(bind=get_engine())
     db = SessionLocal()
     mode = "APPLY（写库）" if args.apply else "DRY-RUN（仅预览）"
-    print(f"== 回填目录行 [{mode}] ==")
+    backend = "ensure_directory_path" if ensure_directory_path is not None else "inline（旧版本回退）"
+    print(f"== 回填目录行 [{mode}] 建目录方式: {backend} ==")
     try:
         workspaces = _target_workspaces(db, args.workspace_ids or [], args.all_workspaces)
         if not workspaces:

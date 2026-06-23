@@ -11,6 +11,18 @@
 - **数据库自动复用应用配置**（`POSTGRES_*` 环境变量 / `docker/.env` / `openrag/.env`），与 api / worker 同库。**在容器内运行时零额外配置**。
 - **默认 dry-run**（只预览不写库）；必须显式加 `--apply` 才写入。
 - **幂等**：可反复运行，已存在目录不会重复创建。
+- **兼容旧版本**：新版本复用应用的 `ensure_directory_path`；旧版本（如 1.1.x 尚无该函数）自动回退为「直接建目录行」，无需任何改动。
+
+### K8s 部署用 kubectl（命令对照）
+
+| docker | kubectl（命名空间 `openrag`） |
+|---|---|
+| `docker ps` | `kubectl -n openrag get pods` |
+| `docker cp f api:/dst` | `kubectl cp f openrag/<pod>:/dst -c api`（slim 镜像无 tar 时用 `kubectl exec -i <pod> -c api -- sh -c 'cat>/dst' < f`） |
+| `docker exec api -- ...` | `kubectl -n openrag exec <pod> -c api -- ...` |
+| `pg_dump`（postgres 容器） | `kubectl -n openrag exec postgres-0 -c postgres -- pg_dump ...` |
+
+> 锁定一个 api Pod 并 cp/exec 用同一个：`API_POD=$(kubectl -n openrag get pod -l app=openrag-api -o jsonpath='{.items[0].metadata.name}')`。回填写共享库，任一 Pod 跑一次即可。
 
 参数：
 
