@@ -2,6 +2,12 @@
 
 > 配合 [Kubernetes 部署说明（更新版）](02-Kubernetes部署-update.md) 使用。本文只讲**本次代码改动的最小化增量部署**：构建并滚动更新 **api 一个镜像**，其余镜像全部复用。
 
+> **范围说明（重要）**：本文修的是**后端目录问题**（你最初报的"目录树不显示"），只需 api。
+> 但合并后的 `main` **同时**包含了 PR #11 的**前端文件夹拖拽上传**（改了 `web/`）。
+> - 只想修目录树 bug（你的诉求）→ **api-only**，照本文做即可，web 复用旧镜像。
+> - 想要完整最新 main（含拖拽上传 UI）→ 还要**额外重建 web 镜像**，见文末「可选：同时上 web」。
+> 内网当前是 1.1.3，两者都还没有；二选一取决于你是否需要那个前端 UI。
+
 ## 为什么只动 api（最大化复用）
 
 本次改动只有 `openrag/src/openrag/services/file_ingest.py` 一个文件（上传时建目录行）。因此：
@@ -10,7 +16,7 @@
 |---|---|---|
 | `openrag/api` | **是** | 上传入口 `ingest_new_file` 在 api 进程里运行，改动在此 |
 | `openrag/task-worker` | 否（复用） | worker 不调用 `ingest_new_file`，行为不变；可继续用旧 tag |
-| `openrag/web` | 否（复用） | 本次无任何前端改动 |
+| `openrag/web` | 否（复用）* | **本次目录修复**无前端改动。*注：latest main 另含 PR #11 前端拖拽上传，想要它则 web 也要重建（见文末） |
 | 第三方镜像（postgres / milvus / etcd / minio / es / busybox） | 否（复用） | 完全未变，已在 Harbor 与节点上 |
 
 **因此整套增量 = 构建 1 个镜像 + 推 1 个镜像 + 改 1 个 tag + 滚动 1 个 Deployment。**
@@ -127,6 +133,18 @@ kubectl -n openrag rollout undo deployment/openrag-api
 #   kubectl -n openrag set image deployment/openrag-api api=$HARBOR/$HARBOR_PROJECT/api:1.1.3
 ```
 
-## 可选：让 worker / web 也对齐到新 tag
+## 可选：同时上 web（要 PR #11 的前端拖拽上传才需要）
 
-非必需（本次它们内容/行为不变）。若团队要求三套业务镜像 tag 一致，再按 [部署文档](02-Kubernetes部署-update.md) §A/§B 一并构建、推送 worker/web 的新 tag，并在 overlay 里同步三者 newTag 后 `apply -k`。
+latest main 的 `web/` 因 PR #11 **确实变了**（新增"拖文件夹自动上传"）。**只修目录树 bug 不需要它**；若你也想要这个 UI：
+
+```powershell
+# 构建机：用同一个 NEWTAG 额外构建 web
+docker build --build-arg NPM_PROXY=$env:BUILD_PROXY --build-arg NPM_REGISTRY=$env:NPM_REGISTRY -f docker/Dockerfile.web -t "openrag/web:$($env:NEWTAG)" .
+docker save -o "openrag-web-$($env:NEWTAG).tar" "openrag/web:$($env:NEWTAG)"
+```
+传输 / `docker load` / 推 Harbor（`web:$NEWTAG`）同 api；然后在 overlay 里把 `openrag/web` 的 `newTag` 也改成 `$NEWTAG`，`apply -k` 后多滚动一个：
+```bash
+kubectl -n openrag rollout status deployment/openrag-web --timeout=600s
+```
+
+`task-worker` 仍**无需**重建（本次无 worker 相关改动）；若团队强制三套业务镜像 tag 一致，再按 [部署文档](02-Kubernetes部署-update.md) §A/§B 一并处理。
