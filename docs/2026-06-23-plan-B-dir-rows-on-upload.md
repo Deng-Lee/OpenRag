@@ -35,7 +35,7 @@
 1. **先写失败测试（后端）**：
    - *建目录*：新空间，`ingest_new_file(parent_logical_path="/a/b", require_parent_dir=False, ...)`；断言落库后存在 `/a`、`/a/b` 两行且 `is_directory=true`，文件行 `uri="/a/b/<name>"`。
    - *幂等*：同目录再 ingest 另一文件；断言不重复建目录、无异常。
-   - *严格模式不回归*：`require_parent_dir=True` 且父目录缺失 → 仍 404。
+   - *严格模式不回归*：`require_parent_dir=True` 且父目录缺失 → 仍 400（`_assert_parent_directory_exists` 现有行为）。
    - *根目录上传*：`parent_logical_path="/"` → 不应新增除根外的目录行。
 2. **实现**：在 `require_parent_dir=False` 分支加入 `ensure_directory_path` 调用（传父目录逻辑路径）。
 3. **回归**：跑既有 upload / service upload / `test_workspace_file_tree` 等测试。
