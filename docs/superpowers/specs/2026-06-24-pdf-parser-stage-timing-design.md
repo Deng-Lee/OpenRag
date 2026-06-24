@@ -175,6 +175,14 @@ finally:
 - 不动 `parse_into_bboxes`。
 - 不把 `file_path` 加进 trace context（只在埋点里带）。
 
+### 4.6 增强：profile 也落 `parse.document` trace span（DB 可查，2026-06-24 追加）
+
+在"只打日志"之外，额外把本次解析的 profile 子集 `{total_ms, page_count, n_tables, status, stages}` 写进**既有** `parse.document` trace span 的 `output_summary`（不新建 TraceRun/TraceSpan，只给已有 span 加字段）。
+
+- 链路：`RAGFlowPdfParser._emit_parse_profile` 把 rec 存到 `self._last_parse_profile` → `PDFParserAdapter` 解析后读到 `self.last_parse_profile` → `document_processor._parse_span_profile(parser)` 取干净子集 → 加到 `parse.document` span 的 `output_summary["pdf_stage_profile"]`（非 PDF parser 返回 None，不加该字段）。
+- 查询：`GET /traces?file_id=<id>` 拿 trace_id → `GET /traces/{trace_id}` → 找 `stage="parse.document"` 的 span → `output_summary.pdf_stage_profile`。
+- 好处：有界（一文件一份 JSON）、可查、不随上传量堆日志文件。
+
 ## 5. 受影响文件
 
 - `openrag/src/openrag/parsers/ragflow/parser/pdf_parser.py`

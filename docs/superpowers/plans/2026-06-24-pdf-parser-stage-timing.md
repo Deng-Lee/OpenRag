@@ -669,6 +669,21 @@ Claude 修改后的方案比上一版更可执行，主体设计可以接受。�
 
 ---
 
+## 增强：profile 落 parse.document span（2026-06-24，分支 feat/pdf-parser-stage-timing）
+
+应需求（"不靠日志文件、能从 DB 捞每文件各阶段耗时"），在日志埋点之外把 profile 持久化到既有 `parse.document` trace span 的 `output_summary`。
+
+- 改动（TDD，11 条新测试全绿）：
+  - `RAGFlowPdfParser._emit_parse_profile`：额外 `self._last_parse_profile = rec`（`__call__` 入口初始化为 None）。
+  - `PDFParserAdapter`：`__init__` 加 `self.last_parse_profile=None`；`_parse_ragflow_with_tables` 解析成功后 `self.last_parse_profile = getattr(self.ragflow_parser, "_last_parse_profile", None)`。
+  - `document_processor._parse_span_profile(parser)`：取 `{total_ms,page_count,n_tables,status,stages}` 干净子集（非 PDF parser → None）；`process_document` 把它加到 `parse.document` span 的 `output_summary["pdf_stage_profile"]`。
+- 测试：`test_pdf_parse_timing.py::test_call_stores_last_parse_profile` + `test_parse_profile_persistence.py`（adapter 暴露、helper 三态）。
+- 查询：`GET /traces?file_id=<id>` → `GET /traces/{trace_id}` → `stage="parse.document"` 的 span → `output_summary.pdf_stage_profile`。
+- **范围说明**：这一步有意**扩展**了原计划"只打日志、不写 trace"的边界，但只给**既有** span 加字段，不新建 TraceRun/TraceSpan。
+- 提交：`feat(pdf): persist per-stage parse profile into parse.document trace span`（3c98c4e）。
+
+---
+
 ## Codex 三次评审结果（2026-06-24）
 
 来源：Codex 对 Claude Code 再次修改后的当前 plan、spec 与工作区状态进行第三轮静态审查。本节仅追加在文件末尾，未修改前文、spec 或代码。
