@@ -1,7 +1,7 @@
 # PDF Parser 阶段计时埋点 — 设计文档
 
 - 日期：2026-06-24
-- 状态：待评审（Design）
+- 状态：已实现（Implemented，见 docs/superpowers/plans/2026-06-24-pdf-parser-stage-timing.md；分支 feat/pdf-parser-stage-timing）
 - 范围：`RAGFlowPdfParser.__call__` 解析路径的阶段级计时日志
 
 ## 1. 背景与目标

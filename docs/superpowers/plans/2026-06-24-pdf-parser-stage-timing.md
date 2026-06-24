@@ -349,7 +349,9 @@ git commit -m "feat(pdf): add _emit_parse_profile summary line for parse timing"
 def _stub_all_stages(p, tbls=None):
     """Replace the 8 stage methods with no-op stubs (name-mangled dunders included)."""
     tbls = tbls if tbls is not None else []
-    p._RAGFlowPdfParser__images__ = lambda *a, **k: None
+    # __images__ has two trailing underscores -> NOT name-mangled -> attr is "__images__".
+    # __filterout_scraps has no trailing underscore -> mangled.
+    setattr(p, "__images__", lambda *a, **k: None)
     p._layouts_rec = lambda *a, **k: None
     p._table_transformer_job = lambda *a, **k: None
     p._text_merge = lambda *a, **k: None
@@ -655,6 +657,15 @@ Claude 修改后的方案比上一版更可执行，主体设计可以接受。�
 5. **adapter 级冒烟**：维持「非必需但有价值」，已在「实现注意点 #8」记录；`__call__` 级单测足以验证埋点主逻辑。
 
 方案主体不变：上下文管理器包裹 `__call__` 的 8 个阶段 + 结构化 JSON（字段 `file_path`）+ 分名 `pdf.<stage>` logger + `finally` 汇总；范围仍限「仅 8 个阶段计时埋点」，不扩到 `parse_into_bboxes` / 其它 PDF 入口 / 全局 logging。
+
+---
+
+## 执行记录（2026-06-24，分支 feat/pdf-parser-stage-timing）
+
+- 已按 Task 1→4 落地（TDD 小步：先写失败测试 → 跑红 → 实现 → 跑绿 → 提交）。新增 `openrag/tests/test_pdf_parse_timing.py` 共 6 条单测全绿：`python -m pytest tests/test_pdf_parse_timing.py -v` → 6 passed。
+- 提交序列：`docs(pdf): add stage-timing spec and implementation plan` → `feat(pdf): add _stage timing context manager ...` → `feat(pdf): add _emit_parse_profile ...` → `feat(pdf): instrument __call__ with per-stage timing logs + profile`。
+- **TDD 修正**：`__images__` 有**双下划线后缀**，按 Python 规则**不**参与名字改写；测试 stub 由 `p._RAGFlowPdfParser__images__` 改为 `setattr(p, "__images__", ...)`。`__filterout_scraps`（无尾下划线）仍按 `_RAGFlowPdfParser__filterout_scraps` 改写。`pdf_parser.py` 内 `__call__` 调用两者均正常（同类内）。
+- **既有失败（非本次引入）**：`tests/test_pdf_parser_resilience.py::test_images_handles_pdfplumber_failure_without_missing_attrs` 在 **main 基线 a34b2e0 同样失败**（已切到基线 parser 复跑核实）。根因：`__images__` 在 pdfplumber 早失败时未把 `page_chars`/`page_images` 初始化为 `[]`，到末尾 `is_english` 推导处崩 `AttributeError`。与本次埋点无关、未在本任务修复（如需，可单开任务在 `__images__` 顶部加默认初始化）。`tests/test_pdf_position_tags.py` 全绿。
 
 ---
 
