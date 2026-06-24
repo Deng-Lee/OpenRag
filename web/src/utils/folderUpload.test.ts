@@ -6,7 +6,9 @@ import {
   precheck,
   isDuplicateError,
   walkEntry,
+  filenameBytes,
   MAX_FILE_SIZE,
+  MAX_FILENAME_BYTES,
   type PickedFile,
 } from './folderUpload';
 
@@ -109,16 +111,52 @@ describe('precheck', () => {
     expect(skipped).toEqual([{ rel: 'f/big.pdf', reason: 'too_large' }]);
   });
 
+  it('skips files whose name exceeds the byte limit (ASCII)', () => {
+    const longLeaf = 'a'.repeat(MAX_FILENAME_BYTES - 3) + '.pdf'; // 197 + 4 = 201 bytes
+    const rel = `f/${longLeaf}`;
+    const { accepted, skipped } = precheck([{ file: fakeFile(10), relativePath: rel }]);
+    expect(accepted).toHaveLength(0);
+    expect(skipped).toEqual([{ rel, reason: 'name_too_long' }]);
+  });
+
+  it('skips over-long unicode names by bytes, not characters', () => {
+    const longLeaf = '中'.repeat(66) + '.pdf'; // 198 + 4 = 202 bytes; only 70 chars
+    const rel = `f/${longLeaf}`;
+    const { skipped } = precheck([{ file: fakeFile(10), relativePath: rel }]);
+    expect(skipped).toEqual([{ rel, reason: 'name_too_long' }]);
+  });
+
+  it('accepts a name whose byte length is exactly the limit', () => {
+    const leaf = 'a'.repeat(MAX_FILENAME_BYTES - 4) + '.pdf'; // 196 + 4 = 200 bytes
+    const { accepted, skipped } = precheck([{ file: fakeFile(10), relativePath: `f/${leaf}` }]);
+    expect(accepted).toHaveLength(1);
+    expect(skipped).toHaveLength(0);
+  });
+
   it('partitions a mixed batch', () => {
     const items: PickedFile[] = [
       { file: fakeFile(10), relativePath: 'f/a.pdf' },
       { file: fakeFile(10), relativePath: 'f/__MACOSX/b.pdf' },
       { file: fakeFile(10), relativePath: 'f/c.png' },
       { file: fakeFile(MAX_FILE_SIZE + 1), relativePath: 'f/d.pdf' },
+      { file: fakeFile(10), relativePath: `f/${'e'.repeat(201)}.pdf` },
     ];
     const { accepted, skipped } = precheck(items);
     expect(accepted.map((a) => a.relativePath)).toEqual(['f/a.pdf']);
-    expect(skipped.map((s) => s.reason)).toEqual(['junk', 'unsupported', 'too_large']);
+    expect(skipped.map((s) => s.reason)).toEqual([
+      'junk',
+      'unsupported',
+      'too_large',
+      'name_too_long',
+    ]);
+  });
+});
+
+describe('filenameBytes', () => {
+  it('counts UTF-8 bytes, not characters', () => {
+    expect(filenameBytes('abc')).toBe(3);
+    expect(filenameBytes('中')).toBe(3);
+    expect(filenameBytes('中文')).toBe(6);
   });
 });
 

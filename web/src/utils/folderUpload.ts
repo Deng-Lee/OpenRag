@@ -7,7 +7,7 @@ export interface PickedFile {
   relativePath: string;
 }
 
-export type SkipReason = 'junk' | 'unsupported' | 'too_large';
+export type SkipReason = 'junk' | 'unsupported' | 'too_large' | 'name_too_long';
 
 export interface SkippedItem {
   rel: string;
@@ -18,6 +18,15 @@ export interface SkippedItem {
 
 // 与后端 file_ingest.py:23 一致
 export const MAX_FILE_SIZE = 100 * 1024 * 1024;
+
+// 叶子文件名字节上限，与后端 file_ingest.py 的 MAX_FILENAME_BYTES 一致。
+// 后端 worker 落盘临时文件名受操作系统单分量 255 字节限制，按字节判断（中文每字 3 字节）。
+export const MAX_FILENAME_BYTES = 200;
+
+/** UTF-8 字节长度（与后端按字节判断一致；中文每字 3 字节）。 */
+export function filenameBytes(name: string): number {
+  return new TextEncoder().encode(name).length;
+}
 
 // 与后端 SUPPORTED_PARSER_TYPES / _EXTENSION_MIME_OVERRIDES 对齐
 export const SUPPORTED_EXTENSIONS = new Set([
@@ -74,6 +83,10 @@ export function precheck(items: PickedFile[]): { accepted: PickedFile[]; skipped
     }
     if (it.file.size > MAX_FILE_SIZE) {
       skipped.push({ rel, reason: 'too_large' });
+      continue;
+    }
+    if (filenameBytes(name) > MAX_FILENAME_BYTES) {
+      skipped.push({ rel, reason: 'name_too_long' });
       continue;
     }
     accepted.push(it);

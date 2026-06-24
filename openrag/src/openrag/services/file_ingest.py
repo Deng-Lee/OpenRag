@@ -21,6 +21,13 @@ from openrag.storage.minio_storage import MinioStorage
 from openrag.tracing.context import get_trace_context, reset_trace_context, set_trace_context
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+# Leaf filename byte budget. The worker downloads each file to a local temp path
+# named ``doc_{file_id}_{basename}`` (worker/task_worker.py), where a single path
+# component is capped at 255 bytes by the OS (ENAMETOOLONG). 200 leaves headroom
+# for the ``doc_{id}_`` prefix and keeps ``name`` within the 255-char DB column.
+# Counted in BYTES (not chars): non-ASCII names cost >1 byte/char in UTF-8.
+# Mirror this value in web/src/utils/folderUpload.ts (MAX_FILENAME_BYTES).
+MAX_FILENAME_BYTES = 200
 ALLOWED_MIME_TYPES = [
     "text/plain",
     "text/markdown",
@@ -390,6 +397,33 @@ def ingest_new_file(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+            )
+
+        # Reject over-long file names up front (before MinIO/DB writes) so the
+        # caller gets a clear 400 instead of a silent worker failure: the worker
+        # writes the file to a local temp path and the OS caps a single path
+        # component at 255 bytes (ENAMETOOLONG). Check the leaf component in bytes.
+        leaf_name = posixpath.basename((upload_filename or "").replace("\\", "/"))
+        filename_bytes = len(leaf_name.encode("utf-8"))
+        if filename_bytes > MAX_FILENAME_BYTES:
+            _safe_span(
+                trace_service,
+                "upload.validate",
+                input_summary={
+                    "filename": upload_filename,
+                    "workspace_id": workspace.id,
+                    "parser_type": parser_type,
+                    "document_type": normalized_document_type,
+                    "filename_bytes": filename_bytes,
+                },
+                error_message="filename_too_long",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"File name too long: {filename_bytes} bytes "
+                    f"(max {MAX_FILENAME_BYTES}). Please shorten the file name."
+                ),
             )
 
         file_size = len(file_content)

@@ -231,6 +231,7 @@
       "skip_junk": "Hidden/system file, skipped",
       "skip_unsupported": "Unsupported type {{ext}}, skipped",
       "skip_too_large": "Exceeds 100MB, skipped",
+      "skip_name_too_long": "File name too long (over 200 bytes), skipped",
       "skip_duplicate": "Already exists, skipped",
       "upload_failed": "Upload failed ({{code}})"
     },

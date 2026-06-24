@@ -231,6 +231,7 @@
       "skip_junk": "隐藏/系统文件，已跳过",
       "skip_unsupported": "不支持的类型{{ext}}，已跳过",
       "skip_too_large": "超过 100MB，已跳过",
+      "skip_name_too_long": "文件名过长（超 200 字节），已跳过",
       "skip_duplicate": "已存在，已跳过",
       "upload_failed": "上传失败（{{code}}）"
     },

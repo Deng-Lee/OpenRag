@@ -163,6 +163,7 @@ export default function FileUpload({
   const skipReasonText = (reason: SkipReason, ext?: string): string => {
     if (reason === 'unsupported') return t('files.upload.skip_unsupported', { ext: ext ? `.${ext}` : '' });
     if (reason === 'too_large') return t('files.upload.skip_too_large');
+    if (reason === 'name_too_long') return t('files.upload.skip_name_too_long');
     return t('files.upload.skip_junk');
   };
 
