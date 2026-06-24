@@ -191,3 +191,17 @@ def test_call_emits_profile_on_failure(caplog):
     profile = _json_events(caplog, "pdf_parse_profile")
     assert len(profile) == 1
     assert profile[0][1]["status"] == "error"
+
+
+def test_call_stores_last_parse_profile():
+    set_trace_context(task_id="tc", file_id=11)
+    p = _bare_parser()
+    _stub_all_stages(p, tbls=[("img", "tbl")])
+    RAGFlowPdfParser.__call__(p, "/tmp/doc_11_a.pdf")
+    prof = p._last_parse_profile
+    assert isinstance(prof, dict)
+    assert prof["status"] == "ok"
+    assert isinstance(prof["total_ms"], int)
+    assert prof["n_tables"] == 1
+    assert len(prof["stages"]) == 8
+    assert prof["file_path"] == "/tmp/doc_11_a.pdf"

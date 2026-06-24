@@ -2227,6 +2227,7 @@ class RAGFlowPdfParser:
                 "status": status,
                 "stages": list(getattr(self, "_stage_profile", []) or []),
             }
+            self._last_parse_profile = rec
             logging.getLogger(self._PARSE_PROFILE_LOGGER).info(
                 json.dumps(rec, ensure_ascii=False, default=str)
             )
@@ -2258,6 +2259,7 @@ class RAGFlowPdfParser:
 
         self._parse_file_path = fnm if isinstance(fnm, str) else "<bytes>"
         self._stage_profile = []
+        self._last_parse_profile = None
         parse_start = timer()
         overall_status = "ok"
         tbls = []
