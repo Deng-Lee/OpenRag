@@ -105,3 +105,28 @@ def test_stage_without_trace_context(caplog):
     assert d["task_id"] is None
     assert d["file_id"] is None
     assert d["status"] == "ok"
+
+
+def test_emit_parse_profile(caplog):
+    set_trace_context(task_id="t9", file_id=7)
+    p = _bare_parser()
+    p.page_images = [object(), object(), object()]
+    p._stage_profile = [
+        {"stage": "pdf.images_ocr", "duration_ms": 100},
+        {"stage": "pdf.layout_recognition", "duration_ms": 50},
+    ]
+    with caplog.at_level(logging.INFO, logger="pdf"):
+        p._emit_parse_profile(total_ms=200, n_tables=3, status="ok")
+    events = _json_events(caplog, "pdf_parse_profile")
+    assert len(events) == 1
+    name, d = events[0]
+    assert name == "pdf.parse_profile"
+    assert d["task_id"] == "t9"
+    assert d["file_id"] == 7
+    assert d["file_path"] == "/tmp/doc_7_report.pdf"
+    assert d["page_count"] == 3
+    assert d["total_ms"] == 200
+    assert d["n_tables"] == 3
+    assert d["status"] == "ok"
+    assert len(d["stages"]) == 2
+    assert d["stages"][0]["stage"] == "pdf.images_ocr"

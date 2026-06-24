@@ -2213,6 +2213,26 @@ class RAGFlowPdfParser:
             except Exception:  # pragma: no cover - never break parsing
                 pass
 
+    def _emit_parse_profile(self, total_ms, n_tables, status="ok"):
+        try:
+            ids = self._parse_ctx_ids()
+            rec = {
+                "evt": "pdf_parse_profile",
+                "task_id": ids.get("task_id"),
+                "file_id": ids.get("file_id"),
+                "file_path": ids.get("file_path"),
+                "page_count": self._safe_len(getattr(self, "page_images", None)),
+                "total_ms": total_ms,
+                "n_tables": n_tables,
+                "status": status,
+                "stages": list(getattr(self, "_stage_profile", []) or []),
+            }
+            logging.getLogger(self._PARSE_PROFILE_LOGGER).info(
+                json.dumps(rec, ensure_ascii=False, default=str)
+            )
+        except Exception:  # pragma: no cover - never break parsing
+            pass
+
     def __call__(
         self, fnm, need_image=True, zoomin=3, return_html=False, auto_rotate_tables=None
     ):
