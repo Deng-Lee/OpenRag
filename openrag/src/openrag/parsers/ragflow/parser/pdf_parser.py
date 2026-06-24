@@ -2256,32 +2256,60 @@ class RAGFlowPdfParser:
                 "yes",
             )
 
-        self.__images__(fnm, zoomin)
-        self._layouts_rec(zoomin)
-        self._table_transformer_job(zoomin, auto_rotate=auto_rotate_tables)
-        self._text_merge()
-        logging.info(
-            "[RAGFlowPdfParser.__call__] Before _concat_downward: boxes=%s",
-            len(self.boxes) if self.boxes else 0,
-        )
+        self._parse_file_path = fnm if isinstance(fnm, str) else "<bytes>"
+        self._stage_profile = []
+        parse_start = timer()
+        overall_status = "ok"
+        tbls = []
         try:
-            self._concat_downward()
-        except Exception as exc:
-            logging.exception("[RAGFlowPdfParser.__call__] _concat_downward FAILED")
-            raise
-        logging.info(
-            "[RAGFlowPdfParser.__call__] After _concat_downward: boxes=%s",
-            len(self.boxes) if self.boxes else 0,
-        )
-        self._filter_forpages()
-        try:
-            tbls = self._extract_table_figure(need_image, zoomin, return_html, True)
-        except Exception as exc:
-            logging.exception(
-                "[RAGFlowPdfParser.__call__] _extract_table_figure FAILED"
+            with self._stage("pdf.images_ocr"):
+                self.__images__(fnm, zoomin)
+            with self._stage("pdf.layout_recognition"):
+                self._layouts_rec(zoomin)
+            with self._stage("pdf.table_transformer"):
+                self._table_transformer_job(zoomin, auto_rotate=auto_rotate_tables)
+            with self._stage("pdf.text_merge"):
+                self._text_merge()
+            logging.info(
+                "[RAGFlowPdfParser.__call__] Before _concat_downward: boxes=%s",
+                len(self.boxes) if self.boxes else 0,
             )
+            try:
+                with self._stage("pdf.concat_downward"):
+                    self._concat_downward()
+            except Exception:
+                logging.exception(
+                    "[RAGFlowPdfParser.__call__] _concat_downward FAILED"
+                )
+                raise
+            logging.info(
+                "[RAGFlowPdfParser.__call__] After _concat_downward: boxes=%s",
+                len(self.boxes) if self.boxes else 0,
+            )
+            with self._stage("pdf.filter_forpages"):
+                self._filter_forpages()
+            try:
+                with self._stage("pdf.extract_table_figure"):
+                    tbls = self._extract_table_figure(
+                        need_image, zoomin, return_html, True
+                    )
+            except Exception:
+                logging.exception(
+                    "[RAGFlowPdfParser.__call__] _extract_table_figure FAILED"
+                )
+                raise
+            with self._stage("pdf.filterout_scraps"):
+                result_text = self.__filterout_scraps(deepcopy(self.boxes), zoomin)
+            return result_text, tbls
+        except Exception:
+            overall_status = "error"
             raise
-        return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
+        finally:
+            self._emit_parse_profile(
+                total_ms=int((timer() - parse_start) * 1000),
+                n_tables=len(tbls or []),
+                status=overall_status,
+            )
 
     def parse_into_bboxes(self, fnm, callback=None, zoomin=3):
         start = timer()

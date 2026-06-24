@@ -130,3 +130,64 @@ def test_emit_parse_profile(caplog):
     assert d["status"] == "ok"
     assert len(d["stages"]) == 2
     assert d["stages"][0]["stage"] == "pdf.images_ocr"
+
+
+def _stub_all_stages(p, tbls=None):
+    """Replace the 8 stage methods with no-op stubs (name-mangled dunders included)."""
+    tbls = tbls if tbls is not None else []
+    # __images__ has two trailing underscores -> NOT name-mangled -> attr is "__images__".
+    # __filterout_scraps has no trailing underscore -> mangled -> "_RAGFlowPdfParser__filterout_scraps".
+    setattr(p, "__images__", lambda *a, **k: None)
+    p._layouts_rec = lambda *a, **k: None
+    p._table_transformer_job = lambda *a, **k: None
+    p._text_merge = lambda *a, **k: None
+    p._concat_downward = lambda *a, **k: None
+    p._filter_forpages = lambda *a, **k: None
+    p._extract_table_figure = lambda *a, **k: tbls
+    p._RAGFlowPdfParser__filterout_scraps = lambda *a, **k: "BODY TEXT"
+
+
+def test_call_emits_all_stage_lines_and_profile(caplog):
+    set_trace_context(task_id="tc", file_id=11)
+    p = _bare_parser()
+    _stub_all_stages(p, tbls=[("img", "tbl")])
+    with caplog.at_level(logging.INFO, logger="pdf"):
+        text, tbls = RAGFlowPdfParser.__call__(p, "/tmp/doc_11_a.pdf")
+    assert text == "BODY TEXT"
+    assert len(tbls) == 1
+    stage_events = _json_events(caplog, "pdf_stage")
+    assert [d["stage"] for _, d in stage_events] == STAGE_NAMES  # order preserved
+    for _, d in stage_events:
+        assert d["task_id"] == "tc"
+        assert d["file_id"] == 11
+        assert d["file_path"] == "/tmp/doc_11_a.pdf"
+        assert d["status"] == "ok"
+    profile = _json_events(caplog, "pdf_parse_profile")
+    assert len(profile) == 1
+    _, pd = profile[0]
+    assert len(pd["stages"]) == 8
+    assert pd["n_tables"] == 1
+    assert pd["status"] == "ok"
+    assert isinstance(pd["total_ms"], int)
+
+
+def test_call_emits_profile_on_failure(caplog):
+    set_trace_context(task_id="tc", file_id=11)
+    p = _bare_parser()
+    _stub_all_stages(p)
+
+    def _boom(*a, **k):
+        raise RuntimeError("layout failed")
+
+    p._layouts_rec = _boom
+    with caplog.at_level(logging.INFO, logger="pdf"):
+        with pytest.raises(RuntimeError):
+            RAGFlowPdfParser.__call__(p, "/tmp/doc_11_a.pdf")
+    by_stage = {d["stage"]: d for _, d in _json_events(caplog, "pdf_stage")}
+    assert by_stage["pdf.images_ocr"]["status"] == "ok"
+    assert by_stage["pdf.layout_recognition"]["status"] == "error"
+    assert by_stage["pdf.layout_recognition"]["error"] == "RuntimeError"
+    assert "pdf.text_merge" not in by_stage  # never reached after the failure
+    profile = _json_events(caplog, "pdf_parse_profile")
+    assert len(profile) == 1
+    assert profile[0][1]["status"] == "error"
