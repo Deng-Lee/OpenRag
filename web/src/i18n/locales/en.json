@@ -232,6 +232,7 @@
       "skip_unsupported": "Unsupported type {{ext}}, skipped",
       "skip_too_large": "Exceeds 100MB, skipped",
       "skip_name_too_long": "File name too long (over 200 bytes), skipped",
+      "name_too_long": "File name too long. Please keep it within 50 characters.",
       "skip_duplicate": "Already exists, skipped",
       "upload_failed": "Upload failed ({{code}})"
     },

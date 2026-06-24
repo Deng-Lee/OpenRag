@@ -99,6 +99,11 @@ export function isDuplicateError(status: number | undefined, detail: string): bo
   return status === 400 && /already exists/i.test(detail);
 }
 
+/** 后端「文件名过长」400：detail 以 "File name too long" 开头（见 file_ingest.py）。 */
+export function isFilenameTooLongError(status: number | undefined, detail: string): boolean {
+  return status === 400 && /File name too long/i.test(detail);
+}
+
 /**
  * 递归读取拖入的 FileSystemEntry，产出 {file, relativePath}。
  * 注意：readEntries 单次最多约 100 项，必须循环读到空，否则大目录会丢文件。

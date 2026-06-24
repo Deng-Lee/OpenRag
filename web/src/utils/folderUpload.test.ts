@@ -5,6 +5,7 @@ import {
   isJunkPath,
   precheck,
   isDuplicateError,
+  isFilenameTooLongError,
   walkEntry,
   filenameBytes,
   MAX_FILE_SIZE,
@@ -170,6 +171,18 @@ describe('isDuplicateError', () => {
     expect(isDuplicateError(400, 'Parent directory does not exist')).toBe(false);
     expect(isDuplicateError(413, 'too large')).toBe(false);
     expect(isDuplicateError(undefined, '')).toBe(false);
+  });
+});
+
+describe('isFilenameTooLongError', () => {
+  it('is true only for 400 + backend "File name too long" detail', () => {
+    expect(isFilenameTooLongError(400, 'File name too long: 535 bytes (max 200).')).toBe(true);
+  });
+
+  it('does not misclassify other 400s or statuses', () => {
+    expect(isFilenameTooLongError(400, 'File already exists at /a')).toBe(false);
+    expect(isFilenameTooLongError(500, 'File name too long')).toBe(false);
+    expect(isFilenameTooLongError(undefined, '')).toBe(false);
   });
 });
 

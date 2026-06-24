@@ -10,6 +10,7 @@ import {
   precheck,
   remoteParentDir,
   isDuplicateError,
+  isFilenameTooLongError,
   walkEntry,
   type PickedFile,
   type SkipReason,
@@ -312,8 +313,12 @@ export default function FileUpload({
         setDocumentType('general');
         setUploadPath(selectedPath);
       } catch (error: unknown) {
-        const err = error as { response?: { data?: { detail?: string } } };
-        const errorMsg = err.response?.data?.detail || '文件上传失败';
+        const err = error as { response?: { status?: number; data?: { detail?: string } } };
+        const code = err.response?.status;
+        const detailMsg = String(err.response?.data?.detail ?? '');
+        const errorMsg = isFilenameTooLongError(code, detailMsg)
+          ? t('files.upload.name_too_long')
+          : detailMsg || '文件上传失败';
         message.error(errorMsg);
         onError?.(error as Error);
       } finally {
