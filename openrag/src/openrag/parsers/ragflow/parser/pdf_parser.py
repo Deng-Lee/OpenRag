@@ -15,6 +15,7 @@
 #
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ import sys
 import threading
 import unicodedata
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from io import BytesIO
 from timeit import default_timer as timer
@@ -49,6 +51,12 @@ from openrag.parsers.ragflow.vision import (
 from openrag.parsers.ragflow.vision.ocr import settings  # lightweight proxy
 from rag.nlp import rag_tokenizer
 from rag.prompts.generator import vision_llm_describe_prompt
+
+try:
+    from openrag.tracing.context import get_trace_context as _get_trace_context
+except Exception:  # pragma: no cover - tracing context is optional
+    def _get_trace_context():
+        return {}
 
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
@@ -2136,6 +2144,74 @@ class RAGFlowPdfParser:
         assert len(self.page_cum_height) == len(self.page_images) + 1
         if len(self.boxes) == 0 and zoomin < 9:
             self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
+
+    # ---- parse-stage instrumentation -------------------------------------
+    _PARSE_PROFILE_LOGGER = "pdf.parse_profile"
+
+    @staticmethod
+    def _safe_len(obj):
+        try:
+            return len(obj) if obj is not None else None
+        except Exception:
+            return None
+
+    def _parse_ctx_ids(self):
+        """task_id/file_id from trace context + file from current parse call."""
+        try:
+            ctx = _get_trace_context() or {}
+        except Exception:
+            ctx = {}
+        return {
+            "task_id": ctx.get("task_id"),
+            "file_id": ctx.get("file_id"),
+            "file_path": getattr(self, "_parse_file_path", None),
+        }
+
+    def _stage_log_base(self, stage):
+        rec = {"evt": "pdf_stage", "stage": stage}
+        rec.update(self._parse_ctx_ids())
+        return rec
+
+    @contextmanager
+    def _stage(self, stage):
+        """Time one parse stage and emit a structured-JSON log line.
+
+        Reads task_id/file_id from the trace context and file from
+        self._parse_file_path. Records len(self.boxes) before/after. The
+        instrumentation never raises on its own; if the wrapped stage raises,
+        the line is logged with status="error" and the exception re-raised.
+        status="ok" only means no exception propagated OUT of the stage; a
+        stage that swallows its own exceptions internally (e.g. __images__)
+        can still be logged as "ok".
+        """
+        start = timer()
+        boxes_before = self._safe_len(getattr(self, "boxes", None))
+        status = "ok"
+        err = None
+        try:
+            yield
+        except Exception as exc:
+            status = "error"
+            err = type(exc).__name__
+            raise
+        finally:
+            duration_ms = int((timer() - start) * 1000)
+            try:
+                rec = self._stage_log_base(stage)
+                rec["duration_ms"] = duration_ms
+                rec["boxes_before"] = boxes_before
+                rec["boxes_after"] = self._safe_len(getattr(self, "boxes", None))
+                rec["status"] = status
+                if err:
+                    rec["error"] = err
+                profile = getattr(self, "_stage_profile", None)
+                if isinstance(profile, list):
+                    profile.append({"stage": stage, "duration_ms": duration_ms})
+                logging.getLogger(stage).info(
+                    json.dumps(rec, ensure_ascii=False, default=str)
+                )
+            except Exception:  # pragma: no cover - never break parsing
+                pass
 
     def __call__(
         self, fnm, need_image=True, zoomin=3, return_html=False, auto_rotate_tables=None
