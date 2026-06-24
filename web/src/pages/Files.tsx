@@ -75,6 +75,20 @@ function isDirectChildUri(uri: string | undefined, parentPath: string): boolean 
   return suffix.length > 0 && !suffix.includes('/');
 }
 
+/** 逻辑路径 uri 是否落在 parentPath 之下（递归，含任意深度子孙）。根目录 '/' 视为包含全部。 */
+/** 与后端 `_is_under_path_uri` 一致：右侧列表按当前选中目录收窄。 */
+export function isUnderLogicalPath(uri: string | undefined, parentPath: string): boolean {
+  const p = normalizeLogicalPath(parentPath);
+  const u = normalizeLogicalPath(uri);
+  if (p === '/') return true;
+  return u === p || u.startsWith(`${p}/`);
+}
+
+/** 右侧列表展示集：排除目录行，并按当前选中目录（递归）收窄到其子树。 */
+export function selectDisplayedFiles(files: File[], selectedDirectory: string): File[] {
+  return files.filter((f) => !f.is_directory && isUnderLogicalPath(f.uri, selectedDirectory));
+}
+
 function joinChildDirectoryPath(parentKey: string, rawName: string): string {
   const segment = rawName
     .trim()
@@ -645,15 +659,11 @@ export default function Files() {
     );
   };
 
-  const displayedFiles = useMemo(() => {
-    return files.filter((f) => {
-      // 仅文件：不展示目录行
-      if (f.is_directory) {
-        return false;
-      }
-      return true;
-    });
-  }, [files]);
+  // 右侧列表：排除目录行，并按当前选中目录（递归）收窄；根目录展示全部。
+  const displayedFiles = useMemo(
+    () => selectDisplayedFiles(files, selectedDirectory),
+    [files, selectedDirectory]
+  );
 
   const workspaceMenuItems = [
     ...workspaces.map((workspace) => ({
