@@ -258,6 +258,7 @@ export default function Files() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [selectedDirectory, setSelectedDirectory] = useState<string>('/');
+  const [selectedFileId, setSelectedFileId] = useState<number | null>(null);
 
   const toggleLanguage = (checked: boolean) => {
     i18n.changeLanguage(checked ? 'zh' : 'en');
@@ -510,6 +511,7 @@ export default function Files() {
 
   const handleWorkspaceChange = (workspace: Workspace) => {
     setSelectedDirectory('/');
+    setSelectedFileId(null);
     setCurrentWorkspace(workspace);
     localStorage.setItem('currentWorkspaceId', workspace.id.toString());
   };
@@ -537,11 +539,14 @@ export default function Files() {
   };
 
   const onSelectDirectory = (selectedKeys: Key[]) => {
-    if (selectedKeys.length > 0) {
-      const key = selectedKeys[0] as string;
-      if (!key.startsWith('file-')) {
-        setSelectedDirectory(key);
-      }
+    if (selectedKeys.length === 0) return;
+    const key = selectedKeys[0] as string;
+    const fileId = parseFileNodeId(key);
+    if (fileId != null) {
+      setSelectedFileId(fileId);
+    } else {
+      setSelectedDirectory(key);
+      setSelectedFileId(null);
     }
   };
 
@@ -678,10 +683,10 @@ export default function Files() {
     );
   };
 
-  // 右侧列表：排除目录行，并按当前选中目录（递归）收窄；根目录展示全部。
+  // 右侧列表：选中单个文件时只显示该文件，否则排除目录行并按当前选中目录（递归）收窄。
   const displayedFiles = useMemo(
-    () => selectDisplayedFiles(files, selectedDirectory),
-    [files, selectedDirectory]
+    () => pickDisplayedFiles(files, selectedDirectory, selectedFileId),
+    [files, selectedDirectory, selectedFileId]
   );
 
   const workspaceMenuItems = [
