@@ -150,6 +150,7 @@
       "edit_dir": "Edit Directory Path",
       "create_dir": "Create Directory",
       "reprocess": "Reprocess",
+      "preview": "Preview",
       "manage_dir": "Manage Directory",
       "add_dir": "New folder",
       "delete_dir": "Delete"

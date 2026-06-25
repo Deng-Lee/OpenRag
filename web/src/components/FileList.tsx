@@ -1,5 +1,5 @@
 import { Table, Button, Space, Popconfirm, message, Typography, Modal, Form, Select, Tag, Popover } from 'antd';
-import { DeleteOutlined, FolderOutlined, FileOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, FolderOutlined, FileOutlined, ReloadOutlined, EyeOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { DocumentType, File, SimpleStatus } from '../types';
 import { filesAPI } from '../services/api';
@@ -205,10 +205,10 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
       onCell: () => ({ style: nowrapCellStyle }),
       render: (time: string) => time ? new Date(time).toLocaleString() : '-',
     },
-    ...(canWrite ? [{
+    {
       title: t('files.columns.action'),
       key: 'action',
-      width: 120,
+      width: 160,
       fixed: 'right' as const,
       onCell: () => ({ style: nowrapCellStyle }),
       render: (_: any, record: File) => (
@@ -216,24 +216,34 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
           {!record.is_directory && (
             <Button
               type="link"
+              icon={<EyeOutlined />}
+              onClick={() => setPreviewFile(record)}
+              title={t('files.actions.preview')}
+            />
+          )}
+          {canWrite && !record.is_directory && (
+            <Button
+              type="link"
               icon={<ReloadOutlined />}
               onClick={() => handleReprocess(record)}
               title={t('files.actions.reprocess')}
             />
           )}
-          <Popconfirm
-            title={t('files.messages.delete_confirm')}
-            onConfirm={() => handleDelete(record.id)}
-            okText={t('files.messages.yes')}
-            cancelText={t('files.messages.no')}
-          >
-            <Button type="link" danger icon={<DeleteOutlined />}>
-              {t('common.delete')}
-            </Button>
-          </Popconfirm>
+          {canWrite && (
+            <Popconfirm
+              title={t('files.messages.delete_confirm')}
+              onConfirm={() => handleDelete(record.id)}
+              okText={t('files.messages.yes')}
+              cancelText={t('files.messages.no')}
+            >
+              <Button type="link" danger icon={<DeleteOutlined />}>
+                {t('common.delete')}
+              </Button>
+            </Popconfirm>
+          )}
         </Space>
       ),
-    }] : []),
+    },
   ];
 
   return (
@@ -303,6 +313,7 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
         open={!!previewFile}
         file={previewFile}
         onClose={() => setPreviewFile(null)}
+        canWrite={canWrite}
       />
     </>
   );

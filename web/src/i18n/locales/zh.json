@@ -150,6 +150,7 @@
       "edit_dir": "修改目录路径",
       "create_dir": "创建目录",
       "reprocess": "重新处理",
+      "preview": "预览",
       "manage_dir": "管理目录",
       "add_dir": "新增目录",
       "delete_dir": "删除"

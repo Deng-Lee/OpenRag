@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isUnderLogicalPath, selectDisplayedFiles } from './Files';
+import { isUnderLogicalPath, selectDisplayedFiles, parseFileNodeId, pickDisplayedFiles } from './Files';
 import type { File } from '../types';
 
 function makeFile(partial: Partial<File> & { id: number; uri: string }): File {
@@ -67,5 +67,43 @@ describe('selectDisplayedFiles', () => {
   it('excludes files outside the selected folder', () => {
     const ids = selectDisplayedFiles(all, '/docs').map((f) => f.id);
     expect(ids).toEqual([5]);
+  });
+});
+
+describe('parseFileNodeId', () => {
+  it('parses the numeric id from a file node key', () => {
+    expect(parseFileNodeId('file-42')).toBe(42);
+  });
+
+  it('returns null for directory keys', () => {
+    expect(parseFileNodeId('/uploads')).toBeNull();
+    expect(parseFileNodeId('/')).toBeNull();
+  });
+
+  it('returns null for malformed file keys', () => {
+    expect(parseFileNodeId('file-')).toBeNull();
+    expect(parseFileNodeId('file-abc')).toBeNull();
+  });
+});
+
+describe('pickDisplayedFiles', () => {
+  const underUploads = makeFile({ id: 3, uri: '/uploads/a.txt' });
+  const deepUnderUploads = makeFile({ id: 4, uri: '/uploads/sub/b.txt' });
+  const underDocs = makeFile({ id: 5, uri: '/docs/c.txt' });
+  const all = [underUploads, deepUnderUploads, underDocs];
+
+  it('shows only the selected file when a file id is set', () => {
+    const ids = pickDisplayedFiles(all, '/', 4).map((f) => f.id);
+    expect(ids).toEqual([4]);
+  });
+
+  it('ignores selectedDirectory when a file id is set', () => {
+    const ids = pickDisplayedFiles(all, '/docs', 3).map((f) => f.id);
+    expect(ids).toEqual([3]);
+  });
+
+  it('falls back to directory scoping when no file is selected', () => {
+    const ids = pickDisplayedFiles(all, '/uploads', null).map((f) => f.id);
+    expect(ids).toEqual([3, 4]);
   });
 });

@@ -30,9 +30,10 @@ interface FilePreviewModalProps {
   open: boolean;
   file: File | null;
   onClose: () => void;
+  canWrite?: boolean;
 }
 
-export default function FilePreviewModal({ open, file, onClose }: FilePreviewModalProps) {
+export default function FilePreviewModal({ open, file, onClose, canWrite = false }: FilePreviewModalProps) {
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -186,7 +187,7 @@ export default function FilePreviewModal({ open, file, onClose }: FilePreviewMod
       title={
         <Space wrap>
           <span>{title}</span>
-          {file && !file.is_directory ? (
+          {file && !file.is_directory && canWrite ? (
             <Button type="text" icon={<DownloadOutlined />} onClick={handleDownload} size="small">
               {t('files.preview.download')}
             </Button>
