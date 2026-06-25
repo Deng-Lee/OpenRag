@@ -182,6 +182,7 @@ finally:
 - 链路：`RAGFlowPdfParser._emit_parse_profile` 把 rec 存到 `self._last_parse_profile` → `PDFParserAdapter` 解析后读到 `self.last_parse_profile` → `document_processor._parse_span_profile(parser)` 取干净子集 → 加到 `parse.document` span 的 `output_summary["pdf_stage_profile"]`（非 PDF parser 返回 None，不加该字段）。
 - 查询：`GET /traces?file_id=<id>` 拿 trace_id → `GET /traces/{trace_id}` → 找 `stage="parse.document"` 的 span → `output_summary.pdf_stage_profile`。
 - 好处：有界（一文件一份 JSON）、可查、不随上传量堆日志文件。
+- 失败解析同样可查（2026-06-25 追加）：adapter 在 `finally` 复制 profile（成功/失败都复制），`TraceService.fail_span` 支持 `output_summary`，`document_processor` 把 profile 挂到**失败的** `parse.document` span，`status="error"`，便于排障定位卡住的阶段。
 
 ## 5. 受影响文件
 

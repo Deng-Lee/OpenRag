@@ -712,3 +712,47 @@ Claude 修改后的方案比上一版更可执行，主体设计可以接受。�
 ### 最终意见
 
 Claude 最新修改后的方案已经具备可执行性。建议进入实现时按当前 plan 小步执行：先新增 `_stage` / `_emit_parse_profile` 测试与实现，再包裹 `__call__`，最后跑显式测试与 PDF 既有回归；全程不要改全局 logging、不要扩到其它 parser、不要在未经用户确认时提交。
+
+---
+
+## Codex 四次评审结果（2026-06-25）
+
+来源：Codex 对最近新增的 trace-span profile 持久化提交进行代码审查。本节仅追加在文件末尾，未修改前文、spec 或代码。
+
+### 本轮审查范围
+
+- 目标提交：`3c98c4e feat(pdf): persist per-stage parse profile into parse.document trace span`。
+- 文档提交：`97a4491 docs(pdf): document trace-span profile persistence enhancement`。
+- 改动链路：`RAGFlowPdfParser._emit_parse_profile` 保存 `_last_parse_profile` -> `PDFParserAdapter.last_parse_profile` 暴露最近一次 profile -> `document_processor._parse_span_profile()` 取 `{total_ms,page_count,n_tables,status,stages}` 子集 -> `parse.document.output_summary["pdf_stage_profile"]`。
+
+### 主要发现
+
+- **P2：失败的 PDF 解析不会把 stage profile 写进 trace/API。** `PDFParserAdapter._parse_ragflow_with_tables()` 只在 `self.ragflow_parser(file_path)` 成功返回后复制 `_last_parse_profile`；如果某阶段抛错，`RAGFlowPdfParser.__call__` 虽然会在 `finally` 里生成失败 profile，但 adapter 直接进入 `except` 并 re-raise，`last_parse_profile` 没有更新。随后 `DocumentProcessor.process_document()` 的 parse 失败路径只调用 `_safe_fail_span(..., metrics=...)`，`TraceService.fail_span()` 也没有 `output_summary` 参数。因此成功解析可通过 API 查到 `pdf_stage_profile`，失败解析查不到“失败到哪个阶段、已完成阶段耗时”。这与排障目标冲突，建议修复为：异常分支也复制 `_last_parse_profile`，并让失败的 `parse.document` span 也带上 `pdf_stage_profile`。
+- **P2：新增测试仍不在默认 pytest 收集白名单内。** `openrag/pytest.ini` 的 `python_files` 白名单不包含 `test_pdf_parse_timing.py` 和 `test_parse_profile_persistence.py`。如果 CI 只跑默认 `pytest`，这次新增测试不会被收集。建议把文件名加入白名单，或在 CI/回归命令中显式运行这两个测试文件。
+- **P3：缺少 trace/API 端到端落库回归。** 当前新增的 `test_parse_profile_persistence.py` 主要覆盖 adapter 字段暴露和 `_parse_span_profile()` helper，没有覆盖 `DocumentProcessor.process_document()` 写入 `TraceSpan.output_summary`，也没有覆盖 `/traces` API 返回该字段。成功路径静态看可行，但需求是“通过 API 拿取”，建议补一个轻量集成测试验证 `parse.document.output_summary.pdf_stage_profile` 实际可查。
+
+### 可接受的部分
+
+- 成功路径设计总体可行：没有新建额外 `TraceRun`/`TraceSpan`，只给既有 `parse.document` span 增加一个有界 JSON 子字段，写入体量可控。
+- `_parse_span_profile()` 有意剔除了 `file_path`、`task_id`、`file_id` 等字段，只保留耗时摘要，这降低了输出冗余和路径暴露风险。
+- `RAGFlowPdfParser._emit_parse_profile()` 自身仍在 try/except 内，持久化 profile 的赋值不会把解析流程变得更脆弱。
+
+### 边界与风险结论
+
+- 这次增强已经超出最初“只写日志、不写 trace”的边界，但扩展点较小，属于可接受的需求演进。
+- 当前最大执行风险不是成功路径，而是失败路径排障缺口：如果 PDF 卡死或某阶段抛错，API 侧仍可能拿不到本次最关键的阶段耗时。
+- 合并前建议至少补齐失败路径持久化与默认测试收集；端到端 API 测试建议作为同一修复的一部分补上。
+
+---
+
+## 四次评审的处理（2026-06-25）
+
+针对 Codex 四次评审：
+
+1. **P2-1 失败路径不可查 —— 已修复。** `PDFParserAdapter._parse_ragflow_with_tables` 改为在 `finally` 复制 `_last_parse_profile`（成功/失败都复制）；`TraceService.fail_span` 增加 `output_summary` 形参透传给 `_complete_span`；`document_processor` 解析 `except` 分支用 `_parse_span_profile(parser)` 把 `pdf_stage_profile` 挂到**失败的** `parse.document` span。失败解析现在也能从 `output_summary.pdf_stage_profile` 看到"卡在哪个阶段、已完成阶段耗时"（`status="error"`）。
+2. **P3 缺端到端落库测试 —— 已补。** 复用 `test_document_processing_trace.py` 的 in-memory sqlite harness，新增成功/失败两条集成测试，直接断言 `parse.document.output_summary.pdf_stage_profile`（成功 `status=ok`、失败 `status=error`）；另在 `test_parse_profile_persistence.py` 增 adapter 失败路径单测。
+3. **P2-2 测试不在 pytest 白名单 —— 维持现状。** 用户此前已明确"维持现状"（与既有 `test_pdf_parser_resilience.py` 一致，显式路径运行），本轮不改。
+4. **adapter 冒烟（加分项）—— 已覆盖。** 新增的 adapter 成功/失败单测 + 两条 `process_document` 集成测试已覆盖入口路径。
+
+- 回归：`test_document_processing_trace.py` / `test_parse_profile_persistence.py` / `test_pdf_parse_timing.py` / `test_trace_service.py` / `test_traces_api.py` 共 **25 passed**。
+- 提交：`fix(pdf): persist stage profile on failed parses + add trace integration tests`（4dda3cd）。
