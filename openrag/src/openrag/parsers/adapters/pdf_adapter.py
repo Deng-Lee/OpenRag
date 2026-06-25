@@ -218,6 +218,10 @@ class PDFParserAdapter(RAGFlowParserAdapter):
         self.ragflow_parser = (
             RAGFlowPdfParser() if RAGFlowPdfParser is not None else None
         )
+        # Per-stage timing profile from the most recent parse (read by the
+        # pipeline to persist into the parse.document trace span). None until
+        # a parse runs; None for non-PDF parsers.
+        self.last_parse_profile = None
 
     def parse(self, file_path: str) -> list[DocumentBlock]:
         if self.ragflow_parser is None:
@@ -237,6 +241,13 @@ class PDFParserAdapter(RAGFlowParserAdapter):
                 "[pdf_adapter] ragflow_parser FAILED for file=%s", file_path
             )
             raise
+        finally:
+            # Copy the profile on BOTH success and failure: __call__ writes
+            # _last_parse_profile in its own finally (status="error" on
+            # failure), so failed parses stay queryable via the trace span.
+            self.last_parse_profile = getattr(
+                self.ragflow_parser, "_last_parse_profile", None
+            )
         logger.info(
             "[pdf_adapter] ragflow_parser returned: text_body_len=%s, tbls=%s",
             len(text_body) if text_body else 0,

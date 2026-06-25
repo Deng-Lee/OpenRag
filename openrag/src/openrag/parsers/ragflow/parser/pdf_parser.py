@@ -15,6 +15,7 @@
 #
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ import sys
 import threading
 import unicodedata
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from io import BytesIO
 from timeit import default_timer as timer
@@ -49,6 +51,12 @@ from openrag.parsers.ragflow.vision import (
 from openrag.parsers.ragflow.vision.ocr import settings  # lightweight proxy
 from rag.nlp import rag_tokenizer
 from rag.prompts.generator import vision_llm_describe_prompt
+
+try:
+    from openrag.tracing.context import get_trace_context as _get_trace_context
+except Exception:  # pragma: no cover - tracing context is optional
+    def _get_trace_context():
+        return {}
 
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
@@ -2137,6 +2145,95 @@ class RAGFlowPdfParser:
         if len(self.boxes) == 0 and zoomin < 9:
             self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
 
+    # ---- parse-stage instrumentation -------------------------------------
+    _PARSE_PROFILE_LOGGER = "pdf.parse_profile"
+
+    @staticmethod
+    def _safe_len(obj):
+        try:
+            return len(obj) if obj is not None else None
+        except Exception:
+            return None
+
+    def _parse_ctx_ids(self):
+        """task_id/file_id from trace context + file from current parse call."""
+        try:
+            ctx = _get_trace_context() or {}
+        except Exception:
+            ctx = {}
+        return {
+            "task_id": ctx.get("task_id"),
+            "file_id": ctx.get("file_id"),
+            "file_path": getattr(self, "_parse_file_path", None),
+        }
+
+    def _stage_log_base(self, stage):
+        rec = {"evt": "pdf_stage", "stage": stage}
+        rec.update(self._parse_ctx_ids())
+        return rec
+
+    @contextmanager
+    def _stage(self, stage):
+        """Time one parse stage and emit a structured-JSON log line.
+
+        Reads task_id/file_id from the trace context and file from
+        self._parse_file_path. Records len(self.boxes) before/after. The
+        instrumentation never raises on its own; if the wrapped stage raises,
+        the line is logged with status="error" and the exception re-raised.
+        status="ok" only means no exception propagated OUT of the stage; a
+        stage that swallows its own exceptions internally (e.g. __images__)
+        can still be logged as "ok".
+        """
+        start = timer()
+        boxes_before = self._safe_len(getattr(self, "boxes", None))
+        status = "ok"
+        err = None
+        try:
+            yield
+        except Exception as exc:
+            status = "error"
+            err = type(exc).__name__
+            raise
+        finally:
+            duration_ms = int((timer() - start) * 1000)
+            try:
+                rec = self._stage_log_base(stage)
+                rec["duration_ms"] = duration_ms
+                rec["boxes_before"] = boxes_before
+                rec["boxes_after"] = self._safe_len(getattr(self, "boxes", None))
+                rec["status"] = status
+                if err:
+                    rec["error"] = err
+                profile = getattr(self, "_stage_profile", None)
+                if isinstance(profile, list):
+                    profile.append({"stage": stage, "duration_ms": duration_ms})
+                logging.getLogger(stage).info(
+                    json.dumps(rec, ensure_ascii=False, default=str)
+                )
+            except Exception:  # pragma: no cover - never break parsing
+                pass
+
+    def _emit_parse_profile(self, total_ms, n_tables, status="ok"):
+        try:
+            ids = self._parse_ctx_ids()
+            rec = {
+                "evt": "pdf_parse_profile",
+                "task_id": ids.get("task_id"),
+                "file_id": ids.get("file_id"),
+                "file_path": ids.get("file_path"),
+                "page_count": self._safe_len(getattr(self, "page_images", None)),
+                "total_ms": total_ms,
+                "n_tables": n_tables,
+                "status": status,
+                "stages": list(getattr(self, "_stage_profile", []) or []),
+            }
+            self._last_parse_profile = rec
+            logging.getLogger(self._PARSE_PROFILE_LOGGER).info(
+                json.dumps(rec, ensure_ascii=False, default=str)
+            )
+        except Exception:  # pragma: no cover - never break parsing
+            pass
+
     def __call__(
         self, fnm, need_image=True, zoomin=3, return_html=False, auto_rotate_tables=None
     ):
@@ -2160,32 +2257,61 @@ class RAGFlowPdfParser:
                 "yes",
             )
 
-        self.__images__(fnm, zoomin)
-        self._layouts_rec(zoomin)
-        self._table_transformer_job(zoomin, auto_rotate=auto_rotate_tables)
-        self._text_merge()
-        logging.info(
-            "[RAGFlowPdfParser.__call__] Before _concat_downward: boxes=%s",
-            len(self.boxes) if self.boxes else 0,
-        )
+        self._parse_file_path = fnm if isinstance(fnm, str) else "<bytes>"
+        self._stage_profile = []
+        self._last_parse_profile = None
+        parse_start = timer()
+        overall_status = "ok"
+        tbls = []
         try:
-            self._concat_downward()
-        except Exception as exc:
-            logging.exception("[RAGFlowPdfParser.__call__] _concat_downward FAILED")
-            raise
-        logging.info(
-            "[RAGFlowPdfParser.__call__] After _concat_downward: boxes=%s",
-            len(self.boxes) if self.boxes else 0,
-        )
-        self._filter_forpages()
-        try:
-            tbls = self._extract_table_figure(need_image, zoomin, return_html, True)
-        except Exception as exc:
-            logging.exception(
-                "[RAGFlowPdfParser.__call__] _extract_table_figure FAILED"
+            with self._stage("pdf.images_ocr"):
+                self.__images__(fnm, zoomin)
+            with self._stage("pdf.layout_recognition"):
+                self._layouts_rec(zoomin)
+            with self._stage("pdf.table_transformer"):
+                self._table_transformer_job(zoomin, auto_rotate=auto_rotate_tables)
+            with self._stage("pdf.text_merge"):
+                self._text_merge()
+            logging.info(
+                "[RAGFlowPdfParser.__call__] Before _concat_downward: boxes=%s",
+                len(self.boxes) if self.boxes else 0,
             )
+            try:
+                with self._stage("pdf.concat_downward"):
+                    self._concat_downward()
+            except Exception:
+                logging.exception(
+                    "[RAGFlowPdfParser.__call__] _concat_downward FAILED"
+                )
+                raise
+            logging.info(
+                "[RAGFlowPdfParser.__call__] After _concat_downward: boxes=%s",
+                len(self.boxes) if self.boxes else 0,
+            )
+            with self._stage("pdf.filter_forpages"):
+                self._filter_forpages()
+            try:
+                with self._stage("pdf.extract_table_figure"):
+                    tbls = self._extract_table_figure(
+                        need_image, zoomin, return_html, True
+                    )
+            except Exception:
+                logging.exception(
+                    "[RAGFlowPdfParser.__call__] _extract_table_figure FAILED"
+                )
+                raise
+            with self._stage("pdf.filterout_scraps"):
+                result_text = self.__filterout_scraps(deepcopy(self.boxes), zoomin)
+            return result_text, tbls
+        except Exception:
+            overall_status = "error"
             raise
-        return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
+        finally:
+            self._emit_parse_profile(
+                total_ms=int((timer() - parse_start) * 1000),
+                n_tables=len(tbls or []),
+                status=overall_status,
+            )
 
     def parse_into_bboxes(self, fnm, callback=None, zoomin=3):
         start = timer()

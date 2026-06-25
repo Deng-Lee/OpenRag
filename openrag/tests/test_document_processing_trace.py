@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -491,4 +492,151 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         finally:
             db2.close()
     finally:
+        Base.metadata.drop_all(bind=engine)
+
+
+_PROFILE_OK = {
+    "total_ms": 123,
+    "page_count": 2,
+    "n_tables": 1,
+    "status": "ok",
+    "stages": [
+        {"stage": "pdf.images_ocr", "duration_ms": 100},
+        {"stage": "pdf.layout_recognition", "duration_ms": 23},
+    ],
+}
+
+
+class FakeProfiledParser:
+    parser_version = "pdf-test"
+
+    def __init__(self):
+        self.last_parse_profile = dict(_PROFILE_OK)
+
+    def parse(self, file_path):
+        return [
+            DocumentBlock(
+                text="Body",
+                page=1,
+                offset=0,
+                block_type="text",
+                block_id="b1",
+                char_start=0,
+                char_end=4,
+            )
+        ]
+
+
+class FakeProfiledRegistry:
+    def get_parser(self, file_path, parser_type):
+        return FakeProfiledParser()
+
+
+class FakeFailingProfiledParser:
+    parser_version = "pdf-test"
+
+    def __init__(self):
+        # __call__ writes this in its own finally before raising; the adapter
+        # copies it to last_parse_profile even on failure.
+        self.last_parse_profile = {
+            "total_ms": 50,
+            "page_count": 1,
+            "n_tables": 0,
+            "status": "error",
+            "stages": [{"stage": "pdf.images_ocr", "duration_ms": 50}],
+        }
+
+    def parse(self, file_path):
+        raise RuntimeError("layout boom")
+
+
+class FakeFailingProfiledRegistry:
+    def get_parser(self, file_path, parser_type):
+        return FakeFailingProfiledParser()
+
+
+def test_process_document_persists_pdf_stage_profile_on_failure(tmp_path):
+    engine, db = _new_db()
+    try:
+        user, workspace, file = _seed_file(db)
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"source document bytes")
+        processor = DocumentProcessor(
+            db=db,
+            parser_registry=FakeFailingProfiledRegistry(),
+            chunk_engine=FakeChunkEngine(),
+            embedding_engine=FakeEmbeddingEngine(),
+            minio_storage=FakeProcessingMinio(),
+            vector_store=None,
+            layer_store=None,
+            chunk_fulltext_store=None,
+        )
+        set_trace_context(
+            trace_id="proc-profile-fail",
+            trace_type="document_processing",
+            workspace_id=workspace.id,
+            user_id=user.id,
+            file_id=file.id,
+            task_id="1",
+            sampling_reason="unit-test",
+        )
+        with pytest.raises(RuntimeError):
+            processor.process_document(
+                file_path=str(source),
+                file_id=file.id,
+                user_id=user.id,
+                parser_type="pdf",
+            )
+        parse_span = db.query(TraceSpan).filter_by(stage="parse.document").one()
+        assert parse_span.status == "failed"
+        prof = parse_span.output_summary["pdf_stage_profile"]
+        assert prof["status"] == "error"
+        assert prof["stages"][0]["stage"] == "pdf.images_ocr"
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_process_document_persists_pdf_stage_profile_on_success(tmp_path):
+    engine, db = _new_db()
+    try:
+        user, workspace, file = _seed_file(db)
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"source document bytes")
+        processor = DocumentProcessor(
+            db=db,
+            parser_registry=FakeProfiledRegistry(),
+            chunk_engine=FakeChunkEngine(),
+            embedding_engine=FakeEmbeddingEngine(),
+            minio_storage=FakeProcessingMinio(),
+            vector_store=None,
+            layer_store=None,
+            chunk_fulltext_store=None,
+        )
+        set_trace_context(
+            trace_id="proc-profile-ok",
+            trace_type="document_processing",
+            workspace_id=workspace.id,
+            user_id=user.id,
+            file_id=file.id,
+            task_id="1",
+            sampling_reason="unit-test",
+        )
+        result = processor.process_document(
+            file_path=str(source),
+            file_id=file.id,
+            user_id=user.id,
+            parser_type="pdf",
+        )
+        assert result["status"] == "completed"
+        parse_span = db.query(TraceSpan).filter_by(stage="parse.document").one()
+        prof = parse_span.output_summary["pdf_stage_profile"]
+        assert prof["status"] == "ok"
+        assert prof["total_ms"] == 123
+        assert [s["stage"] for s in prof["stages"]] == [
+            "pdf.images_ocr",
+            "pdf.layout_recognition",
+        ]
+    finally:
+        db.close()
         Base.metadata.drop_all(bind=engine)

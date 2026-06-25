@@ -92,6 +92,7 @@ def _safe_fail_span(
     error_message: str,
     *,
     metrics: Optional[dict] = None,
+    output_summary: Optional[dict] = None,
 ) -> None:
     if span is None:
         return
@@ -100,6 +101,7 @@ def _safe_fail_span(
             span_id=span.span_id,
             error_message=error_message,
             metrics=metrics,
+            output_summary=output_summary,
         )
     except Exception:
         pass
@@ -163,6 +165,28 @@ def _extract_chunk_position_fields(chunk) -> dict:
         "page_num_int": _coerce_int_list(metadata.get("page_num_int")),
         "position_int": _coerce_position_int(metadata.get("position_int")),
         "top_int": _coerce_int_list(metadata.get("top_int")),
+    }
+
+
+def _parse_span_profile(parser) -> Optional[dict]:
+    """Clean per-stage timing subset to attach to the parse.document span.
+
+    Reads ``parser.last_parse_profile`` (set by PDFParserAdapter for PDFs;
+    absent for other parsers). Returns None when there is no usable profile,
+    so the span's output_summary only gains the field for instrumented PDFs.
+    """
+    profile = getattr(parser, "last_parse_profile", None)
+    if not isinstance(profile, dict):
+        return None
+    stages = profile.get("stages")
+    if not stages:
+        return None
+    return {
+        "total_ms": profile.get("total_ms"),
+        "page_count": profile.get("page_count"),
+        "n_tables": profile.get("n_tables"),
+        "status": profile.get("status"),
+        "stages": stages,
     }
 
 
@@ -249,11 +273,15 @@ class DocumentProcessor:
         try:
             text_blocks = parser.parse(file_path)
         except Exception as exc:
+            fail_profile = _parse_span_profile(parser)
             _safe_fail_span(
                 trace_service,
                 parse_span,
                 str(exc),
                 metrics={"duration_ms": int((time.perf_counter() - parse_started) * 1000)},
+                output_summary=(
+                    {"pdf_stage_profile": fail_profile} if fail_profile else None
+                ),
             )
             _safe_fail_run(
                 trace_service,
@@ -269,22 +297,26 @@ class DocumentProcessor:
             canonical_text_override = canonical_result.text
             canonical_source = canonical_source_metadata()
         parse_duration_ms = int((time.perf_counter() - parse_started) * 1000)
+        parse_output_summary = {
+            "parser_name": _parser_name(parser),
+            "parser_version": _parser_version(parser),
+            "block_count": len(text_blocks),
+            "page_count": len(
+                {
+                    getattr(block, "page", None)
+                    for block in text_blocks
+                    if getattr(block, "page", None) is not None
+                }
+            ),
+            "duration_ms": parse_duration_ms,
+        }
+        stage_profile = _parse_span_profile(parser)
+        if stage_profile:
+            parse_output_summary["pdf_stage_profile"] = stage_profile
         _safe_finish_span(
             trace_service,
             parse_span,
-            output_summary={
-                "parser_name": _parser_name(parser),
-                "parser_version": _parser_version(parser),
-                "block_count": len(text_blocks),
-                "page_count": len(
-                    {
-                        getattr(block, "page", None)
-                        for block in text_blocks
-                        if getattr(block, "page", None) is not None
-                    }
-                ),
-                "duration_ms": parse_duration_ms,
-            },
+            output_summary=parse_output_summary,
             metrics={"duration_ms": parse_duration_ms},
         )
         print(f"  [PIPELINE] Step 1 — Parsed {len(text_blocks)} text blocks")
