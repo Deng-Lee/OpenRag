@@ -1,42 +1,42 @@
-# File Preview Action Button + Single-File List Filter — Implementation Plan
+# 文件预览操作按钮 + 单文件列表筛选 — 实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **致执行本计划的智能体：** 必备子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 来逐任务实施本计划。各步骤使用复选框（`- [ ]`）语法以便跟踪进度。
 
-**Goal:** Add an always-available "preview" action button to the file list (works for any parse status, hides the modal's download button from read-only users), and make selecting a single file node in the left tree narrow the right list to just that file.
+**目标：** 为文件列表新增一个始终可用的「预览」操作按钮（对任意解析状态都生效，并对只读用户隐藏弹窗中的下载按钮）；同时让在左侧树中选中单个文件节点时，把右侧列表收窄为仅显示该文件。
 
-**Architecture:** Pure-frontend change in `web/` only — no backend edits. Change 1 reuses the existing `FilePreviewModal`, driven by a new action-column button; the modal gains an optional `canWrite` prop that gates its download button (route B — deterrent, not an access boundary). Change 2 adds two pure exported helpers in `Files.tsx` (`parseFileNodeId`, `pickDisplayedFiles`) plus a `selectedFileId` state, following the existing pattern of unit-testing the page's pure helpers rather than rendering the whole page.
+**架构：** 纯前端改动，仅涉及 `web/` —— 无后端改动。改动 1 复用现有的 `FilePreviewModal`，由操作列中新增的按钮触发；该弹窗新增一个可选的 `canWrite` 属性，用于控制其下载按钮（方案 B —— 仅作为威慑/提示，并非访问权限边界）。改动 2 在 `Files.tsx` 中新增两个导出的纯函数辅助方法（`parseFileNodeId`、`pickDisplayedFiles`）以及一个 `selectedFileId` 状态，沿用现有「对页面纯函数做单元测试而非渲染整个页面」的模式。
 
-**Tech Stack:** React 18 + TypeScript, Ant Design 5, react-i18next, Vitest + @testing-library/react.
+**技术栈：** React 18 + TypeScript、Ant Design 5、react-i18next、Vitest + @testing-library/react。
 
-Spec: [docs/superpowers/specs/2026-06-24-file-preview-action-and-single-file-filter-design.md](../specs/2026-06-24-file-preview-action-and-single-file-filter-design.md)
+规格文档：[docs/superpowers/specs/2026-06-24-file-preview-action-and-single-file-filter-design.md](../specs/2026-06-24-file-preview-action-and-single-file-filter-design.md)
 
 ---
 
-## File Structure
+## 文件结构
 
-| File | Responsibility | Change |
+| 文件 | 职责 | 改动 |
 |---|---|---|
-| `web/src/i18n/locales/zh.json` / `en.json` | UI strings | Add `files.actions.preview` |
-| `web/src/pages/Files.tsx` | Files page: left tree + right list state | Add `parseFileNodeId`, `pickDisplayedFiles`, `selectedFileId` state + wiring |
-| `web/src/pages/Files.test.tsx` | Pure-helper unit tests | Add tests for the two new helpers |
-| `web/src/components/FilePreviewModal.tsx` | Preview modal | Add `canWrite?` prop, gate download button |
-| `web/src/components/FilePreviewModal.test.tsx` | Modal download-visibility tests | **New file** |
-| `web/src/components/FileList.tsx` | File table + actions column | Always-render action column; add Preview button; pass `canWrite` to modal |
-| `web/src/components/FileList.test.tsx` | FileList render tests | Enhance modal mock; add preview/read-only tests |
+| `web/src/i18n/locales/zh.json` / `en.json` | UI 文案 | 新增 `files.actions.preview` |
+| `web/src/pages/Files.tsx` | 文件页：左侧树 + 右侧列表状态 | 新增 `parseFileNodeId`、`pickDisplayedFiles`、`selectedFileId` 状态及接线 |
+| `web/src/pages/Files.test.tsx` | 纯函数单元测试 | 为两个新辅助函数新增测试 |
+| `web/src/components/FilePreviewModal.tsx` | 预览弹窗 | 新增 `canWrite?` 属性，控制下载按钮 |
+| `web/src/components/FilePreviewModal.test.tsx` | 弹窗下载按钮可见性测试 | **新文件** |
+| `web/src/components/FileList.tsx` | 文件表格 + 操作列 | 操作列始终渲染；新增预览按钮；向弹窗传入 `canWrite` |
+| `web/src/components/FileList.test.tsx` | FileList 渲染测试 | 增强弹窗 mock；新增预览/只读相关测试 |
 
-**All commands run from the `web/` directory.** Test runner: `npx vitest run <path>` (project script `npm test` = `vitest --run`). Typecheck/build: `npm run build` (`tsc && vite build`).
+**所有命令均在 `web/` 目录下执行。** 测试运行器：`npx vitest run <path>`（项目脚本 `npm test` = `vitest --run`）。类型检查/构建：`npm run build`（`tsc && vite build`）。
 
 ---
 
-## Task 1: i18n key `files.actions.preview`
+## 任务 1：新增 i18n 文案 `files.actions.preview`
 
-**Files:**
-- Modify: `web/src/i18n/locales/zh.json:152`
-- Modify: `web/src/i18n/locales/en.json:152`
+**文件：**
+- 修改：`web/src/i18n/locales/zh.json:152`
+- 修改：`web/src/i18n/locales/en.json:152`
 
-- [ ] **Step 1: Add the Chinese string**
+- [ ] **步骤 1：新增中文文案**
 
-In `web/src/i18n/locales/zh.json`, inside the `files.actions` object (the one starting at line 147), add a `preview` entry right after the `reprocess` line:
+在 `web/src/i18n/locales/zh.json` 的 `files.actions` 对象（从第 147 行开始的那个）内，紧跟 `reprocess` 行之后新增一个 `preview` 条目：
 
 ```json
       "reprocess": "重新处理",
@@ -44,9 +44,9 @@ In `web/src/i18n/locales/zh.json`, inside the `files.actions` object (the one st
       "manage_dir": "管理目录",
 ```
 
-- [ ] **Step 2: Add the English string**
+- [ ] **步骤 2：新增英文文案**
 
-In `web/src/i18n/locales/en.json`, inside the `files.actions` object (line 147), add the matching entry after `reprocess`:
+在 `web/src/i18n/locales/en.json` 的 `files.actions` 对象（第 147 行）内，紧跟 `reprocess` 之后新增对应条目：
 
 ```json
       "reprocess": "Reprocess",
@@ -54,12 +54,12 @@ In `web/src/i18n/locales/en.json`, inside the `files.actions` object (line 147),
       "manage_dir": "Manage Directory",
 ```
 
-- [ ] **Step 3: Verify both JSON files still parse**
+- [ ] **步骤 3：确认两个 JSON 文件仍可正常解析**
 
-Run: `cd web && node -e "JSON.parse(require('fs').readFileSync('src/i18n/locales/zh.json','utf8')); JSON.parse(require('fs').readFileSync('src/i18n/locales/en.json','utf8')); console.log('OK')"`
-Expected: prints `OK` (no JSON syntax error).
+运行：`cd web && node -e "JSON.parse(require('fs').readFileSync('src/i18n/locales/zh.json','utf8')); JSON.parse(require('fs').readFileSync('src/i18n/locales/en.json','utf8')); console.log('OK')"`
+预期：打印 `OK`（无 JSON 语法错误）。
 
-- [ ] **Step 4: Commit**
+- [ ] **步骤 4：提交**
 
 ```bash
 git add web/src/i18n/locales/zh.json web/src/i18n/locales/en.json
@@ -68,17 +68,17 @@ git commit -m "i18n(web): add files.actions.preview string"
 
 ---
 
-## Task 2: Pure helpers for single-file selection (`Files.tsx`)
+## 任务 2：单文件选择的纯函数辅助方法（`Files.tsx`）
 
-These are pure, exported functions tested directly — matching the existing `selectDisplayedFiles` / `isUnderLogicalPath` pattern in `Files.test.tsx`.
+这些是直接测试的纯导出函数 —— 与 `Files.test.tsx` 中现有的 `selectDisplayedFiles` / `isUnderLogicalPath` 模式一致。
 
-**Files:**
-- Modify: `web/src/pages/Files.tsx` (add helpers after `selectDisplayedFiles`, line 90)
-- Test: `web/src/pages/Files.test.tsx`
+**文件：**
+- 修改：`web/src/pages/Files.tsx`（在 `selectDisplayedFiles` 之后、第 90 行处新增辅助函数）
+- 测试：`web/src/pages/Files.test.tsx`
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **步骤 1：编写会失败的测试**
 
-In `web/src/pages/Files.test.tsx`, update the import on line 2 and append two `describe` blocks at the end of the file:
+在 `web/src/pages/Files.test.tsx` 中，更新第 2 行的 import，并在文件末尾追加两个 `describe` 块：
 
 ```typescript
 import { isUnderLogicalPath, selectDisplayedFiles, parseFileNodeId, pickDisplayedFiles } from './Files';
@@ -124,14 +124,14 @@ describe('pickDisplayedFiles', () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **步骤 2：运行测试以确认其失败**
 
-Run: `cd web && npx vitest run src/pages/Files.test.tsx`
-Expected: FAIL — `parseFileNodeId is not a function` / `pickDisplayedFiles is not a function` (import resolves to `undefined`).
+运行：`cd web && npx vitest run src/pages/Files.test.tsx`
+预期：失败 —— `parseFileNodeId is not a function` / `pickDisplayedFiles is not a function`（import 解析为 `undefined`）。
 
-- [ ] **Step 3: Implement the helpers**
+- [ ] **步骤 3：实现辅助函数**
 
-In `web/src/pages/Files.tsx`, immediately after the `selectDisplayedFiles` function (ends line 90), add:
+在 `web/src/pages/Files.tsx` 中，紧跟 `selectDisplayedFiles` 函数（结束于第 90 行）之后，新增：
 
 ```typescript
 /** 文件树节点 key 形如 "file-<id>"；解析出正整数 id，非文件节点或非法 key 返回 null。 */
@@ -154,12 +154,12 @@ export function pickDisplayedFiles(
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **步骤 4：运行测试以确认其通过**
 
-Run: `cd web && npx vitest run src/pages/Files.test.tsx`
-Expected: PASS (all `parseFileNodeId`, `pickDisplayedFiles`, and pre-existing helper tests green).
+运行：`cd web && npx vitest run src/pages/Files.test.tsx`
+预期：通过（`parseFileNodeId`、`pickDisplayedFiles` 以及既有辅助函数的测试全部为绿）。
 
-- [ ] **Step 5: Commit**
+- [ ] **步骤 5：提交**
 
 ```bash
 git add web/src/pages/Files.tsx web/src/pages/Files.test.tsx
@@ -168,24 +168,24 @@ git commit -m "feat(web): add parseFileNodeId + pickDisplayedFiles helpers for s
 
 ---
 
-## Task 3: Wire single-file selection into the Files page (`Files.tsx`)
+## 任务 3：将单文件选择接入文件页（`Files.tsx`）
 
-Mechanical wiring of the Task 2 helpers into component state. Per the existing pattern, this page's full render is not unit-tested (the test file covers pure helpers only); verification is typecheck + existing suite.
+把任务 2 的辅助函数机械地接入组件状态。按现有模式，本页面的完整渲染不做单元测试（测试文件只覆盖纯函数）；验证方式为类型检查 + 既有测试套件。
 
-**Files:**
-- Modify: `web/src/pages/Files.tsx:241` (add state), `:492-496` (`handleWorkspaceChange`), `:520-527` (`onSelectDirectory`), `:663-666` (`displayedFiles`)
+**文件：**
+- 修改：`web/src/pages/Files.tsx:241`（新增状态）、`:492-496`（`handleWorkspaceChange`）、`:520-527`（`onSelectDirectory`）、`:663-666`（`displayedFiles`）
 
-- [ ] **Step 1: Add the `selectedFileId` state**
+- [ ] **步骤 1：新增 `selectedFileId` 状态**
 
-In `web/src/pages/Files.tsx`, directly after line 241 (`const [selectedDirectory, setSelectedDirectory] = useState<string>('/');`), add:
+在 `web/src/pages/Files.tsx` 中，紧跟第 241 行（`const [selectedDirectory, setSelectedDirectory] = useState<string>('/');`）之后，新增：
 
 ```typescript
   const [selectedFileId, setSelectedFileId] = useState<number | null>(null);
 ```
 
-- [ ] **Step 2: Reset selected file on workspace change**
+- [ ] **步骤 2：切换工作区时重置已选文件**
 
-In `handleWorkspaceChange` (lines 492-496), add the reset alongside the existing directory reset:
+在 `handleWorkspaceChange`（第 492-496 行）中，连同现有的目录重置一起新增文件重置：
 
 ```typescript
   const handleWorkspaceChange = (workspace: Workspace) => {
@@ -196,9 +196,9 @@ In `handleWorkspaceChange` (lines 492-496), add the reset alongside the existing
   };
 ```
 
-- [ ] **Step 3: Handle file-node selection in `onSelectDirectory`**
+- [ ] **步骤 3：在 `onSelectDirectory` 中处理文件节点选择**
 
-Replace the whole `onSelectDirectory` function (lines 520-527) with:
+将整个 `onSelectDirectory` 函数（第 520-527 行）替换为：
 
 ```typescript
   const onSelectDirectory = (selectedKeys: Key[]) => {
@@ -214,9 +214,9 @@ Replace the whole `onSelectDirectory` function (lines 520-527) with:
   };
 ```
 
-- [ ] **Step 4: Use `pickDisplayedFiles` for the right list**
+- [ ] **步骤 4：右侧列表改用 `pickDisplayedFiles`**
 
-Replace the `displayedFiles` memo (lines 663-666) with:
+将 `displayedFiles` 的 memo（第 663-666 行）替换为：
 
 ```typescript
   // 右侧列表：选中单个文件时只显示该文件，否则排除目录行并按当前选中目录（递归）收窄。
@@ -226,17 +226,17 @@ Replace the `displayedFiles` memo (lines 663-666) with:
   );
 ```
 
-- [ ] **Step 5: Typecheck**
+- [ ] **步骤 5：类型检查**
 
-Run: `cd web && npm run build`
-Expected: build succeeds (no TS errors). `parseFileNodeId` and `pickDisplayedFiles` are already imported because they're defined and used in the same module — confirm no "declared but never read" error for the removed inline filter.
+运行：`cd web && npm run build`
+预期：构建成功（无 TS 错误）。`parseFileNodeId` 与 `pickDisplayedFiles` 因在同一模块中定义并使用，已自然被引用 —— 确认被移除的内联 filter 不会引发「声明却从未读取」之类的报错。
 
-- [ ] **Step 6: Run the page's unit tests (regression)**
+- [ ] **步骤 6：运行页面的单元测试（回归）**
 
-Run: `cd web && npx vitest run src/pages/Files.test.tsx`
-Expected: PASS (unchanged helper tests still green).
+运行：`cd web && npx vitest run src/pages/Files.test.tsx`
+预期：通过（未改动的辅助函数测试仍为绿）。
 
-- [ ] **Step 7: Commit**
+- [ ] **步骤 7：提交**
 
 ```bash
 git add web/src/pages/Files.tsx
@@ -245,15 +245,15 @@ git commit -m "feat(web): narrow right file list to the file selected in the lef
 
 ---
 
-## Task 4: Gate the preview modal's download button by `canWrite` (`FilePreviewModal.tsx`)
+## 任务 4：按 `canWrite` 控制预览弹窗的下载按钮（`FilePreviewModal.tsx`）
 
-**Files:**
-- Modify: `web/src/components/FilePreviewModal.tsx:29-35` (prop), `:189-193` (download button)
-- Test: `web/src/components/FilePreviewModal.test.tsx` (**new**)
+**文件：**
+- 修改：`web/src/components/FilePreviewModal.tsx:29-35`（属性）、`:189-193`（下载按钮）
+- 测试：`web/src/components/FilePreviewModal.test.tsx`（**新文件**）
 
-- [ ] **Step 1: Write the failing test (new file)**
+- [ ] **步骤 1：编写会失败的测试（新文件）**
 
-Create `web/src/components/FilePreviewModal.test.tsx`:
+创建 `web/src/components/FilePreviewModal.test.tsx`：
 
 ```tsx
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -329,14 +329,14 @@ describe('FilePreviewModal download button visibility', () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **步骤 2：运行测试以确认其失败**
 
-Run: `cd web && npx vitest run src/components/FilePreviewModal.test.tsx`
-Expected: FAIL — the third test (and the first) fail because the download button currently renders whenever `file && !file.is_directory` regardless of `canWrite`, so `files.preview.download` text is present. (`canWrite` is also not yet a valid prop — a TS error may surface in the editor, but vitest runs via esbuild and will execute; the assertions are what fail.)
+运行：`cd web && npx vitest run src/components/FilePreviewModal.test.tsx`
+预期：失败 —— 第三个（以及第一个）测试失败，因为当前只要 `file && !file.is_directory` 下载按钮就会渲染，与 `canWrite` 无关，所以 `files.preview.download` 文案存在。（`canWrite` 此时也还不是合法属性 —— 编辑器中可能出现 TS 报错，但 vitest 经由 esbuild 运行仍会执行；失败的是断言部分。）
 
-- [ ] **Step 3: Add the `canWrite` prop**
+- [ ] **步骤 3：新增 `canWrite` 属性**
 
-In `web/src/components/FilePreviewModal.tsx`, extend the props interface (lines 29-33):
+在 `web/src/components/FilePreviewModal.tsx` 中，扩展属性接口（第 29-33 行）：
 
 ```tsx
 interface FilePreviewModalProps {
@@ -347,15 +347,15 @@ interface FilePreviewModalProps {
 }
 ```
 
-And update the component signature (line 35):
+并更新组件签名（第 35 行）：
 
 ```tsx
 export default function FilePreviewModal({ open, file, onClose, canWrite = false }: FilePreviewModalProps) {
 ```
 
-- [ ] **Step 4: Gate the download button**
+- [ ] **步骤 4：控制下载按钮**
 
-In the modal `title` (lines 189-193), add `canWrite &&` to the render condition:
+在弹窗 `title`（第 189-193 行）中，向渲染条件加上 `canWrite &&`：
 
 ```tsx
           {file && !file.is_directory && canWrite ? (
@@ -365,12 +365,12 @@ In the modal `title` (lines 189-193), add `canWrite &&` to the render condition:
           ) : null}
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [ ] **步骤 5：运行测试以确认其通过**
 
-Run: `cd web && npx vitest run src/components/FilePreviewModal.test.tsx`
-Expected: PASS (download hidden when `canWrite` is false/omitted, shown when true).
+运行：`cd web && npx vitest run src/components/FilePreviewModal.test.tsx`
+预期：通过（`canWrite` 为 false/缺省时隐藏下载，为 true 时显示）。
 
-- [ ] **Step 6: Commit**
+- [ ] **步骤 6：提交**
 
 ```bash
 git add web/src/components/FilePreviewModal.tsx web/src/components/FilePreviewModal.test.tsx
@@ -379,24 +379,24 @@ git commit -m "feat(web): hide FilePreviewModal download button from read-only u
 
 ---
 
-## Task 5: Preview action button + always-on action column (`FileList.tsx`)
+## 任务 5：预览操作按钮 + 始终渲染的操作列（`FileList.tsx`）
 
-**Files:**
-- Modify: `web/src/components/FileList.tsx:2` (icon import), `:208-236` (action column), `:302-306` (modal props)
-- Test: `web/src/components/FileList.test.tsx:12-51` (label map), `:62-64` (modal mock), append tests
+**文件：**
+- 修改：`web/src/components/FileList.tsx:2`（图标 import）、`:208-236`（操作列）、`:302-306`（弹窗属性）
+- 测试：`web/src/components/FileList.test.tsx:12-51`（label 映射）、`:62-64`（弹窗 mock）、追加测试
 
-- [ ] **Step 1: Update the test — enhance the modal mock, add the i18n label, write new tests**
+- [ ] **步骤 1：更新测试 —— 增强弹窗 mock、新增 i18n 文案、编写新测试**
 
-In `web/src/components/FileList.test.tsx`:
+在 `web/src/components/FileList.test.tsx` 中：
 
-(a) Add the preview label to the mock `labels` map (after the `files.actions.reprocess` entry, line 33):
+(a) 向 mock 的 `labels` 映射新增预览文案（在 `files.actions.reprocess` 条目之后，第 33 行）：
 
 ```typescript
         'files.actions.reprocess': 'Reprocess',
         'files.actions.preview': 'Preview',
 ```
 
-(b) Replace the `FilePreviewModal` mock (lines 62-64) so it surfaces `open` / `file` / `canWrite`:
+(b) 替换 `FilePreviewModal` 的 mock（第 62-64 行），使其暴露 `open` / `file` / `canWrite`：
 
 ```tsx
 vi.mock('./FilePreviewModal', () => ({
@@ -409,7 +409,7 @@ vi.mock('./FilePreviewModal', () => ({
 }));
 ```
 
-(c) Append these tests inside the `describe('FileList', ...)` block (before its closing `});` on line 300):
+(c) 在 `describe('FileList', ...)` 块内（其结尾的 `});`，即第 300 行之前）追加这些测试：
 
 ```tsx
   const previewFile = {
@@ -447,22 +447,22 @@ vi.mock('./FilePreviewModal', () => ({
   });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **步骤 2：运行测试以确认其失败**
 
-Run: `cd web && npx vitest run src/components/FileList.test.tsx`
-Expected: FAIL — `getByTitle('Preview')` finds nothing (no preview button yet; for read-only users the action column isn't even rendered today).
+运行：`cd web && npx vitest run src/components/FileList.test.tsx`
+预期：失败 —— `getByTitle('Preview')` 找不到任何元素（尚无预览按钮；并且当前对只读用户而言，操作列根本不渲染）。
 
-- [ ] **Step 3: Import the icon**
+- [ ] **步骤 3：引入图标**
 
-In `web/src/components/FileList.tsx`, add `EyeOutlined` to the icon import (line 2):
+在 `web/src/components/FileList.tsx` 中，向图标 import（第 2 行）加入 `EyeOutlined`：
 
 ```tsx
 import { DeleteOutlined, FolderOutlined, FileOutlined, ReloadOutlined, EyeOutlined } from '@ant-design/icons';
 ```
 
-- [ ] **Step 4: Make the action column always render with a Preview button**
+- [ ] **步骤 4：让操作列始终渲染，并带上预览按钮**
 
-Replace the entire trailing action-column entry (lines 208-236, the `...(canWrite ? [{ ... }] : [])` spread) with a plain always-present column:
+将整个末尾的操作列条目（第 208-236 行，即 `...(canWrite ? [{ ... }] : [])` 展开式）替换为一个始终存在的普通列：
 
 ```tsx
     {
@@ -507,11 +507,11 @@ Replace the entire trailing action-column entry (lines 208-236, the `...(canWrit
   ];
 ```
 
-(The closing `];` shown is the existing end of the `columns` array — do not duplicate it.)
+（此处展示的结尾 `];` 是现有 `columns` 数组的末尾 —— 请勿重复添加。）
 
-- [ ] **Step 5: Pass `canWrite` to the preview modal**
+- [ ] **步骤 5：向预览弹窗传入 `canWrite`**
 
-Update the `FilePreviewModal` usage (lines 302-306):
+更新 `FilePreviewModal` 的使用处（第 302-306 行）：
 
 ```tsx
       <FilePreviewModal
@@ -522,12 +522,12 @@ Update the `FilePreviewModal` usage (lines 302-306):
       />
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **步骤 6：运行测试以确认其通过**
 
-Run: `cd web && npx vitest run src/components/FileList.test.tsx`
-Expected: PASS — new preview tests green; pre-existing tests (name navigation, reprocess modal, failed popover, etc.) still pass because the name-link button keeps accessible name `a.pdf`/`b.pdf` and reprocess/delete are unchanged for writers.
+运行：`cd web && npx vitest run src/components/FileList.test.tsx`
+预期：通过 —— 新增的预览测试为绿；既有测试（文件名跳转、reprocess 弹窗、失败气泡卡片等）仍然通过，因为文件名链接按钮保留了可访问名 `a.pdf`/`b.pdf`，且对写入用户而言 reprocess/delete 未变。
 
-- [ ] **Step 7: Commit**
+- [ ] **步骤 7：提交**
 
 ```bash
 git add web/src/components/FileList.tsx web/src/components/FileList.test.tsx
@@ -536,28 +536,28 @@ git commit -m "feat(web): add always-available preview action button to the file
 
 ---
 
-## Task 6: Full verification
+## 任务 6：完整验证
 
-- [ ] **Step 1: Run the entire web test suite**
+- [ ] **步骤 1：运行整个 web 测试套件**
 
-Run: `cd web && npm test`
-Expected: all suites PASS (Files, FileList, FilePreviewModal, and every other existing test).
+运行：`cd web && npm test`
+预期：所有套件通过（Files、FileList、FilePreviewModal 以及其余所有既有测试）。
 
-- [ ] **Step 2: Typecheck + production build**
+- [ ] **步骤 2：类型检查 + 生产构建**
 
-Run: `cd web && npm run build`
-Expected: `tsc` reports no errors and `vite build` completes.
+运行：`cd web && npm run build`
+预期：`tsc` 无报错，且 `vite build` 完成。
 
-- [ ] **Step 3: Manual smoke checklist (run `npm run dev`, then verify)**
+- [ ] **步骤 3：手动冒烟检查清单（运行 `npm run dev` 后逐项验证）**
 
-  - Action column now shows an eye/preview button on every file row (including read-only users and `done` files).
-  - Clicking preview opens `FilePreviewModal` for a `done` file (the gap the feature closes).
-  - As a read-only user, the modal has no Download button; as a writer, it does.
-  - Clicking a folder in the left tree scopes the right list to that folder (unchanged behavior).
-  - Clicking a single **file** node in the left tree narrows the right list to exactly that one file; clicking a folder again restores folder scoping.
-  - Switching workspaces clears any single-file selection.
+  - 操作列现在会在每一文件行（包括只读用户与 `done` 状态文件）上显示一个眼睛/预览按钮。
+  - 点击预览能为 `done` 文件打开 `FilePreviewModal`（这正是本特性补上的缺口）。
+  - 作为只读用户，弹窗中没有下载按钮；作为写入用户，则有。
+  - 在左侧树中点击文件夹，会把右侧列表收窄到该文件夹（行为不变）。
+  - 在左侧树中点击单个**文件**节点，会把右侧列表精确收窄到该文件；再次点击文件夹则恢复按文件夹收窄。
+  - 切换工作区会清除任何单文件选择状态。
 
-- [ ] **Step 4: Final commit (only if Step 3 surfaced fixes)**
+- [ ] **步骤 4：最终提交（仅当步骤 3 暴露出需修复之处时）**
 
 ```bash
 git add -A -- web/
@@ -566,15 +566,15 @@ git commit -m "fix(web): address preview/single-file-filter smoke findings"
 
 ---
 
-## Self-Review Notes
+## 自查记录
 
-**Spec coverage:**
-- §4 Change 1 (action-column preview button, all users, always-render column, width 160, reuse modal, name-click unchanged) → Tasks 1, 5.
-- §4 Change 1 download-button route B (hide for read-only via `canWrite`) → Task 4; FileList passes `canWrite` → Task 5 Step 5.
-- §4 Change 2 (`selectedFileId`, `onSelectDirectory` file branch, `pickDisplayedFiles` derivation, workspace-change reset) → Tasks 2, 3.
-- §7 tests (FileList preview + read-only; Files single-file vs directory) → Task 5 + Task 2. Download-hide gets its own focused test in Task 4 (the spec's note about asserting it in `FileList.test.tsx` is satisfied more reliably against the real modal, since `FileList.test.tsx` mocks the modal away).
-- §6 route C → out of scope by decision; no task. Correct.
+**规格覆盖情况：**
+- §4 改动 1（操作列预览按钮、对所有用户、操作列始终渲染、宽度 160、复用弹窗、文件名点击行为不变）→ 任务 1、5。
+- §4 改动 1 下载按钮方案 B（通过 `canWrite` 对只读用户隐藏）→ 任务 4；FileList 传入 `canWrite` → 任务 5 步骤 5。
+- §4 改动 2（`selectedFileId`、`onSelectDirectory` 的文件分支、`pickDisplayedFiles` 派生、切换工作区时重置）→ 任务 2、3。
+- §7 测试（FileList 预览 + 只读；Files 单文件 vs 目录）→ 任务 5 + 任务 2。下载隐藏在任务 4 中有专门的聚焦测试（规格中关于在 `FileList.test.tsx` 里断言它的备注，改为针对真实弹窗来验证更可靠，因为 `FileList.test.tsx` 已把弹窗 mock 掉了）。
+- §6 方案 C → 经决策定为不在范围内；无对应任务。正确。
 
-**Type consistency:** `parseFileNodeId(key: string): number | null` and `pickDisplayedFiles(files, selectedDirectory, selectedFileId)` are named and signed identically in Task 2 (definition + tests) and Task 3 (call site). `canWrite?: boolean` matches across `FilePreviewModal` (Task 4) and the `FileList` call site + test mock (Task 5).
+**类型一致性：** `parseFileNodeId(key: string): number | null` 与 `pickDisplayedFiles(files, selectedDirectory, selectedFileId)` 在任务 2（定义 + 测试）和任务 3（调用处）中的命名与签名完全一致。`canWrite?: boolean` 在 `FilePreviewModal`（任务 4）与 `FileList` 调用处 + 测试 mock（任务 5）之间保持一致。
 
-**No placeholders:** every code step contains the literal code; every run step lists the exact command and expected result.
+**无占位符：** 每个代码步骤都包含字面代码；每个运行步骤都列出确切命令与预期结果。
