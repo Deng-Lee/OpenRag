@@ -89,6 +89,25 @@ export function selectDisplayedFiles(files: File[], selectedDirectory: string): 
   return files.filter((f) => !f.is_directory && isUnderLogicalPath(f.uri, selectedDirectory));
 }
 
+/** 文件树节点 key 形如 "file-<id>"；解析出正整数 id，非文件节点或非法 key 返回 null。 */
+export function parseFileNodeId(key: string): number | null {
+  if (!key.startsWith('file-')) return null;
+  const id = Number(key.slice('file-'.length));
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/** 右侧列表最终展示集：选中单个文件时只显示该文件，否则按选中目录（递归）收窄。 */
+export function pickDisplayedFiles(
+  files: File[],
+  selectedDirectory: string,
+  selectedFileId: number | null
+): File[] {
+  if (selectedFileId != null) {
+    return files.filter((f) => f.id === selectedFileId && !f.is_directory);
+  }
+  return selectDisplayedFiles(files, selectedDirectory);
+}
+
 function joinChildDirectoryPath(parentKey: string, rawName: string): string {
   const segment = rawName
     .trim()
