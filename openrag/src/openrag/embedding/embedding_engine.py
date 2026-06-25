@@ -22,6 +22,7 @@ _MODEL_DIMS = {
     "text-embedding-v2": 1536,
     "text-embedding-v3": 1024,
     "text-embedding-v4": 1024,
+    "Qwen3-Embedding-4B": 2560,
 }
 
 

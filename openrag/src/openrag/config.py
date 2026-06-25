@@ -110,10 +110,10 @@ class PostgresConfig(BaseSettings):
 class EmbeddingConfig(BaseSettings):
     """Embedding 配置"""
 
-    model: str = "text-embedding-3-small"
+    model: str = "Qwen3-Embedding-4B"
     provider: str = "openai"
     api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
-    dimension: int = 1536
+    dimension: int = 2560
 
 
 class SecurityConfig(BaseSettings):

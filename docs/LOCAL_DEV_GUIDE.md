@@ -24,12 +24,16 @@ OpenRag 依赖于多个外部服务。我们提供了 `docker-compose.dev.yml` �
    ```bash
    cp .env.example .env
    ```
-3. 启动开发环境的 Docker 容器：
+3. （推荐）如果本机曾启动过独立的 RAGFlow 服务，先停掉它们，避免占用内存和端口。该命令不会删除数据卷：
+   ```powershell
+   docker stop docker-ragflow-cpu-1 docker-mysql-1 docker-redis-1 docker-es01-1
+   ```
+4. 启动开发环境的 Docker 容器：
    ```bash
    docker-compose -f docker-compose.dev.yml up -d
    docker compose -f docker-compose.dev.yml up -d postgres etcd minio milvus elasticsearch
    ```
-4. 检查服务是否全部正常运行（看到 `Up` 状态即可）：
+5. 检查服务是否全部正常运行（看到 `Up` 状态即可）：
    ```bash
    docker-compose -f docker-compose.dev.yml ps
    ```
