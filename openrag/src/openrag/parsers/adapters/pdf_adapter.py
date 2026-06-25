@@ -236,14 +236,18 @@ class PDFParserAdapter(RAGFlowParserAdapter):
         logger.info("[pdf_adapter] calling ragflow_parser for file=%s", file_path)
         try:
             text_body, tbls = self.ragflow_parser(file_path)
-            self.last_parse_profile = getattr(
-                self.ragflow_parser, "_last_parse_profile", None
-            )
         except Exception as exc:
             logger.exception(
                 "[pdf_adapter] ragflow_parser FAILED for file=%s", file_path
             )
             raise
+        finally:
+            # Copy the profile on BOTH success and failure: __call__ writes
+            # _last_parse_profile in its own finally (status="error" on
+            # failure), so failed parses stay queryable via the trace span.
+            self.last_parse_profile = getattr(
+                self.ragflow_parser, "_last_parse_profile", None
+            )
         logger.info(
             "[pdf_adapter] ragflow_parser returned: text_body_len=%s, tbls=%s",
             len(text_body) if text_body else 0,

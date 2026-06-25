@@ -92,6 +92,7 @@ def _safe_fail_span(
     error_message: str,
     *,
     metrics: Optional[dict] = None,
+    output_summary: Optional[dict] = None,
 ) -> None:
     if span is None:
         return
@@ -100,6 +101,7 @@ def _safe_fail_span(
             span_id=span.span_id,
             error_message=error_message,
             metrics=metrics,
+            output_summary=output_summary,
         )
     except Exception:
         pass
@@ -271,11 +273,15 @@ class DocumentProcessor:
         try:
             text_blocks = parser.parse(file_path)
         except Exception as exc:
+            fail_profile = _parse_span_profile(parser)
             _safe_fail_span(
                 trace_service,
                 parse_span,
                 str(exc),
                 metrics={"duration_ms": int((time.perf_counter() - parse_started) * 1000)},
+                output_summary=(
+                    {"pdf_stage_profile": fail_profile} if fail_profile else None
+                ),
             )
             _safe_fail_run(
                 trace_service,

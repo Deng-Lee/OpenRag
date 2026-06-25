@@ -1,5 +1,7 @@
 """Persist the PDF stage-timing profile through adapter -> parse.document span."""
 
+import pytest
+
 
 def test_adapter_exposes_last_parse_profile():
     from openrag.parsers.adapters.pdf_adapter import PDFParserAdapter
@@ -24,6 +26,30 @@ def test_adapter_exposes_last_parse_profile():
     assert adapter.last_parse_profile is not None
     assert adapter.last_parse_profile["stages"][0]["stage"] == "pdf.images_ocr"
     assert adapter.last_parse_profile["total_ms"] == 5
+
+
+def test_adapter_exposes_last_parse_profile_on_failure():
+    from openrag.parsers.adapters.pdf_adapter import PDFParserAdapter
+
+    adapter = PDFParserAdapter.__new__(PDFParserAdapter)
+    adapter.last_parse_profile = None
+
+    class _FailingRagflowParser:
+        # __call__ sets this in its own finally before raising; mimic that here.
+        _last_parse_profile = {
+            "stages": [{"stage": "pdf.images_ocr", "duration_ms": 3}],
+            "total_ms": 3,
+            "status": "error",
+        }
+
+        def __call__(self, fnm):
+            raise RuntimeError("layout boom")
+
+    adapter.ragflow_parser = _FailingRagflowParser()
+    with pytest.raises(RuntimeError):
+        adapter._parse_ragflow_with_tables("x.pdf")
+    assert adapter.last_parse_profile is not None
+    assert adapter.last_parse_profile["status"] == "error"
 
 
 def test_parse_span_profile_extracts_clean_subset():

@@ -152,12 +152,14 @@ class TraceService:
         span_id: Optional[str] = None,
         error_message: Optional[str] = None,
         metrics: Optional[Dict[str, Any]] = None,
+        output_summary: Optional[Dict[str, Any]] = None,
     ) -> Optional[TraceSpan]:
         span = self._complete_span(
             span_id=span_id,
             status="failed",
             error_message=error_message,
             metrics=metrics,
+            output_summary=output_summary,
         )
         if span_id is None or span_id == get_trace_context()["span_id"]:
             pop_span()
