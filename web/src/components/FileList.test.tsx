@@ -31,6 +31,7 @@ vi.mock('react-i18next', () => ({
         'files.messages.no': 'No',
         'common.delete': 'Delete',
         'files.actions.reprocess': 'Reprocess',
+        'files.actions.preview': 'Preview',
         'files.fields.parser_type': 'Parser',
         'files.fields.document_type': 'Document Type',
         'files.messages.reprocess_hint': 'Hint',
@@ -60,7 +61,12 @@ vi.mock('react-router-dom', () => ({
 }));
 
 vi.mock('./FilePreviewModal', () => ({
-  default: () => null,
+  default: (props: { open: boolean; file: { name?: string } | null; canWrite?: boolean }) =>
+    props.open && props.file ? (
+      <div data-testid="preview-modal" data-can-write={String(!!props.canWrite)}>
+        {props.file.name}
+      </div>
+    ) : null,
 }));
 
 vi.mock('../services/api', () => ({
@@ -296,5 +302,39 @@ describe('FileList', () => {
     await waitFor(() => {
       expect(reprocessMock).toHaveBeenCalledWith(5, undefined, 'general');
     });
+  });
+
+  const previewFile = {
+    id: 1,
+    uri: '/uploads/test.pdf',
+    name: 'test.pdf',
+    owner_id: 1,
+    is_directory: false,
+    size: 1024,
+    mime_type: 'application/pdf',
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+  };
+
+  it('opens the preview modal when the preview action is clicked', () => {
+    renderFileList(<FileList files={[previewFile]} onFileDeleted={vi.fn()} />);
+    expect(screen.queryByTestId('preview-modal')).toBeNull();
+    fireEvent.click(screen.getByTitle('Preview'));
+    expect(screen.getByTestId('preview-modal')).toHaveTextContent('test.pdf');
+  });
+
+  it('shows preview for read-only users but hides reprocess and delete', () => {
+    renderFileList(<FileList files={[previewFile]} onFileDeleted={vi.fn()} />);
+    expect(screen.getByTitle('Preview')).toBeInTheDocument();
+    expect(screen.queryByTitle('Reprocess')).toBeNull();
+    expect(screen.queryByText('Delete')).toBeNull();
+    fireEvent.click(screen.getByTitle('Preview'));
+    expect(screen.getByTestId('preview-modal')).toHaveAttribute('data-can-write', 'false');
+  });
+
+  it('passes canWrite to the preview modal for writers', () => {
+    renderFileList(<FileList files={[previewFile]} onFileDeleted={vi.fn()} canWrite />);
+    fireEvent.click(screen.getByTitle('Preview'));
+    expect(screen.getByTestId('preview-modal')).toHaveAttribute('data-can-write', 'true');
   });
 });
