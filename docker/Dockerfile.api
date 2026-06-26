@@ -54,6 +54,9 @@ RUN cp -a /root/.local/lib/python3.11/site-packages/. /usr/local/lib/python3.11/
 COPY openrag/src/ ./src/
 COPY openrag/run_api.py .
 COPY openrag/setup.py .
+# Alembic 配置与迁移脚本：随镜像打包，容器内才能执行 `python -m alembic upgrade head`
+COPY openrag/alembic.ini .
+COPY openrag/alembic/ ./alembic/
 
 # Install the package
 RUN pip install --no-cache-dir -e .
