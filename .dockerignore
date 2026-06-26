@@ -40,6 +40,14 @@ docs/
 **/test/
 **/fixtures/
 
+# Worktrees & build caches (not needed in images; bloat build context)
+.worktrees/
+**/.uv-cache*/
+**/.venv/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
 # Misc
 *.tar
 *.tar.gz

@@ -42,7 +42,9 @@ ENV PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.10
 EXPOSE 80
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --quiet --tries=1 --spider http://localhost/health || exit 1
+# 用 127.0.0.1 而非 localhost：容器内 localhost 会先解析成 IPv6 [::1]，
+# 而 nginx 仅监听 IPv4，会导致探针 Connection refused → 容器误报 unhealthy。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1/health || exit 1
 
 CMD ["sh", "-c", "envsubst '${PREVIEW_FRAME_ANCESTORS}' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
