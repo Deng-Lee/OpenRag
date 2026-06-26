@@ -69,3 +69,6 @@ docker/data/
 
 # Offline release tarballs
 openrag-offline-*.tar
+
+# Local commit-history summary (not tracked)
+worktime.md
