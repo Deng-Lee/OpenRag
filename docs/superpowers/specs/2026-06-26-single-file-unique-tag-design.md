@@ -23,6 +23,7 @@
 | 存储方案 | **在 `files` 表加一列 `tag`**（非独立 `file_tags` 表）；unique 索引同时服务唯一性校验与检索查询 |
 | 前端"只在单文件加 tag" | tag 非空且拖入文件夹/多文件时，**整批拦截并提示**；tag 为空时文件夹/批量照常、不加 tag |
 | 替换 / reprocess / 数据源连接器 | **不改**——tag 只在新建文件时设定 |
+| 外部删除（新增） | 新增 `DELETE /service/v1/workspaces/{name}/documents/by-path`，复用内部删除链路，默认异步 202；删除即释放 tag、可被后续上传复用 |
 | tag 默认约束（评审可改） | 长度上限 **128**；**区分大小写精确匹配**；纯空白视为不打 tag（NULL）；删除文件即释放 tag |
 
 ## 3. 关键现状（代码事实）
@@ -33,6 +34,7 @@
   - `POST /service/v1/workspaces/{workspace_name}/documents`（[service_api.py:295](../../../openrag/src/openrag/api/service_api.py)）— 外部 service token。
 - `PUT /service/v1/workspaces/{workspace_name}/documents/by-path`（[service_api.py:329](../../../openrag/src/openrag/api/service_api.py)）是**替换已有文件内容**（走 `replace_file_content`，沿用旧 `File` 行），不是新建 → 不涉及 tag。
 - 数据源连接器（GitHub / Google Drive / Jira / Bitbucket 等，`openrag/common/data_source/`）是**批量同步**，不走上传端点 → 不涉及。
+- **删除现状**：外部 service-token API（`service_api.py`）**没有任何 `@router.delete`**——外部只能上传(POST)与替换内容(PUT by-path)，删不了文档。唯一的文档删除是内部 `DELETE /files/{file_id}`（[files_api.py:741](../../../openrag/src/openrag/api/files_api.py)，JWT `get_current_user` + owner/admin write）：默认异步建 `TaskType.DELETE_FILE` 任务，`background=false` 时同步调 `delete_file_with_storage(db, file, workspace)`。删除的统一 chokepoint 为 `delete_file_with_storage`（[file_deletion.py:82](../../../openrag/src/openrag/services/file_deletion.py)）；`TaskType.DELETE_FILE` 见 [task.py:36](../../../openrag/src/openrag/models/task.py)。
 - `File` 模型（[file.py](../../../openrag/src/openrag/models/file.py)）**无 tag 字段**；已有 `UniqueConstraint("workspace_id", "uri", name="uq_files_workspace_uri")`（[file.py:175](../../../openrag/src/openrag/models/file.py)）；`@validates(...)` 在 [file.py:84](../../../openrag/src/openrag/models/file.py) 对若干字符串列做 NUL 清洗。
 - `service_api.py` 已有可复用 helper：`_token_can_read_workspace(ctx, workspace_id)`（[service_api.py:228](../../../openrag/src/openrag/api/service_api.py)）、`_document_summary(f)`（[service_api.py:172](../../../openrag/src/openrag/api/service_api.py)）、`_upload_response_dict(...)`（[service_api.py:184](../../../openrag/src/openrag/api/service_api.py)）、`require_workspace_for_name` / `assert_token_workspace_permission`。
 - 前端上传弹窗组件 `FileUpload.tsx`：
@@ -108,10 +110,28 @@ GET /service/v1/documents/by-tag?tag=XXX
 - i18n：新增 `files.upload.tag_label` / `files.upload.tag_conflict` / `files.upload.tag_batch_blocked`（`zh.json`/`en.json` 各一条）。
 - 文件列表/详情若存在 tag 则展示（沿用现有渲染，纯增量）。
 
+### 4.7 外部删除入口（新增，仅外部 service token）
+
+新增 `DELETE /service/v1/workspaces/{workspace_name}/documents/by-path`，与现有 `PUT .../by-path` 同一 URL 形态、对称：
+
+```
+DELETE /service/v1/workspaces/{workspace_name}/documents/by-path?path=XXX&background=true
+```
+
+- 鉴权：`require_workspace_for_name(db, workspace_name)` + `assert_token_workspace_permission(ctx, ws.id, "write")`（删除属写操作）。
+- 定位文件：`db.query(File).filter(File.workspace_id == ws.id, File.uri == validate_path(path), File.is_directory.is_(False)).first()`；为空 → `404`（沿用 PUT by-path 的查找方式 [service_api.py:341-347](../../../openrag/src/openrag/api/service_api.py)）。
+- 删除：**复用内部同款删除链路，不重写**：
+  - `background=true`（默认，`Query(default=True)`）：`TaskService.create_task(workspace_id=ws.id, user_id=ws.owner_id, file_id=row.id, task_type=TaskType.DELETE_FILE.value, queue="normal", priority=6, max_retries=3, status=TaskStatus.PENDING)` → 返回 `202 + task_id`。
+  - `background=false`：`delete_file_with_storage(db, row, ws)`（[file_deletion.py:82](../../../openrag/src/openrag/services/file_deletion.py)）同步清 MinIO/层级/Milvus/DB → 返回 `200`。
+- `user_id` 取 `ws.owner_id`，与 service 上传的操作者归属一致。
+- 删除该行后其 `tag`（若有）随之释放，可被后续上传复用。
+- 仅删**单个文件**；目录/前缀级联删除不在本次范围（内部已有 `POST /files/delete-path-prefix`）。
+- 需在 `service_api.py` 增加 import：`delete_file_with_storage`、`TaskService`、`TaskType`、`TaskStatus`。
+
 ## 5. 边界与不做（Non-goals）
 
-- **不**支持给已存在文件改 / 加 / 删 tag（tag 只在新建上传时设定）；替换内容、reprocess 均不动 tag。
-- 删除文件即释放其 tag（行删除，unique 索引自然释放）。
+- **不**支持给已存在文件**原地改 / 加 / 清空** tag（tag 只在新建上传时设定）；替换内容、reprocess 均不动 tag。复用某个 tag 的路径是「删文档 → 重新上传」。
+- 删除文件即释放其 tag（行删除，unique 约束自然释放）。外部经新增的 `DELETE .../documents/by-path` 即可走完此路径；**目录/前缀级联删除**仍不在本次范围（内部 `POST /files/delete-path-prefix` 承担）。
 - 全局唯一的固有性质：上传时 tag 若与**他人工作区**文档撞车也会 409（提示语保持通用「标签已被占用」，不透露在哪个工作区）。
 - **不**为数据源连接器（批量同步）加 tag。
 - **不**新增内部 JWT 的按 tag 检索端点（检索仅外部 service token；内部 UI 通过文件元数据里的 tag 字段查看）。
@@ -129,6 +149,8 @@ GET /service/v1/documents/by-tag?tag=XXX
 - 未知 tag → 404。
 - 超长 tag → 400。
 - （可选）并发抢同一 tag → 恰一个成功、另一个 409。
+- `DELETE /service/v1/workspaces/{name}/documents/by-path` 删除文件 → 文档消失、其 tag 释放、可用同一 tag 重新上传成功。
+- 无 write 权限 token 删除 → 403；删不存在的 path → 404。
 
 **前端**（`FileUpload` 相关测试）：
 
@@ -142,7 +164,7 @@ GET /service/v1/documents/by-tag?tag=XXX
 - `openrag/alembic/versions/20260626_0004_add_file_tag.py`（新建迁移）
 - `openrag/src/openrag/services/file_ingest.py`（`ingest_new_file` 加 `tag` 参数 + 校验 + 竞态兜底）
 - `openrag/src/openrag/api/files_api.py`（`/upload` 加 `tag` Form；`FileUploadResponse` / `_file_to_upload_response` 回显 tag）
-- `openrag/src/openrag/api/service_api.py`（`/documents` 加 `tag` Form；新增 `GET /documents/by-tag`；`_upload_response_dict` / `_document_summary` 带 tag）
+- `openrag/src/openrag/api/service_api.py`（`/documents` 加 `tag` Form；新增 `GET /documents/by-tag`；新增 `DELETE /workspaces/{name}/documents/by-path`；新增 import `delete_file_with_storage` / `TaskService` / `TaskType` / `TaskStatus`；`_upload_response_dict` / `_document_summary` 带 tag）
 - 文件详情/列表响应 schema（增加可选 `tag` 字段）
 - `web/src/components/FileUpload.tsx`（tag 输入 + 批量守卫 + 透传 + 清空 + 409 提示）
 - `web/src/services/api.ts`（`upload()` 加可选 `tag`）
