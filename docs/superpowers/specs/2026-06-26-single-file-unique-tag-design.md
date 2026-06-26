@@ -157,6 +157,7 @@ Form: tag=XXX, path=/parent/dir, parser_type=auto, create_dirs=false   （body: 
   1. 预检查 `(W, target_uri)` 是否被**另一文档**占用 → 占用则 **409**（不误删无关文档）；此检查**先于**任何改动。
   2. 同步 `existing.tag = None` + commit + 入队异步 `DELETE_FILE`(existing)（同 §4.7 background 路径）。
   3. `ingest_new_file(..., tag=tag)` 在 `target_uri` 建新行（此时 tag 已空闲）。
+- **「目标路径被他文档占 → 409」是横切「创建」「移动」两分支的护栏**（只有这两分支会在 `target_uri` 落新文件）：创建分支由 `ingest_new_file` 自身的 `(workspace_id, uri)` 重复校验兜底（上表括注）；移动分支由 step 1 的显式预检查兜底，且**必须先于** step 2 释放旧 tag/排删旧文档——否则目标被占时旧文档已被破坏。「更新」分支（同 uri = tag T 自己）与「他 workspace」分支不涉及。
 - **安全性**：移动分支的异步删旧只按旧行 `id`/`uri` 作用，碰不到新行（§4.7 已论证）。失败窗口（步骤 3 在释放 tag 后因 MinIO 等失败）→ 旧行 tag 已空且已排删、未建出新行，属罕见部分失败，与现有孤儿风险一致；实现计划可用单事务加固。
 - 返回元数据 dict + `action`（`created`/`updated`/`moved`）+ 新/改文档的 `task_id`。
 - **破坏性是明确契约**：异路径/异名 = **真的删掉旧文档**；本端点显式 opt-in（普通 `POST upload` 仍撞 tag 即 409、不受影响）。
