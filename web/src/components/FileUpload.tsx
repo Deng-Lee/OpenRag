@@ -6,12 +6,12 @@ import type { DataNode } from 'antd/es/tree';
 import { useTranslation } from 'react-i18next';
 import { filesAPI } from '../services/api';
 import { shouldBlockTaggedBatch } from './fileUploadGuard';
+import { classifyUploadError } from './fileUploadError';
 import type { DocumentType, File } from '../types';
 import {
   precheck,
   remoteParentDir,
   isDuplicateError,
-  isFilenameTooLongError,
   walkEntry,
   type PickedFile,
   type SkipReason,
@@ -331,11 +331,15 @@ export default function FileUpload({
         const err = error as { response?: { status?: number; data?: { detail?: string } } };
         const code = err.response?.status;
         const detailMsg = String(err.response?.data?.detail ?? '');
-        const errorMsg = code === 409
-          ? t('files.upload.tag_conflict')
-          : isFilenameTooLongError(code, detailMsg)
-          ? t('files.upload.name_too_long')
-          : detailMsg || '文件上传失败';
+        const kind = classifyUploadError(code, detailMsg);
+        const errorMsg =
+          kind === 'tag_conflict'
+            ? t('files.upload.tag_conflict')
+            : kind === 'name_too_long'
+            ? t('files.upload.name_too_long')
+            : kind === 'backend_detail'
+            ? detailMsg
+            : '文件上传失败';
         message.error(errorMsg);
         onError?.(error as Error);
       } finally {
