@@ -72,3 +72,46 @@ def test_bad_tag_rejected_400(db, wsowner, bad):
     with pytest.raises(HTTPException) as ei:
         _ingest(db, w, u, tag=bad)
     assert ei.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_duplicate_tag_same_workspace_409(db, wsowner):
+    w, u = wsowner
+    _ingest(db, w, u, filename="a.txt", tag="dup")
+    with pytest.raises(HTTPException) as ei:
+        _ingest(db, w, u, filename="b.txt", tag="dup")
+    assert ei.value.status_code == status.HTTP_409_CONFLICT
+
+
+def test_duplicate_tag_check_before_mkdir(db, wsowner):
+    """Tag conflict must abort before ancestor dirs are created (no empty dirs left)."""
+    w, u = wsowner
+    _ingest(db, w, u, path="/", filename="a.txt", tag="dup")
+    with pytest.raises(HTTPException):
+        _ingest(db, w, u, path="/new/deep", filename="b.txt", tag="dup")
+    # /new and /new/deep must NOT have been created by the aborted upload
+    leftover = db.query(File).filter(
+        File.workspace_id == w.id, File.is_directory.is_(True), File.uri.like("/new%")
+    ).count()
+    assert leftover == 0
+
+
+def test_same_tag_other_workspace_ok(db, wsowner):
+    w, u = wsowner
+    other = Workspace(name="W2", slug="w2", owner_id=u.id)
+    db.add(other); db.commit(); db.refresh(other)
+    _ingest(db, w, u, filename="a.txt", tag="shared")
+    row2, _ = _ingest(db, other, u, filename="a.txt", tag="shared")
+    assert row2.tag == "shared"
+
+
+def test_violated_unique_constraint_classifier():
+    from openrag.services.file_ingest import _violated_unique_constraint
+
+    class _E:
+        def __init__(self, m): self.orig = m
+
+    assert _violated_unique_constraint(_E('violates unique constraint "uq_files_workspace_tag"')) == "tag"
+    assert _violated_unique_constraint(_E("UNIQUE constraint failed: files.workspace_id, files.tag")) == "tag"
+    assert _violated_unique_constraint(_E('violates unique constraint "uq_files_workspace_uri"')) == "uri"
+    assert _violated_unique_constraint(_E("UNIQUE constraint failed: files.workspace_id, files.uri")) == "uri"
+    assert _violated_unique_constraint(_E("some unrelated error")) is None

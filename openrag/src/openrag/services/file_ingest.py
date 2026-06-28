@@ -44,6 +44,19 @@ def _normalize_tag(tag):
             detail="Invalid tag. Allowed: ^[A-Za-z0-9._:-]{1,128}$",
         )
     return tag
+
+
+def _violated_unique_constraint(exc):
+    """Return 'tag' | 'uri' | None for a unique-violation IntegrityError.
+
+    Works for PostgreSQL (constraint name in message) and SQLite (column list).
+    """
+    msg = str(getattr(exc, "orig", exc) or "")
+    if "uq_files_workspace_tag" in msg or "files.tag" in msg:
+        return "tag"
+    if "uq_files_workspace_uri" in msg or "files.uri" in msg:
+        return "uri"
+    return None
 ALLOWED_MIME_TYPES = [
     "text/plain",
     "text/markdown",
@@ -464,6 +477,21 @@ def ingest_new_file(
                 detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
             )
 
+        if normalized_tag is not None:
+            tag_clash = (
+                db.query(FileModel)
+                .filter(
+                    FileModel.workspace_id == workspace.id,
+                    FileModel.tag == normalized_tag,
+                )
+                .first()
+            )
+            if tag_clash is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tag already in use",
+                )
+
         if require_parent_dir:
             _assert_parent_directory_exists(db, workspace.id, parent_logical_path)
 
@@ -551,7 +579,22 @@ def ingest_new_file(
             tag=normalized_tag,
         )
         db.add(file_record)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            kind = _violated_unique_constraint(exc)
+            if kind == "tag":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tag already in use",
+                ) from exc
+            if kind == "uri":
+                raise HTTPException(
+                    status_code=duplicate_status_code,
+                    detail=f"File already exists at {file_uri}",
+                ) from exc
+            raise
         db.refresh(file_record)
 
         task_record: Optional[Task] = None
