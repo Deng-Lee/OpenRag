@@ -138,6 +138,7 @@ class FileResponse(BaseModel):
     size: int
     mime_type: Optional[str]
     document_type: str
+    tag: Optional[str] = None
     created_at: str
     updated_at: str
     processing_status: Optional[str] = None
@@ -279,6 +280,7 @@ def _file_to_response(file: FileModel, owner_name_map: Optional[dict[int, str]] 
         size=file.size,
         mime_type=file.mime_type,
         document_type=getattr(file, "document_type", None) or DEFAULT_DOCUMENT_TYPE,
+        tag=file.tag,
         created_at=file.created_at.isoformat(),
         updated_at=file.updated_at.isoformat(),
         processing_status=ps,
@@ -356,6 +358,7 @@ async def upload_file(
         default=DEFAULT_DOCUMENT_TYPE,
         description="Document type: general, manual, laws",
     ),
+    tag: Optional[str] = Form(default=None, description="Unique tag within the workspace"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -408,6 +411,7 @@ async def upload_file(
         document_type=document_type,
         require_parent_dir=False,
         duplicate_status_code=status.HTTP_400_BAD_REQUEST,
+        tag=tag,
     )
 
     return _file_to_upload_response(
