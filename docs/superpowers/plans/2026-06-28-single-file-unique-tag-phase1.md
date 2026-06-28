@@ -21,9 +21,10 @@
 | `openrag/src/openrag/models/file.py`（改） | `File` 加 `tag` 列 + `@validates` + `uq_files_workspace_tag` |
 | `openrag/alembic/versions/20260626_0004_add_file_tag.py`（建） | 加 `tag` 列 + 唯一约束的迁移 |
 | `openrag/src/openrag/services/file_ingest.py`（改） | `ingest_new_file` 加 `tag` 参数：正则校验、workspace 内查重前置、`IntegrityError` 分类 helper |
-| `openrag/src/openrag/api/files_api.py`（改） | `POST /files/upload` 加 `tag` Form；`FileUploadResponse` / `_file_to_upload_response` 回显 tag |
-| `openrag/src/openrag/api/service_api.py`（改） | `POST .../documents` 加 `tag` Form；新增 `GET .../documents/by-tag`；`_upload_response_dict` / `_document_summary` 回显 tag |
+| `openrag/src/openrag/api/files_api.py`（改） | `POST /files/upload` 加 `tag` Form；`FileResponse` / `FileUploadResponse` / `_file_to_response` 回显 tag；API 层重复 tag 409 回归 |
+| `openrag/src/openrag/api/service_api.py`（改） | `POST .../documents` 加 `tag` Form；新增 `GET .../documents/by-tag`；`_upload_response_dict` / `_document_summary` 回显 tag；移除上传前预建目录，避免绕过 tag 预检 |
 | `web/src/services/api.ts`（改） | `filesAPI.upload()` 加可选 `tag` |
+| `web/src/types/index.ts`（改） | `File` 类型补 `tag?: string | null`，与后端列表/详情/上传响应一致 |
 | `web/src/components/FileUpload.tsx`（改） | tag 输入 + 批量守卫（抽纯函数 `shouldBlockTaggedBatch`）+ 透传 + 清空 |
 | `web/src/i18n/locales/{zh,en}.json`（改） | tag 相关文案 |
 | `openrag/tests/test_file_tag_model.py`（建） | 模型级唯一性测试 |
@@ -537,8 +538,8 @@ git commit -m "feat(ingest): workspace-scoped tag dup-check before mkdir + Integ
 ## Task 5: 内部 `POST /files/upload` 加 `tag` Form + 回显
 
 **Files:**
-- Modify: `openrag/src/openrag/api/files_api.py`（`upload_file` ~L348；`FileUploadResponse` schema；`_file_to_upload_response`）
-- Test: `openrag/tests/test_files_api_tag.py`
+- Modify: `openrag/src/openrag/api/files_api.py`（`upload_file` ~L348；`FileResponse`/`FileUploadResponse` schema；`_file_to_response`/`_file_to_upload_response`）
+- Test: `openrag/tests/test_files_api_tag.py`（上传回显 + API 层重复 tag 409）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -570,13 +571,37 @@ def test_upload_with_tag_persists_and_echoes(client, db, test_user, test_workspa
     app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
     monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", FakeMinioStorage)
 
-    files = {"file": ("n.txt", b"hello", "text/plain")}
-    data = {"path": "/", "workspace_id": str(test_workspace.id), "tag": "doc-1"}
-    r = client.post("/files/upload", files=files, data=data)
+    try:
+        files = {"file": ("n.txt", b"hello", "text/plain")}
+        data = {"path": "/", "workspace_id": str(test_workspace.id), "tag": "doc-1"}
+        r = client.post("/files/upload", files=files, data=data)
 
-    assert r.status_code == status.HTTP_201_CREATED
-    assert r.json().get("tag") == "doc-1"
-    app.dependency_overrides.pop(get_current_user, None)
+        assert r.status_code == status.HTTP_201_CREATED
+        assert r.json().get("tag") == "doc-1"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_upload_duplicate_tag_returns_409(client, db, test_user, test_workspace, monkeypatch):
+    app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", FakeMinioStorage)
+
+    try:
+        first = client.post(
+            "/files/upload",
+            files={"file": ("a.txt", b"one", "text/plain")},
+            data={"path": "/", "workspace_id": str(test_workspace.id), "tag": "dup"},
+        )
+        assert first.status_code == status.HTTP_201_CREATED
+
+        second = client.post(
+            "/files/upload",
+            files={"file": ("b.txt", b"two", "text/plain")},
+            data={"path": "/", "workspace_id": str(test_workspace.id), "tag": "dup"},
+        )
+        assert second.status_code == status.HTTP_409_CONFLICT
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 ```
 
 > 若 `tests.test_files_api` 没有把这些 fixture 设为模块级可导入（它们用 `self`/类内方法），改为在本测试文件内**照抄** `test_files_api.py` 顶部的 `override_get_db`、`db`、`test_user`、`test_workspace`、`FakeMinioStorage`、`override_get_current_user_factory` 定义。
@@ -584,7 +609,7 @@ def test_upload_with_tag_persists_and_echoes(client, db, test_user, test_workspa
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cd openrag && python -m pytest tests/test_files_api_tag.py -v`
-Expected: FAIL — 响应 JSON 里没有 `tag`（端点未接收/回显）。
+Expected: FAIL — 响应 JSON 里没有 `tag`（端点未接收/回显），或重复 tag 没有从 API 层稳定透出 409。
 
 - [ ] **Step 3: 实现端点 + 响应**
 
@@ -600,18 +625,24 @@ In `openrag/src/openrag/api/files_api.py`:
 
 (b) 调 `ingest_new_file(...)` 时透传 `tag=tag`（与 `document_type=document_type` 同级）。
 
-(c) 找到 `FileUploadResponse`（pydantic 模型，files_api.py 内）并加可选字段：
+(c) 找到 `FileResponse`（pydantic 模型，files_api.py 内）并在基础响应模型上加可选字段，而不是只加在 `FileUploadResponse` 上：
 
 ```python
     tag: Optional[str] = None
 ```
 
-(d) 找到 `_file_to_upload_response(...)`，在返回的 `FileUploadResponse(...)` 里加 `tag=file_record.tag`。
+(d) 找到 `_file_to_response(...)`，在返回的 `FileResponse(...)` 里加 `tag=file.tag`：
+
+```python
+        tag=file.tag,
+```
+
+这样 `/files` 列表、`GET /files/{id}` 详情、`/files/upload` 上传响应都会一致带 `tag`。`FileUploadResponse` 继承 `FileResponse` 后不需要重复定义字段；若 `_file_to_upload_response(...)` 没有通过 `base.model_dump()` 构造，则也要在返回的 `FileUploadResponse(...)` 里显式加 `tag=file_record.tag`。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd openrag && python -m pytest tests/test_files_api_tag.py -v`
-Expected: PASS（`tag == "doc-1"`）。
+Expected: PASS（`tag == "doc-1"`；重复 tag 返回 409）。
 
 - [ ] **Step 5: 提交**
 
@@ -625,8 +656,8 @@ git commit -m "feat(api): /files/upload accepts + echoes tag"
 ## Task 6: service 上传带 tag + 新增 `GET .../documents/by-tag`
 
 **Files:**
-- Modify: `openrag/src/openrag/api/service_api.py`（`service_upload_document` ~L295；`_upload_response_dict` L184；`_document_summary` L172；新增路由）
-- Test: `openrag/tests/test_service_api_tag.py`
+- Modify: `openrag/src/openrag/api/service_api.py`（`service_upload_document` ~L295；`_upload_response_dict` L184；`_document_summary` L172；新增路由；删除上传前 `ensure_directory_path(...)` 预建目录）
+- Test: `openrag/tests/test_service_api_tag.py`（service 上传回显、重复 tag + `create_dirs=true` 不落空目录、workspace-scoped by-tag）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -637,15 +668,17 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from openrag.models import Workspace
+from openrag.models import File as DbFile, ServiceToken, ServiceTokenWorkspace, Workspace
 from openrag.storage.minio_storage import MinioStorage
 
 
-def _upload(client, ws_name, headers, *, filename="n.txt", tag=None, path="/"):
+def _upload(client, ws_name, headers, *, filename="n.txt", tag=None, path="/", create_dirs=False):
     files = {"file": (filename, b"hello", "text/plain")}
     data = {"path": path}
     if tag is not None:
         data["tag"] = tag
+    if create_dirs:
+        data["create_dirs"] = "true"
     with patch.object(MinioStorage, "put_file", return_value=None):
         return client.post(
             f"/service/v1/workspaces/{ws_name}/documents",
@@ -653,10 +686,62 @@ def _upload(client, ws_name, headers, *, filename="n.txt", tag=None, path="/"):
         )
 
 
+def _file_exists(db: Session, workspace_id: int, uri: str) -> bool:
+    return db.query(DbFile).filter(DbFile.workspace_id == workspace_id, DbFile.uri == uri).first() is not None
+
+
+def _insert_tagged_file(db: Session, ws: Workspace, owner, *, uri: str, tag: str) -> DbFile:
+    f = DbFile(
+        uri=uri,
+        name=uri.rsplit("/", 1)[-1],
+        owner_id=owner.id,
+        workspace_id=ws.id,
+        is_directory=False,
+        size=3,
+        mime_type="text/plain",
+        tag=tag,
+    )
+    db.add(f)
+    db.commit()
+    db.refresh(f)
+    return f
+
+
+def _read_headers_for_workspace(db: Session, owner, workspace: Workspace, secret: str) -> dict[str, str]:
+    tok = ServiceToken(secret=secret, name=secret, created_by_user_id=owner.id)
+    db.add(tok)
+    db.commit()
+    db.refresh(tok)
+    db.add(ServiceTokenWorkspace(token_id=tok.id, workspace_id=workspace.id, permission="read"))
+    db.commit()
+    return {"X-OpenRag-Token": secret}
+
+
 def test_service_upload_with_tag_echoes(client, db, workspace, owner, service_token_write_headers):
     r = _upload(client, workspace.name, service_token_write_headers, tag="svc-tag-1")
     assert r.status_code == 201
     assert r.json().get("tag") == "svc-tag-1"
+
+
+def test_service_duplicate_tag_with_create_dirs_does_not_create_empty_dirs(
+    client, db, workspace, owner, service_token_write_headers
+):
+    first = _upload(client, workspace.name, service_token_write_headers, filename="a.txt", tag="dup")
+    assert first.status_code == 201
+
+    second = _upload(
+        client,
+        workspace.name,
+        service_token_write_headers,
+        filename="b.txt",
+        tag="dup",
+        path="/new/deep",
+        create_dirs=True,
+    )
+    assert second.status_code == 409
+    db.expire_all()
+    assert not _file_exists(db, workspace.id, "/new")
+    assert not _file_exists(db, workspace.id, "/new/deep")
 
 
 def test_get_by_tag_hit(client, db, workspace, owner, service_token_write_headers, service_token_headers):
@@ -671,6 +756,32 @@ def test_get_by_tag_hit(client, db, workspace, owner, service_token_write_header
     assert body["name"] == "hit.txt"
 
 
+def test_get_by_tag_same_tag_is_workspace_scoped(client, db, workspace, owner, service_token_headers):
+    other = Workspace(name="OtherWS", slug="other-ws", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    a = _insert_tagged_file(db, workspace, owner, uri="/a.txt", tag="shared")
+    b = _insert_tagged_file(db, other, owner, uri="/b.txt", tag="shared")
+    other_headers = _read_headers_for_workspace(db, owner, other, "sk-other-read")
+
+    r1 = client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-tag",
+        params={"tag": "shared"}, headers=service_token_headers,
+    )
+    assert r1.status_code == 200
+    assert r1.json()["id"] == a.id
+    assert r1.json()["path"] == "/a.txt"
+
+    r2 = client.get(
+        f"/service/v1/workspaces/{other.name}/documents/by-tag",
+        params={"tag": "shared"}, headers=other_headers,
+    )
+    assert r2.status_code == 200
+    assert r2.json()["id"] == b.id
+    assert r2.json()["path"] == "/b.txt"
+
+
 def test_get_by_tag_unknown_404(client, db, workspace, service_token_headers):
     r = client.get(
         f"/service/v1/workspaces/{workspace.name}/documents/by-tag",
@@ -679,23 +790,10 @@ def test_get_by_tag_unknown_404(client, db, workspace, service_token_headers):
     assert r.status_code == 404
 
 
-def test_get_by_tag_no_read_permission_403(client, db, owner):
-    # A workspace the token is NOT bound to -> assert_token_workspace_permission(read) -> 403
-    other = Workspace(name="OtherWS", slug="other-ws", owner_id=owner.id)
-    db.add(other); db.commit()
-    # service_token_headers is bound only to the `workspace` fixture; here we omit it and
-    # use a token with no binding to `other`. Build via the read-headers fixture's token:
-    from openrag.models import ServiceToken
-    tok = db.query(ServiceToken).first()  # the read token created by service_token_headers
-    # (ensure the read token fixture ran by requesting it)
-```
-
-> 注：`test_get_by_tag_no_read_permission_403` 依赖 read token 不绑定 `other` workspace。实现时请显式构造一个「绑定到 workspace A、却去查 workspace B」的请求：用 `service_token_headers`（绑定 `workspace`）去 GET `OtherWS` 的 by-tag，断言 403。简化版：
-
-```python
 def test_get_by_tag_cross_workspace_403(client, db, owner, workspace, service_token_headers):
     other = Workspace(name="OtherWS", slug="other-ws", owner_id=owner.id)
-    db.add(other); db.commit()
+    db.add(other)
+    db.commit()
     r = client.get(
         f"/service/v1/workspaces/{other.name}/documents/by-tag",
         params={"tag": "x"}, headers=service_token_headers,
@@ -703,12 +801,10 @@ def test_get_by_tag_cross_workspace_403(client, db, owner, workspace, service_to
     assert r.status_code == 403
 ```
 
-（用 `test_get_by_tag_cross_workspace_403` 替换上面未写完的 403 用例。）
-
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cd openrag && python -m pytest tests/test_service_api_tag.py -v`
-Expected: FAIL — 上传响应无 `tag`；`/documents/by-tag` 路由不存在（404 for all，包括本应 200 的命中用例）。
+Expected: FAIL — 上传响应无 `tag`；`/documents/by-tag` 路由不存在（404 for all，包括本应 200 的命中用例）；或 `create_dirs=true` 在重复 tag 409 前已经创建 `/new`、`/new/deep` 空目录。
 
 - [ ] **Step 3: 实现 service 上传 tag + by-tag 路由**
 
@@ -721,6 +817,17 @@ In `openrag/src/openrag/api/service_api.py`:
 ```
 
 并在调 `ingest_new_file(...)` 时加 `tag=tag`。
+
+(a-1) 删除 `service_upload_document` 中调用 `ingest_new_file(...)` 前的预建目录逻辑：
+
+```python
+    if create_dirs:
+        ensure_directory_path(db, ws, path)
+```
+
+不要在 service 层提前创建目录。保留/调整为让 `ingest_new_file(..., require_parent_dir=not create_dirs, tag=tag)` 统一处理：`ingest_new_file()` 内部先规范化与查重 `tag`，再按 `require_parent_dir=False` 创建父目录。这样重复 tag 会在任何目录副作用之前返回 409，不会留下 `/new`、`/new/deep` 这类空目录；成功的 `create_dirs=true` 行为仍由既有 `test_service_upload_create_dirs_materialises_parents` 覆盖。
+
+> 同时删除 `service_upload_document` 中那段已过时的注释（原 `# When create_dirs is set we materialise the parent path first, ...`）——它描述的是被移除的 service 层预建目录逻辑，留着会误导后续读者。
 
 (b) `_upload_response_dict(...)` 返回的 dict 加 `"tag": file_record.tag`。
 
@@ -757,7 +864,7 @@ async def service_document_by_tag(
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd openrag && python -m pytest tests/test_service_api_tag.py -v`
-Expected: PASS（上传回显 tag；by-tag 命中 200、未知 404、跨 workspace 403）。
+Expected: PASS（上传回显 tag；重复 tag + `create_dirs=true` 不落空目录；by-tag 命中 200、未知 404、同 tag 跨 workspace 各查各的、跨 workspace 403）。
 
 - [ ] **Step 5: 回归既有 service 测试**
 
@@ -777,6 +884,7 @@ git commit -m "feat(service): upload tag echo + GET workspaces/{name}/documents/
 
 **Files:**
 - Modify: `web/src/services/api.ts`（`filesAPI.upload` ~L103）
+- Modify: `web/src/types/index.ts`（`File` 接口补 `tag?: string | null`）
 - Modify: `web/src/components/FileUpload.tsx`
 - Modify: `web/src/i18n/locales/zh.json`、`web/src/i18n/locales/en.json`
 - Create: `web/src/components/fileUploadGuard.ts`（抽出纯函数守卫，便于测试）
@@ -884,6 +992,16 @@ In `web/src/services/api.ts`, extend `filesAPI.upload`:
   },
 ```
 
+- [ ] **Step 5.5: 补前端响应类型**
+
+In `web/src/types/index.ts`, 给 `File` 接口加可选字段（与后端 `FileResponse` / `FileUploadResponse` 对齐）：
+
+```ts
+  tag?: string | null;
+```
+
+这不是 UI 功能扩展，而是避免前端拿到列表/详情/上传响应中的 `tag` 后仍被类型系统视为不存在。`npx tsc --noEmit` 必须覆盖这个变化。
+
 - [ ] **Step 6: 跑两个前端测试确认通过**
 
 Run: `cd web && npx vitest run src/components/fileUploadGuard.test.ts src/services/api.tag.test.ts`
@@ -968,7 +1086,7 @@ Expected: PASS + 无类型错误。
 - [ ] **Step 10: 提交**
 
 ```bash
-git add web/src/services/api.ts web/src/components/FileUpload.tsx web/src/components/fileUploadGuard.ts web/src/i18n/locales/zh.json web/src/i18n/locales/en.json web/src/services/api.tag.test.ts web/src/components/fileUploadGuard.test.ts
+git add web/src/services/api.ts web/src/types/index.ts web/src/components/FileUpload.tsx web/src/components/fileUploadGuard.ts web/src/i18n/locales/zh.json web/src/i18n/locales/en.json web/src/services/api.tag.test.ts web/src/components/fileUploadGuard.test.ts
 git commit -m "feat(web): single-file tag input + batch guard + upload passthrough"
 ```
 
@@ -981,10 +1099,18 @@ git commit -m "feat(web): single-file tag input + batch guard + upload passthrou
 Run: `cd openrag && python -m pytest tests/test_file_tag_model.py tests/test_file_ingest_tag.py tests/test_files_api_tag.py tests/test_service_api_tag.py tests/test_file_ingest_creates_dirs.py tests/test_files_api.py tests/test_service_api.py -v`
 Expected: 全 PASS。
 
+必须确认以下来自 Codex 复审补充的回归均已包含在上述测试集中：
+- 内部 `/files/upload`：同 workspace 重复 tag 返回 409。
+- service 上传：同 workspace 重复 tag 且 `create_dirs=true`、目标为 `/new/deep` 时返回 409，并且数据库里没有 `/new`、`/new/deep` 空目录。
+- service 上传：既有 `test_service_upload_create_dirs_materialises_parents` 仍通过，证明删除 service 层预建目录后，成功路径仍能创建父目录。
+- `GET .../documents/by-tag`：同一个 tag 可存在于不同 workspace；查询 workspace A 返回 A 的文件，查询 workspace B 返回 B 的文件；用 A 的 token 查 B 仍返回 403。
+
 - [ ] **Step 2: 前端全量**
 
 Run: `cd web && npx vitest run && npx tsc --noEmit`
 Expected: 全 PASS + 无类型错误。
+
+必须确认 `web/src/types/index.ts` 的 `File` 接口包含 `tag?: string | null`，并由 `npx tsc --noEmit` 覆盖。
 
 - [ ] **Step 3: 标记阶段完成**
 
@@ -995,6 +1121,7 @@ Phase 1 完成。Phase 2（软删除 `deleted_at` 子系统）、Phase 3（upser
 ## Self-Review（计划自查）
 
 - **Spec 覆盖**（§8.3 Phase 1）：tag 列+约束（T1/T2）、字符集校验（T3）、workspace 内查重前置（T4）、`IntegrityError` 按约束名（T4）、两个 POST 透传+回显（T5/T6）、`GET by-tag`（T6）、前端 tag 输入+显式多文件守卫（T7）。普通重复 409（T4/T6）。✅ 覆盖。**有意延后到 Phase 2/3**：`deleted_at` 及所有读/写/预览/检索过滤、`DELETE by-path`、`upsert`、同行 move、前缀删除、worker 改动——本计划顶部已显式标注。
-- **占位符扫描**：无 TBD/TODO；每个实现步骤含完整代码，每个测试步骤含完整测试代码与可跑命令。
-- **类型/签名一致性**：`ingest_new_file(..., tag=...)` 在 T3 定义、T5/T6 调用一致；`_violated_unique_constraint` 在 T4 定义并测；`_normalize_tag` T3 定义、T4 复用；前端 `upload(file, parser, ws, path, docType, tag?)` 第 6 参在 T5(后端 Form)/T7(前端) 一致；`shouldBlockTaggedBatch(tag, hasDirectory, looseCount)` T7 定义与 onDrop 调用一致。
+- **占位符扫描**：无 TBD/TODO；每个实现步骤含完整代码，每个测试步骤含完整测试代码与可跑命令；已移除未写完的 `test_get_by_tag_no_read_permission_403` 片段，避免实现者复制无断言用例。
+- **类型/签名一致性**：`ingest_new_file(..., tag=...)` 在 T3 定义、T5/T6 调用一致；`_violated_unique_constraint` 在 T4 定义并测；`_normalize_tag` T3 定义、T4 复用；后端 `FileResponse` 基础响应模型带 `tag`，`FileUploadResponse` 继承后自然回显；前端 `File` 接口补 `tag?: string | null`；前端 `upload(file, parser, ws, path, docType, tag?)` 第 6 参在 T5(后端 Form)/T7(前端) 一致；`shouldBlockTaggedBatch(tag, hasDirectory, looseCount)` T7 定义与 onDrop 调用一致。
+- **Codex 复审补充风险已落入计划**：T5 补 API 层重复 tag 409；T6 明确删除 service 上传前 `ensure_directory_path(...)` 预建目录，改由 `ingest_new_file(..., require_parent_dir=not create_dirs, tag=tag)` 在 tag 预检后统一建目录；T6/T8 补 `create_dirs=true` 重复 tag 不落空目录、同 tag 跨 workspace by-tag 隔离、跨 workspace token 403 回归；T7/T8 补前端 `File.tag` 类型检查。
 - **已知实现注意**：内部 `/files/upload` 测试依赖 `test_files_api.py` 的 fixtures——若不可跨文件导入则照抄（T5 步骤已注明）。`GET by-tag` 查询本阶段不含 `deleted_at` 过滤（列未建），Phase 2 必补。
