@@ -750,7 +750,12 @@ class RetrievalService:
             )
             return None
 
-    def _effective_file_ids(self, user_id, workspace_id, scope_file_ids=None):
+    def _effective_file_ids(
+        self,
+        user_id: int,
+        workspace_id: Optional[int],
+        scope_file_ids: Optional[set[int]] = None,
+    ) -> Optional[list[int]]:
         """accessible ∩ scope. When scope is not None, always returns a deterministic
         list (incl. empty []) so the downstream `len==0 -> return []` guard fires;
         never returns None in that case."""

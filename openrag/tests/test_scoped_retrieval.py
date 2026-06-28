@@ -107,8 +107,8 @@ def test_contextual_scope_limits_l0_l1_l2():
     l0 = next(c for c in ls.calls if c["layer"] == "l0")
     assert l0["file_ids"] == [2]
     l1 = next(c for c in ls.calls if c["layer"] == "l1")
-    assert set(l1["file_ids"]) <= {2}
-    assert set(vs.calls[0]["file_ids"]) <= {2}
+    assert l1["file_ids"] == [2]
+    assert vs.calls[0]["file_ids"] == [2]
 
 
 def test_contextual_fallback_to_flat_carries_scope():
