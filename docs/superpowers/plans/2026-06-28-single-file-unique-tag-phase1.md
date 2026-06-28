@@ -1125,3 +1125,21 @@ Phase 1 完成。Phase 2（软删除 `deleted_at` 子系统）、Phase 3（upser
 - **类型/签名一致性**：`ingest_new_file(..., tag=...)` 在 T3 定义、T5/T6 调用一致；`_violated_unique_constraint` 在 T4 定义并测；`_normalize_tag` T3 定义、T4 复用；后端 `FileResponse` 基础响应模型带 `tag`，`FileUploadResponse` 继承后自然回显；前端 `File` 接口补 `tag?: string | null`；前端 `upload(file, parser, ws, path, docType, tag?)` 第 6 参在 T5(后端 Form)/T7(前端) 一致；`shouldBlockTaggedBatch(tag, hasDirectory, looseCount)` T7 定义与 onDrop 调用一致。
 - **Codex 复审补充风险已落入计划**：T5 补 API 层重复 tag 409；T6 明确删除 service 上传前 `ensure_directory_path(...)` 预建目录，改由 `ingest_new_file(..., require_parent_dir=not create_dirs, tag=tag)` 在 tag 预检后统一建目录；T6/T8 补 `create_dirs=true` 重复 tag 不落空目录、同 tag 跨 workspace by-tag 隔离、跨 workspace token 403 回归；T7/T8 补前端 `File.tag` 类型检查。
 - **已知实现注意**：内部 `/files/upload` 测试依赖 `test_files_api.py` 的 fixtures——若不可跨文件导入则照抄（T5 步骤已注明）。`GET by-tag` 查询本阶段不含 `deleted_at` 过滤（列未建），Phase 2 必补。
+
+---
+
+## 提交记录（Phase 1 实现）
+
+本阶段按 TDD 逐任务实现，共产生 **7 次实现提交**（Task 1–7；Task 8 为全量回归，无代码改动故不单独提交）。按时间顺序：
+
+| # | 提交 | Task | 总体性描述 |
+|---|---|---|---|
+| 1 | `cd63bfe` | T1 | **模型层落地唯一 tag。** `File` 模型新增可空 `tag` 列（`String(128)`）、`(workspace_id, tag)` 唯一约束 `uq_files_workspace_tag`，并把 `tag` 纳入 `@validates` 的 NUL 字节清洗；附模型级测试证明同 workspace 同 tag 冲突、跨 workspace 同 tag 可共存、多个 NULL 不冲突。 |
+| 2 | `a946375` | T2 | **数据库迁移。** 新增 Alembic 迁移 `20260626_0004`（`20260602_0003 → 0004`），`upgrade` 加 `tag` 列 + 唯一约束、`downgrade` 反向回滚；离线验证迁移链单一 head、无分叉。 |
+| 3 | `62dab38` | T3 | **写入 chokepoint 接收并校验 tag。** `ingest_new_file()` 新增 `tag` 关键字参数，加入 `_normalize_tag()`（去空白→空转 None、字符集正则 `^[A-Za-z0-9._:-]{1,128}$` 校验，非法 400）并把规范化结果落库；覆盖合法/空白/None/6 类非法输入。 |
+| 4 | `bc52224` | T4 | **workspace 内查重前置 + 约束冲突分类。** 在建目录（`ensure_directory_path`）之前做 workspace 内 tag 查重（命中 409，避免冲突时残留空目录），并把创建提交包成 `IntegrityError` 处理：用 `_violated_unique_constraint()` 按约束名/列名区分 tag（409）与 uri（沿用调用方状态码），兼容 PostgreSQL 与 SQLite 报错文本。 |
+| 5 | `314c1d9` | T5 | **内部 JWT 上传透传 + 一致回显。** `POST /files/upload` 加 `tag` Form 并透传 ingest；`tag` 字段加在基类 `FileResponse` 上（`FileUploadResponse` 继承、`_file_to_response` 填充），使 `/files` 列表、`GET /files/{id}` 详情、上传响应一致带 `tag`；补 API 层重复 tag 409 回归。 |
+| 6 | `2fc4d4f` | T6 | **外部 service-token 上传 + 按 tag 检索。** `POST .../documents` 加 `tag` Form、`_upload_response_dict`/`_document_summary` 回显 tag；新增只读 `GET /service/v1/workspaces/{name}/documents/by-tag`（workspace-scoped、404/403 语义）。同时移除 service 层上传前的 `ensure_directory_path` 预建目录，改由 `ingest_new_file(require_parent_dir=not create_dirs)` 在 tag 预检之后统一建目录——使 `create_dirs=true` 撞 tag 时 409 先于任何目录副作用、不落空目录。 |
+| 7 | `3f7111b` | T7 | **前端单文件 tag 输入与批量守卫。** `filesAPI.upload()` 加可选第 6 参 `tag` 透传；`File` 类型补 `tag?: string \| null`；抽纯函数 `shouldBlockTaggedBatch()` 并在 `FileUpload` 的 tag 输入框、拖拽 `onDrop` 守卫（填了 tag 时拖目录/多文件即拦截）、成功后清空、409→tag 冲突文案中接线；附守卫与透传单测、中英文案。 |
+
+**验证（Task 8 全量回归）**：后端 tag 套件 + `ingest_creates_dirs` + `service_api` 既有用例 66 passed；`test_files_api.py` 32 passed（唯一失败 `test_upload_file_large_file` 为既有陈旧用例——构造 100MB 而上限恰为 100MB，与本功能无关）；前端 `vitest` 全量 104 passed、`tsc --noEmit` 零错误。
