@@ -6,6 +6,7 @@ import posixpath
 from typing import Any, List, Optional
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from openrag.models.file import File
@@ -13,6 +14,8 @@ from openrag.models.file import File
 TREE_MAX_NODES = 5000
 TREE_MAX_DEPTH = 50
 CHILDREN_LIMIT = 1000
+SCOPE_MAX_PATHS = 50
+SCOPE_MAX_PATH_LEN = 1024
 
 
 def _escape_ilike(value: str) -> str:
@@ -31,6 +34,64 @@ def _normalize_logical_path(path: str) -> str:
     if not normalized.startswith("/"):
         normalized = "/" + normalized
     return normalized
+
+
+def normalize_scope_paths(paths):
+    """把请求传入的 paths 归一化为去重、有序的逻辑路径列表。
+
+    None -> None（未指定范围）；[] -> []（显式空范围）。
+    超 50 个 / 单路径超 1024 字符 / 空白项 / `..` 穿越 -> 400。
+    """
+    if paths is None:
+        return None
+    if len(paths) > SCOPE_MAX_PATHS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Too many scope paths (limit {SCOPE_MAX_PATHS})",
+        )
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        if raw is None or not str(raw).strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Scope path must not be blank",
+            )
+        if len(str(raw)) > SCOPE_MAX_PATH_LEN:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Scope path too long (limit {SCOPE_MAX_PATH_LEN})",
+            )
+        norm = _normalize_logical_path(str(raw))  # `..` -> 400
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def resolve_scope_file_ids(db: Session, workspace_id: int, paths):
+    """把 paths 解析为该 workspace 下的文件 id 集合（不含目录行）。
+
+    返回 None 表示"不限范围"（paths 未指定，或含根 `/`）。
+    返回 set（可能为空）表示限定范围；空 set 表示空范围 -> 空结果。
+    复用与 `_under_prefix` 一致的前缀规则，但只查 File.id、不构树、不继承 TREE_MAX_NODES。
+    """
+    norm = normalize_scope_paths(paths)
+    if norm is None:
+        return None
+    if "/" in norm:
+        return None
+    ids: set[int] = set()
+    for p in norm:
+        rows = db.execute(
+            select(File.id).where(
+                File.workspace_id == workspace_id,
+                File.is_directory.is_(False),
+                (File.uri == p) | (File.uri.startswith(p + "/")),
+            )
+        ).scalars().all()
+        ids.update(int(r) for r in rows)
+    return ids
 
 
 def _parent_uri(uri: str) -> str:

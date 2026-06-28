@@ -11,6 +11,9 @@ from openrag.services.workspace_file_tree import (
     build_nested_tree,
     get_file_document_by_path,
     list_direct_children,
+    normalize_scope_paths,
+    resolve_scope_file_ids,
+    SCOPE_MAX_PATHS,
 )
 
 
@@ -165,3 +168,68 @@ def test_children_limit_raises(db_session: Session, workspace: Workspace, owner:
     with pytest.raises(HTTPException) as ei:
         list_direct_children(db_session, workspace.id, "/many")
     assert ei.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_normalize_scope_paths_none_and_empty():
+    assert normalize_scope_paths(None) is None
+    assert normalize_scope_paths([]) == []
+
+
+def test_normalize_scope_paths_dedup_and_normalize():
+    assert normalize_scope_paths(["docs", "/docs/"]) == ["/docs"]
+
+
+def test_normalize_scope_paths_rejects_blank():
+    with pytest.raises(HTTPException) as ei:
+        normalize_scope_paths(["/a", "  "])
+    assert ei.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_normalize_scope_paths_rejects_traversal():
+    with pytest.raises(HTTPException) as ei:
+        normalize_scope_paths(["../secret"])
+    assert ei.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_normalize_scope_paths_rejects_too_many():
+    with pytest.raises(HTTPException) as ei:
+        normalize_scope_paths([f"/d{i}" for i in range(SCOPE_MAX_PATHS + 1)])
+    assert ei.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_normalize_scope_paths_rejects_too_long():
+    with pytest.raises(HTTPException) as ei:
+        normalize_scope_paths(["/" + "a" * 1024])
+    assert ei.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_resolve_scope_file_ids_folder_recursive(db_session, workspace, owner):
+    _dir(db_session, workspace, owner, "/docs", "docs")
+    f1 = _file(db_session, workspace, owner, "/docs/a.txt", "a.txt")
+    _dir(db_session, workspace, owner, "/docs/sub", "sub")
+    f2 = _file(db_session, workspace, owner, "/docs/sub/b.txt", "b.txt")
+    _file(db_session, workspace, owner, "/other/c.txt", "c.txt")
+    ids = resolve_scope_file_ids(db_session, workspace.id, ["/docs"])
+    assert ids == {f1.id, f2.id}
+
+
+def test_resolve_scope_file_ids_single_file(db_session, workspace, owner):
+    f1 = _file(db_session, workspace, owner, "/docs/a.txt", "a.txt")
+    assert resolve_scope_file_ids(db_session, workspace.id, ["/docs/a.txt"]) == {f1.id}
+
+
+def test_resolve_scope_file_ids_root_is_unrestricted(db_session, workspace, owner):
+    assert resolve_scope_file_ids(db_session, workspace.id, ["/"]) is None
+
+
+def test_resolve_scope_file_ids_none_is_unrestricted(db_session, workspace, owner):
+    assert resolve_scope_file_ids(db_session, workspace.id, None) is None
+
+
+def test_resolve_scope_file_ids_empty_list_is_empty_scope(db_session, workspace, owner):
+    _file(db_session, workspace, owner, "/docs/a.txt", "a.txt")
+    assert resolve_scope_file_ids(db_session, workspace.id, []) == set()
+
+
+def test_resolve_scope_file_ids_nonexistent_path_is_empty(db_session, workspace, owner):
+    assert resolve_scope_file_ids(db_session, workspace.id, ["/nope"]) == set()
