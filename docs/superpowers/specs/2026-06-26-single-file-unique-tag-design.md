@@ -1,211 +1,256 @@
-# 单文档唯一 tag + 按 tag 检索 / upsert / 删除 — 设计文档
+# 单文档唯一 tag（workspace 内唯一）+ 按 tag 检索 / upsert / 删除 — 设计文档
 
-- 日期：2026-06-26
+- 日期：2026-06-26（Codex 评审处置 + 收敛：2026-06-28）
 - 状态：设计待评审（Design / pending review）
-- 范围：后端数据模型 1 列 + 1 迁移；写入 chokepoint `ingest_new_file()` 加 1 个可选参数；2 个上传入口各透传；新增 3 个外部 service-token 端点（按 tag 检索 / 按 tag upsert：建·改·移 / 按路径删除）；删除触发时同步释放 tag；前端单文件上传弹窗加 tag 输入 + 批量守卫
+- 范围：后端数据模型 **2 列**（`tag`、`deleted_at`）+ 1 迁移；写入 chokepoint `ingest_new_file()` 加 `tag` 参数（字符集校验 + workspace 内查重 + 查重前置于建目录 + 按约束名区分 `IntegrityError`）；2 个上传入口透传；新增 3 个**workspace-scoped** 外部 service-token 端点（按 tag 检索 / upsert：建·改·**同行移动** / 按路径删除）；删除统一走「软删除 `deleted_at` + 释放 tag + 入队物理清理」**同事务**；所有读路径过滤 `deleted_at IS NULL`；前端单文件 tag 输入 + 批量守卫。
+
+> 本版已采纳 Codex 评审（见 §8）全部 10 条，并据用户 2026-06-28 决策收敛：tag 改为 **`(workspace_id, tag)` 内唯一**、upsert 异路径采用 **同一行 move+replace**、引入 **`deleted_at` 软删除**。
 
 ## 1. 背景与目标
 
-在**单个文档上传**时可为该文档指定一个**唯一 tag**，之后外部系统通过 service token 调用 API、用这个 tag 直接取到指定文档。
+在**单个文档上传**时为该文档指定一个 **workspace 内唯一的 tag**，外部系统通过 service token 用「workspace + tag」直接取到、刷新或删除该文档。
 
-- 加 tag **仅限单文件上传**场景，覆盖两类来源：OpenRag 内部 UI 触发的上传，以及外部 API（service token）触发的上传。
-- 上传时需校验 tag 是否与已有 tag 重合，重合则拒绝。
-- 新增外部 API：按 tag 查询并返回该文档（元数据）。
-- 补齐外部按 tag 的文档生命周期：统一 `PUT upsert-by-tag`（按 tag **建 / 改 / 移**：tag 不存在→创建、同路径→更新、异路径→删旧建新并移动 tag）、`DELETE by-path`（纯删，释放 tag）；删除触发时**同步释放 tag**、重清理异步。
-- 对现有逻辑做**外科手术式**改动，不重构无关代码。
+- 加 tag **仅限单文件上传**：OpenRag 内部 UI 上传 + 外部 API（service token）上传。
+- 上传时校验 tag 在**当前 workspace 内**是否重复，重复则拒绝。
+- 新增外部 API：workspace-scoped 的按 tag 查询（元数据）。
+- 外部按 tag 的文档生命周期：统一 `PUT upsert-by-tag`（建 / 改 / **同行移动**）、`DELETE by-path`（纯删）。
+- 删除统一**软删除**：入队即 `deleted_at=now()` + 释放 tag，对读立即不可见，物理清理（向量/对象/行）异步。
+- 对现有逻辑做**外科手术式**改动，不重构无关代码（`deleted_at` 读过滤是唯一较广的横切点，须逐条审计读路径）。
 
 ## 2. 已确认的决策
 
 | 决策点 | 选择 |
 |---|---|
-| tag 唯一性范围 | **全局唯一**（整个系统内唯一，tag → 文档 1:1）。检索 `GET /service/v1/documents/by-tag`，不挂在 `/workspaces/{name}` 下 |
-| 检索返回内容 | **仅元数据**（同现有 `documents/by-path` 形态，附 `tag` + `workspace_id`/`workspace_name`） |
-| 检索鉴权与跨区探测 | service token 鉴权；查到文档后校验 token 对其 workspace 有 read 权限，**无权一律 404**（非 403），防止跨工作区探测 tag 是否存在 |
-| 存储方案 | **在 `files` 表加一列 `tag`**（非独立 `file_tags` 表）；unique 索引同时服务唯一性校验与检索查询 |
-| 前端"只在单文件加 tag" | tag 非空且拖入文件夹/多文件时，**整批拦截并提示**；tag 为空时文件夹/批量照常、不加 tag |
-| 替换 / reprocess / 数据源连接器 | **不改**——tag 只在新建文件时设定 |
-| 外部删除（新增） | 新增 `DELETE /service/v1/workspaces/{name}/documents/by-path`，复用内部删除链路，默认异步 202、可选同步 200 |
-| 删除时同步释放 tag | 触发删除即把该行 `tag` 同步置 NULL（重清理仍异步），tag 当场可复用；内部 `DELETE /files/{id}` 一并处理（**已确认：内外都加**） |
-| 普通上传撞 tag | 普通 `POST upload` 撞已占 tag **一律 409**、保持简单安全；自动「建/改/移」集中在独立的 `PUT upsert-by-tag`（显式 opt-in） |
-| 按 tag upsert（新增，替代 PUT by-tag） | 新增 `PUT /service/v1/workspaces/{name}/documents/upsert-by-tag`（workspace-scoped）：tag 不存在→创建；同 workspace 同 uri→`replace_file_content` 更新；同 workspace 异 uri→删旧(异步+同步释放 tag)+建新(移动 tag)；tag 在他 workspace→409；目标路径被他文档占→409；返回 `action` |
-| tag 默认约束（评审可改） | 长度上限 **128**；**区分大小写精确匹配**；纯空白视为不打 tag（NULL）；删除文件即释放 tag |
+| tag 唯一性范围 | **`(workspace_id, tag)` 内唯一**（不同 workspace 可复用同一 tag；无跨区 409 侧信道）。按 tag 读写均 **workspace-scoped** |
+| 检索入口与鉴权 | `GET /service/v1/workspaces/{name}/documents/by-tag`；`require_workspace_for_name` + `assert_token_workspace_permission(read)`（无 read → **403**，与现有 by-path 一致；workspace 显式给出，无跨区探测问题） |
+| 检索返回内容 | **仅元数据**（同现有 `documents/by-path` 形态 + `tag`） |
+| 存储方案 | `files` 加列 `tag`，约束 `UniqueConstraint("workspace_id", "tag", name="uq_files_workspace_tag")`（与既有 `uq_files_workspace_uri` 同形）|
+| tag 字符集 | 规范化：`strip()` → 纯空白记为 `NULL`；非空必须匹配 `^[A-Za-z0-9._:-]{1,128}$`，否则 **400**。大小写敏感、精确匹配 |
+| 前端"只在单文件加 tag" | tag 非空且（拖入目录 **或散文件数 > 1**）→ **整批拦截并提示**；tag 为空时批量照常、不加 tag |
+| reprocess / 数据源连接器 | **不改**——tag 只在新建文件时设定 |
+| 普通上传撞 tag | 普通 `POST upload` 撞**本 workspace 内**已占 tag → **409**（按约束名区分，见 §4.2）；自动「建/改/移」集中在 upsert |
+| 按 tag upsert（新增） | `PUT /service/v1/workspaces/{name}/documents/upsert-by-tag`：显式 `target_path`（完整文件路径）。tag 不存在→建；`existing.uri == target_path`→更新；异 uri→**同一行 move+replace**（保留 `file.id`/`tag`）；目标路径被他文档占→409；返回 `action` |
+| 外部删除（新增） | `DELETE /service/v1/workspaces/{name}/documents/by-path`，默认异步软删除 202、可选同步物删 200 |
+| 删除统一软删除 | 异步删除入口（内部 `DELETE /files/{id}`、外部 `DELETE by-path`、内部 `delete-path-prefix`）一律：`deleted_at=now()` + `tag=NULL` + 入队清理任务，**同一次 commit**；失败 `rollback`。`background=false` 走原同步物删 |
+| 读路径过滤 | 所有返回文件的读路径默认 `deleted_at IS NULL`（列表/详情/by-path/by-tag/tree/children/entries/search-by-name/检索回查）|
+| 删除任务事务安全 | 新增非提交的 `TaskService.add_task()`；释放 tag + 建任务在同一 session、单次 commit（不给 `create_task` 加 `commit=False` 分支）|
 
 ## 3. 关键现状（代码事实）
 
-- **所有"新文件上传"都汇聚到单一函数** `ingest_new_file()`（[file_ingest.py:345](../../../openrag/src/openrag/services/file_ingest.py)）；它做校验、写 MinIO、建 `File` 行、按 MIME 建 `process_document` 任务。这是唯一需要插入 tag 的后端 chokepoint。
-- 新上传入口仅两个，均单文件、均调用 `ingest_new_file()`：
-  - `POST /files/upload`（[files_api.py:348](../../../openrag/src/openrag/api/files_api.py)）— 内部 UI / JWT 用户。
-  - `POST /service/v1/workspaces/{workspace_name}/documents`（[service_api.py:295](../../../openrag/src/openrag/api/service_api.py)）— 外部 service token。
-- `PUT /service/v1/workspaces/{workspace_name}/documents/by-path`（[service_api.py:329](../../../openrag/src/openrag/api/service_api.py)）是**替换已有文件内容**（走 `replace_file_content`，沿用旧 `File` 行），不是新建 → 不涉及 tag。
-- `replace_file_content`（[file_ingest.py:589](../../../openrag/src/openrag/services/file_ingest.py)）在**传入的同一 `File` 行**上操作：清旧 chunks/向量、覆盖**同一 `uri`** 的 MinIO 对象、重入队 `process_document`；**不建新行、不改 `uri`、不触碰 `tag`**（第 632-645 行只改 parser_type/document_type/size/mime_type）→ 天然适合"按 tag 原地刷新内容"，无 409/竞态。
-- 数据源连接器（GitHub / Google Drive / Jira / Bitbucket 等，`openrag/common/data_source/`）是**批量同步**，不走上传端点 → 不涉及。
-- **删除现状**：外部 service-token API（`service_api.py`）**没有任何 `@router.delete`**——外部只能上传(POST)与替换内容(PUT by-path)，删不了文档。唯一的文档删除是内部 `DELETE /files/{file_id}`（[files_api.py:741](../../../openrag/src/openrag/api/files_api.py)，JWT `get_current_user` + owner/admin write）：默认异步建 `TaskType.DELETE_FILE` 任务，`background=false` 时同步调 `delete_file_with_storage(db, file, workspace)`。删除的统一 chokepoint 为 `delete_file_with_storage`（[file_deletion.py:82](../../../openrag/src/openrag/services/file_deletion.py)）；`TaskType.DELETE_FILE` 见 [task.py:36](../../../openrag/src/openrag/models/task.py)。
-- `File` 模型（[file.py](../../../openrag/src/openrag/models/file.py)）**无 tag 字段**；已有 `UniqueConstraint("workspace_id", "uri", name="uq_files_workspace_uri")`（[file.py:175](../../../openrag/src/openrag/models/file.py)）；`@validates(...)` 在 [file.py:84](../../../openrag/src/openrag/models/file.py) 对若干字符串列做 NUL 清洗。
-- `service_api.py` 已有可复用 helper：`_token_can_read_workspace(ctx, workspace_id)`（[service_api.py:228](../../../openrag/src/openrag/api/service_api.py)）、`_document_summary(f)`（[service_api.py:172](../../../openrag/src/openrag/api/service_api.py)）、`_upload_response_dict(...)`（[service_api.py:184](../../../openrag/src/openrag/api/service_api.py)）、`require_workspace_for_name` / `assert_token_workspace_permission`。
-- 前端上传弹窗组件 `FileUpload.tsx`：
-  - 单个文件（点击选择 / 拖单文件）走 antd `Dragger` 的 `customRequest`（[FileUpload.tsx:305](../../../web/src/components/FileUpload.tsx)）。
-  - 文件夹拖拽由 capture 阶段的 `onDrop`（[FileUpload.tsx:273](../../../web/src/components/FileUpload.tsx)）用 `webkitGetAsEntry().isDirectory` 检测后接管，走批量循环 `runFolderUpload()`（[FileUpload.tsx:199](../../../web/src/components/FileUpload.tsx)）。
-  - `Dragger` 设 `multiple: false`（[FileUpload.tsx:303](../../../web/src/components/FileUpload.tsx)）：点击选择只能选 1 个；拖多个散文件时 rc-upload 一般只取第 1 个。
-  - 两条路径都调用 `filesAPI.upload(file, parserType, workspaceId, path, documentType)`（[api.ts:103](../../../web/src/services/api.ts)）→ `POST /files/upload`。
-- 数据库：生产 PostgreSQL、测试 SQLite；两者的 **UNIQUE 索引都允许多个 NULL** → 未打 tag 的文件互不冲突。
-- Alembic 迁移规范：版本号 `YYYYMMDD_NNNN`，当前 head 为 `20260602_0003`（[20260602_0003_add_file_document_type.py](../../../openrag/alembic/versions/20260602_0003_add_file_document_type.py)），范式为 `op.add_column` / `op.create_index`。
+- **所有"新文件上传"都汇聚到** `ingest_new_file()`（[file_ingest.py:345](../../../openrag/src/openrag/services/file_ingest.py)）；唯一需插入 tag 的新建 chokepoint。现序为 `ensure_directory_path()`（自动建父目录，:458）**先于** 重复 URI 预检查（:461-483）。
+- 新上传入口仅两个，均单文件、均调 `ingest_new_file()`：`POST /files/upload`（[files_api.py:348](../../../openrag/src/openrag/api/files_api.py)，内部 JWT）、`POST /service/v1/workspaces/{name}/documents`（[service_api.py:295](../../../openrag/src/openrag/api/service_api.py)，外部 token）。
+- `replace_file_content`（[file_ingest.py:589](../../../openrag/src/openrag/services/file_ingest.py)）在**传入的同一 `File` 行**上清旧块/向量、覆盖**同一 `uri`** 的 MinIO 对象、重入队 `process_document`；**不建新行、不改 `uri`、不触碰 `tag`** → upsert 的「更新」「同行移动」分支复用它。
+- **单行移动机制现成**：`move_file` 端点（[files_api.py:914](../../../openrag/src/openrag/api/files_api.py)）+ `minio_storage.move_file`（[minio_storage.py:176](../../../openrag/src/openrag/storage/minio_storage.py)）+ `move_document_hierarchy`（[minio_storage.py:324](../../../openrag/src/openrag/storage/minio_storage.py)）→ upsert 同行 move 复用之，提炼为服务层 helper。
+- **`TaskService.create_task()` 内部自带 `db.commit()` + `db.refresh()`**（[task_service.py:66-68](../../../openrag/src/openrag/services/task_service.py)）；当前**没有**非提交版本 → 需新增 `add_task()`。
+- **删除现状**：外部 `service_api.py` 无任何 `@router.delete`。内部 `DELETE /files/{file_id}`（[files_api.py:741](../../../openrag/src/openrag/api/files_api.py)，JWT，owner/admin write）默认异步建 `TaskType.DELETE_FILE`，`background=false` 同步 `delete_file_with_storage(db, file, workspace)`（[file_deletion.py:82](../../../openrag/src/openrag/services/file_deletion.py)）。前缀删除 `POST /files/delete-path-prefix`（[files_api.py:825](../../../openrag/src/openrag/api/files_api.py)）异步删目录树（**含 tagged 文件**），用 `TaskType.DELETE_PATH_PREFIX`。删除清理全程按 `file.id` / `file.uri` 作用，**无一处按 tag**（[file_deletion.py:109-117](../../../openrag/src/openrag/services/file_deletion.py)）。
+- **现有读路径**（须补 `deleted_at IS NULL` 过滤）：`files_api` 的 `list_files` / 文件详情；`workspace_file_tree` 的 `build_nested_tree` / `get_file_document_by_path` / `list_entries_by_prefix` / `list_direct_children` / `search_documents_by_name`（[workspace_file_tree.py](../../../openrag/src/openrag/services/workspace_file_tree.py)，被 service tree/children/entries/by-path/search-by-name 复用）；检索回查（`retrieval_service` 把 Milvus/ES chunk 命中映射回 `File` 行处）。
+- `File` 模型（[file.py](../../../openrag/src/openrag/models/file.py)）**无 tag / deleted_at 字段**；已有 `UniqueConstraint("workspace_id", "uri", name="uq_files_workspace_uri")`（[file.py:175](../../../openrag/src/openrag/models/file.py)，**本就 per-workspace**，新 tag 唯一性沿用同形）；`@validates(...)`（[file.py:84](../../../openrag/src/openrag/models/file.py)）做 NUL 清洗。
+- `service_api.py` 可复用 helper：`_token_can_read_workspace`（[service_api.py:228](../../../openrag/src/openrag/api/service_api.py)）、`_document_summary`（[:172](../../../openrag/src/openrag/api/service_api.py)）、`_upload_response_dict`（[:184](../../../openrag/src/openrag/api/service_api.py)）、`require_workspace_for_name` / `assert_token_workspace_permission`。
+- 前端 `FileUpload.tsx`：单文件走 `customRequest`（[:305](../../../web/src/components/FileUpload.tsx)），文件夹由 capture `onDrop`（[:273](../../../web/src/components/FileUpload.tsx)）检测 `isDirectory` 后走 `runFolderUpload()`（[:199](../../../web/src/components/FileUpload.tsx)）；`Dragger` `multiple:false`（[:303](../../../web/src/components/FileUpload.tsx)）；两路均调 `filesAPI.upload(...)`（[api.ts:103](../../../web/src/services/api.ts)）。
+- DB：生产 PostgreSQL、测试 SQLite；UNIQUE 索引都允许多 NULL（多列唯一约束中含 NULL 的行互不冲突）。Alembic 规范 `YYYYMMDD_NNNN`，当前 head `20260602_0003`（[迁移示例](../../../openrag/alembic/versions/20260602_0003_add_file_document_type.py)）。
 
 ## 4. 方案设计
 
 ### 4.1 数据模型 + 迁移
 
 - `File` 模型（[file.py](../../../openrag/src/openrag/models/file.py)）：
-  - 新增列 `tag: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, comment="External unique tag (single-file upload only)")`。
-  - 把 `"tag"` 加入第 84 行 `@validates(...)` 列表，复用现有 NUL 清洗。
-  - `__table_args__` 追加 `UniqueConstraint("tag", name="uq_files_tag")`（全局唯一；多 NULL 允许）。
-- 新迁移 `openrag/alembic/versions/20260626_0004_add_file_tag.py`（`down_revision="20260602_0003"`）：
+  - `tag: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, comment="Per-workspace unique tag (single-file upload only)")`；`"tag"` 加入第 84 行 `@validates` 列表。
+  - `deleted_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, nullable=True, comment="Soft-delete marker; row pending physical cleanup")`。
+  - `__table_args__` 追加 `UniqueConstraint("workspace_id", "tag", name="uq_files_workspace_tag")` 与 `Index("idx_files_deleted_at", "deleted_at")`。
+- 迁移 `openrag/alembic/versions/20260626_0004_add_file_tag_and_deleted_at.py`（`down_revision="20260602_0003"`）：
   - `op.add_column("files", sa.Column("tag", sa.String(length=128), nullable=True))`
-  - `op.create_unique_constraint("uq_files_tag", "files", ["tag"])` — 与模型里的 `UniqueConstraint` 种类一致，避免 autogenerate 漂移；PG 以 unique 索引实现，等值查询 `WHERE tag = ?` 同样走索引。
-  - `downgrade`：先 `op.drop_constraint("uq_files_tag", "files", type_="unique")` 再 `op.drop_column("files", "tag")`。
-  - 注：测试用 SQLite 经模型 `Base.metadata.create_all()` 建表（不跑迁移），约束直接来自模型声明；迁移只需在 PG 跑通。
+  - `op.add_column("files", sa.Column("deleted_at", sa.TIMESTAMP(), nullable=True))`
+  - `op.create_unique_constraint("uq_files_workspace_tag", "files", ["workspace_id", "tag"])`
+  - `op.create_index("idx_files_deleted_at", "files", ["deleted_at"])`
+  - `downgrade`：逆序 drop。
+  - 注：测试 SQLite 经 `Base.metadata.create_all()` 建表（不跑迁移），约束/索引来自模型声明；迁移只需在 PG 跑通。
 
 ### 4.2 写入链路（唯一 chokepoint）
 
-`ingest_new_file()`（[file_ingest.py:345](../../../openrag/src/openrag/services/file_ingest.py)）新增**关键字参数** `tag: Optional[str] = None`：
+`ingest_new_file()`（[file_ingest.py:345](../../../openrag/src/openrag/services/file_ingest.py)）新增关键字参数 `tag: Optional[str] = None`：
 
-- 规范化：`tag = (tag or "").strip() or None`；若 `tag` 非空且长度 > 128 → `HTTPException(400)`。
-- **重复校验**（紧挨现有"重复 URI 预检查" [file_ingest.py:461-483](../../../openrag/src/openrag/services/file_ingest.py)，即在写 MinIO 之前）：若 `tag` 非空且 `db.query(File).filter(File.tag == tag).first()` 命中 → `HTTPException(409, "Tag already in use")`。早于 MinIO 写入，错误干净。
+- **规范化 + 字符集**：`tag = (tag or "").strip()`；空 → `None`；非空必须匹配 `^[A-Za-z0-9._:-]{1,128}$`，否则 `HTTPException(400)`。
+- **查重前置**（Codex #9）：tag 校验与 **workspace 内**查重 `db.query(File).filter(File.workspace_id == workspace.id, File.tag == tag).first()` → 命中即 `HTTPException(409, "Tag already in use")`，**放在 `ensure_directory_path()` 之前**，使 tag 冲突时不残留空目录、不写 MinIO。（软删除行 tag 已为 NULL，天然不参与查重。）
 - 创建 `File(..., tag=tag)`。
-- **竞态兜底**：`db.commit()` 若因 `uq_files_tag` 抛 `IntegrityError` → 回滚并转 `HTTPException(409)`（覆盖两个并发上传抢同一 tag 的极小概率；此分支下 MinIO 已写入会留下孤儿对象，与现有任何"commit 后失败"的行为一致，不在本次额外处理）。
-- 其余流程（trace span、任务创建、返回 `(file_record, task_record)`）完全不变。
+- **`IntegrityError` 按约束名区分**（Codex #6）：`db.commit()` 抛 `IntegrityError` 时检查约束名——`uq_files_workspace_tag` → 409「Tag already in use」；`uq_files_workspace_uri` → 维持现有 duplicate-URI 语义；其它 → 通用 409/500。**不可**把所有 `IntegrityError` 一律当 tag 冲突。
+- 其余流程（trace、任务、返回值）不变。
 
 ### 4.3 两个上传入口（各加一个可选参数透传）
 
-- `POST /files/upload`（[files_api.py:348](../../../openrag/src/openrag/api/files_api.py)）：新增 `tag: Optional[str] = Form(default=None, description="Unique tag (single-file upload only)")`，在调用处透传 `ingest_new_file(..., tag=tag)`。
-- `POST /service/v1/workspaces/{workspace_name}/documents`（[service_api.py:295](../../../openrag/src/openrag/api/service_api.py)）：同样新增 `tag` Form 参数并透传。
-- **不改**：`PUT .../by-path`（替换）、`reprocess`、数据源连接器。
+- `POST /files/upload`（[files_api.py:348](../../../openrag/src/openrag/api/files_api.py)）：加 `tag: Optional[str] = Form(default=None)`，透传 `ingest_new_file(..., tag=tag)`。
+- `POST /service/v1/workspaces/{name}/documents`（[service_api.py:295](../../../openrag/src/openrag/api/service_api.py)）：同样加 `tag` Form 并透传。
+- **不改**：`PUT .../by-path`、`reprocess`、数据源连接器。
 
-### 4.4 检索入口（新增，仅外部 service token）
+### 4.4 检索入口（新增，workspace-scoped）
 
-新增 `GET /service/v1/documents/by-tag`（放在 `service_api.py`，因全局唯一**不挂在** `/workspaces/{name}` 下）：
+`GET /service/v1/workspaces/{workspace_name}/documents/by-tag?tag=XXX`：
 
-```
-GET /service/v1/documents/by-tag?tag=XXX
-```
+- 鉴权：`require_workspace_for_name(W)` + `assert_token_workspace_permission(ctx, ws.id, "read")`（无 read → **403**，与现有 by-path 一致）。
+- 查询：`db.query(File).filter(File.workspace_id == ws.id, File.tag == tag, File.is_directory.is_(False), File.deleted_at.is_(None)).first()`；为空 → `404`。
+- 返回元数据 dict（复用 `_document_summary(f)` + `tag`）。
 
-- 鉴权依赖 `get_service_token_context`（与其他 service 路由一致）。
-- 逻辑：
-  1. `f = db.query(File).filter(File.tag == tag, File.is_directory.is_(False)).first()`；为空 → `404`。
-  2. 权限：`_token_can_read_workspace(ctx, f.workspace_id)`（[service_api.py:228](../../../openrag/src/openrag/api/service_api.py)）为假 → **`404`**（不是 403，避免跨工作区探测）。
-  3. 返回元数据 dict：复用 `_document_summary(f)` 的字段，额外补 `tag`、`workspace_id`、`workspace_name`（全局检索方需要知道文档落在哪个工作区）。
+### 4.5 tag 可见性
 
-### 4.5 tag 可见性（让 UI / 调用方看到 tag）
-
-- 上传响应回显 tag：
-  - service：`_upload_response_dict`（[service_api.py:184](../../../openrag/src/openrag/api/service_api.py)）增加 `"tag": file_record.tag`。
-  - 内部：`FileUploadResponse` 及 `_file_to_upload_response`（files_api.py）增加可选 `tag` 字段。
-- 文件详情 / 列表响应 schema（FileResponse 等）增加可选 `tag` 字段，便于内部 UI 展示（纯增量、低风险；`_document_summary` 同步带上 `tag`）。
+- 上传/upsert 响应回显 tag：`_upload_response_dict`（service）、`FileUploadResponse` / `_file_to_upload_response`（内部）加可选 `tag`。
+- 文件详情/列表响应 schema 加可选 `tag`（`_document_summary` 同步带 `tag`），供内部 UI 展示。
 
 ### 4.6 前端（只在单文件路径加 tag）
 
-`FileUpload.tsx`：
+- 弹窗表单加可选「唯一标签」`Input`，`useRef` 镜像供事件回调读最新值。
+- 单文件 `customRequest`（[FileUpload.tsx:305](../../../web/src/components/FileUpload.tsx)）调 `filesAPI.upload(...)` 时传 `tag.trim() || undefined`。
+- **批量守卫**（Codex #7，显式实现）：capture `onDrop`（[FileUpload.tsx:273](../../../web/src/components/FileUpload.tsx)）中，当 `tagRef.current` 非空且（`hasDirectory` **或** `dataTransfer.files.length > 1`）→ `preventDefault()`+`stopPropagation()`+`message.warning(...)` 并 `return`，不发生任何上传。**不依赖** rc-upload「`multiple:false` 一般只取第 1 个」的隐式行为。
+- `runFolderUpload()` 不读 tag；上传成功后清空 tag。
+- `api.ts` `filesAPI.upload()` 加可选 `tag?: string`，非空时 `formData.append('tag', tag)`。
+- 409 → 友好提示「该标签已被占用，请换一个」。i18n 新增 `tag_label` / `tag_conflict` / `tag_batch_blocked`。
 
-- 在弹窗表单内新增可选「唯一标签（tag）」`Input`，状态 `const [tag, setTag] = useState("")`，并用 `useRef` 镜像（与 `uploadPathRef` 等一致，供事件回调读取最新值）。
-- **单文件路径**：`customRequest`（[FileUpload.tsx:305](../../../web/src/components/FileUpload.tsx)）调用 `filesAPI.upload(...)` 时把 `tag.trim() || undefined` 作为新参数传入。
-- **批量守卫**（实现"拦截并提示"）：扩展 capture 阶段 `onDrop`（[FileUpload.tsx:273](../../../web/src/components/FileUpload.tsx)）——当 `tagRef.current` 非空且（检测到目录 `hasDirectory` 或散文件数 > 1）时：`preventDefault()` + `stopPropagation()` + `message.warning("已填写唯一标签，仅支持单文件上传；如需上传文件夹/批量，请先清空标签")` 并 `return`，**不发生任何上传**。
-- **批量路径** `runFolderUpload()`（[FileUpload.tsx:199](../../../web/src/components/FileUpload.tsx)）：保持不读取 tag（守卫已保证 tag 非空时不会进入此路径）。
-- 上传成功后清空 tag（与现有 `setParserType('auto')` 等一并 reset）。
-- `api.ts`：`filesAPI.upload()`（[api.ts:103](../../../web/src/services/api.ts)）新增可选 `tag?: string` 形参，非空时 `formData.append('tag', tag)`。
-- 409 冲突：`customRequest` 的 catch 分支识别 409 → 友好提示「该标签已被占用，请换一个」。
-- i18n：新增 `files.upload.tag_label` / `files.upload.tag_conflict` / `files.upload.tag_batch_blocked`（`zh.json`/`en.json` 各一条）。
-- 文件列表/详情若存在 tag 则展示（沿用现有渲染，纯增量）。
+### 4.7 删除入口（统一软删除事务）
 
-### 4.7 外部删除入口（新增，仅外部 service token）
+**事务安全基座**（Codex #1）：
+- `TaskService` 新增 **非提交** 的 `add_task(...)`：只 `Task(...)` + `db.add(task)` + 返回，不 `commit()`/`refresh()`；现有 `create_task()` 保持「调用即提交」契约，内部改为 `add_task()` 后再 `commit()`/`refresh()`。
+- 新增内部 helper `_release_tag_and_soft_delete(db, file, *, user_id) -> Task`：在同一 session 内 `file.deleted_at = utcnow()`、`file.tag = None`、`TaskService(db).add_task(task_type=DELETE_FILE, file_id=file.id, ...)`，**只调一次 `db.commit()`**；失败 `db.rollback()`（tag/`deleted_at` 一起回滚，旧文件不进入 deleting 状态）。
 
-新增 `DELETE /service/v1/workspaces/{workspace_name}/documents/by-path`，与现有 `PUT .../by-path` 同一 URL 形态、对称：
+**外部新增** `DELETE /service/v1/workspaces/{workspace_name}/documents/by-path?path=XXX&background=true`：
+- 鉴权：`require_workspace_for_name(W)` + `assert_token_workspace_permission(write)`。
+- 定位：`workspace_id==ws.id, uri==validate_path(path), is_directory==False, deleted_at IS NULL`；为空 → 404。
+- `background=true`（默认）：`_release_tag_and_soft_delete(...)` → 202 + task_id。
+- `background=false`：`delete_file_with_storage(db, row, ws)` 同步物删（行消失）→ 200。
+- `user_id` 取 `ws.owner_id`。
 
-```
-DELETE /service/v1/workspaces/{workspace_name}/documents/by-path?path=XXX&background=true
-```
+**内部 `DELETE /files/{id}`**：`background=true` 分支改用 `_release_tag_and_soft_delete(...)`（已确认内外一致）；`background=false` 不变。
 
-- 鉴权：`require_workspace_for_name(db, workspace_name)` + `assert_token_workspace_permission(ctx, ws.id, "write")`（删除属写操作）。
-- 定位文件：`db.query(File).filter(File.workspace_id == ws.id, File.uri == validate_path(path), File.is_directory.is_(False)).first()`；为空 → `404`（沿用 PUT by-path 的查找方式 [service_api.py:341-347](../../../openrag/src/openrag/api/service_api.py)）。
-- 删除：**复用内部同款删除链路，不重写**：
-  - `background=true`（默认，`Query(default=True)`）：**先同步把 `row.tag = None` 并 commit（即时释放 tag）**，再 `TaskService.create_task(workspace_id=ws.id, user_id=ws.owner_id, file_id=row.id, task_type=TaskType.DELETE_FILE.value, queue="normal", priority=6, max_retries=3, status=TaskStatus.PENDING)` → 返回 `202 + task_id`。重清理（向量/对象/删行）仍异步。
-  - `background=false`：`delete_file_with_storage(db, row, ws)`（[file_deletion.py:82](../../../openrag/src/openrag/services/file_deletion.py)）同步清 MinIO/层级/Milvus/DB（含删行，tag 随行消失）→ 返回 `200`。
-- `user_id` 取 `ws.owner_id`，与 service 上传的操作者归属一致。
-- **同步释放 tag 的安全性**：清理任务全程按 `file.id`（向量/ES/Task/删行）与 `file.uri`（MinIO 对象）作用，**无一处按 tag**（[file_deletion.py:109-117](../../../openrag/src/openrag/services/file_deletion.py)）；且 `(workspace_id, uri)` 唯一约束禁止同 uri 两行并存。故"删后用同一 tag 新建另一文档（不同路径）"绝不会被旧行的异步清理波及；同路径复用仍受 uri 约束、需等清理完（或改用 `PUT upsert-by-tag` 的「更新」分支 / `background=false`）。
-- 为与外部一致，内部 `DELETE /files/{id}` 入队 `DELETE_FILE` 前同样同步置 `tag=None`（**已确认：内外都加**）。
-- 仅删**单个文件**；目录/前缀级联删除不在本次范围（内部已有 `POST /files/delete-path-prefix`）。
-- 需在 `service_api.py` 增加 import：`delete_file_with_storage`、`TaskService`、`TaskType`、`TaskStatus`。
+**前缀删除 `POST /files/delete-path-prefix`**：`background=true` 分支批量把 prefix 命中的文件/目录行 `deleted_at=now()` + `tag=None`，再 `add_task(DELETE_PATH_PREFIX)`，**单次 commit**；失败 `rollback`。使前缀删除与单文件删除的 tag 释放语义一致（Codex #4）。
 
-### 4.8 统一 upsert-by-tag 入口（新增，仅外部 service token）
+需在 `service_api.py` import：`delete_file_with_storage` / `TaskService` / `TaskType` / `TaskStatus`。
 
-新增 `PUT /service/v1/workspaces/{workspace_name}/documents/upsert-by-tag`（**workspace-scoped**——create/move 需落到 W 的某路径；与全局只读的 `GET by-tag` 形态不对称是合理的：读只需 tag，写需知道落点）。**替代原计划的 `PUT /documents/by-tag`**——其"同路径替换"被本端点的「更新」分支覆盖。
+### 4.8 统一 upsert-by-tag 入口（新增，workspace-scoped）
+
+`PUT /service/v1/workspaces/{workspace_name}/documents/upsert-by-tag`，**显式 `target_path`**（完整文件路径，Codex #10——不由 `file.filename` 隐式派生目标 uri）：
 
 ```
 PUT /service/v1/workspaces/{workspace_name}/documents/upsert-by-tag
-Form: tag=XXX, path=/parent/dir, parser_type=auto, create_dirs=false   （body: 新文件 multipart）
+Form: tag=XXX, target_path=/dir/name.pdf, parser_type=auto, create_dirs=false   （body: 新文件 multipart）
 ```
 
-- 鉴权：`require_workspace_for_name(W)` + `assert_token_workspace_permission(ctx, ws.id, "write")`。
-- 记 `target_uri = build_file_uri(validate_path(path), file.filename)`，`existing = db.query(File).filter(File.tag == tag, File.is_directory.is_(False)).first()`（全局，tag 唯一）。**决策树**：
+- 鉴权：`require_workspace_for_name(W)` + `assert_token_workspace_permission(write)`。
+- 记 `target_uri = validate_path(target_path)`，`existing = db.query(File).filter(File.workspace_id == ws.id, File.tag == tag, File.is_directory.is_(False), File.deleted_at.is_(None)).first()`（**仅本 workspace**；软删行 tag 已 NULL，天然不命中）。**决策树**：
 
   | 情形 | 行为 | `action` / 状态码 |
   |---|---|---|
-  | `existing is None` | **创建**：`ingest_new_file(..., tag=tag, require_parent_dir=not create_dirs, duplicate_status_code=409)`（目标 uri 被他文档占 → ingest 自身 409） | `created` / 201 |
-  | `existing` 在**别的 workspace** | **409**（tag 被他工作区占用；本端点不跨区删别人文档） | — |
-  | `existing` 在 W 且 `existing.uri == target_uri` | **更新**：`replace_file_content(db, ws, ws.owner_id, existing, new_content=body, content_type=file.content_type, parser_type=parser_type)`（保留 id/uri/tag、清旧块/向量、重入队） | `updated` / 200 |
-  | `existing` 在 W 且 `existing.uri != target_uri` | **删旧 + 建新（移动 tag）**：见下 | `moved` / 200 |
+  | `existing is None` | **创建**：`ingest_new_file(..., upload_filename=basename(target_uri), parent=dirname(target_uri), tag=tag, require_parent_dir=not create_dirs)`（目标 uri 被他文档占 → ingest 自身 409） | `created` / 201 |
+  | `existing.uri == target_uri` | **更新**：`replace_file_content(db, ws, ws.owner_id, existing, ...)`（保留 id/uri/tag） | `updated` / 200 |
+  | `existing.uri != target_uri` | **同一行 move+replace**：见下 | `moved` / 200 |
 
-- **移动分支**（复用积木、不重写）：
-  1. 预检查 `(W, target_uri)` 是否被**另一文档**占用 → 占用则 **409**（不误删无关文档）；此检查**先于**任何改动。
-  2. 同步 `existing.tag = None` + commit + 入队异步 `DELETE_FILE`(existing)（同 §4.7 background 路径）。
-  3. `ingest_new_file(..., tag=tag)` 在 `target_uri` 建新行（此时 tag 已空闲）。
-- **「目标路径被他文档占 → 409」是横切「创建」「移动」两分支的护栏**（只有这两分支会在 `target_uri` 落新文件）：创建分支由 `ingest_new_file` 自身的 `(workspace_id, uri)` 重复校验兜底（上表括注）；移动分支由 step 1 的显式预检查兜底，且**必须先于** step 2 释放旧 tag/排删旧文档——否则目标被占时旧文档已被破坏。「更新」分支（同 uri = tag T 自己）与「他 workspace」分支不涉及。
-- **安全性**：移动分支的异步删旧只按旧行 `id`/`uri` 作用，碰不到新行（§4.7 已论证）。失败窗口（步骤 3 在释放 tag 后因 MinIO 等失败）→ 旧行 tag 已空且已排删、未建出新行，属罕见部分失败，与现有孤儿风险一致；实现计划可用单事务加固。
-- 返回元数据 dict + `action`（`created`/`updated`/`moved`）+ 新/改文档的 `task_id`。
-- **破坏性是明确契约**：异路径/异名 = **真的删掉旧文档**；本端点显式 opt-in（普通 `POST upload` 仍撞 tag 即 409、不受影响）。
-- 复用现成函数 `ingest_new_file` / `replace_file_content`（已 import）与删除链（§4.7 的 import）；另需从 `file_ingest` import `build_file_uri`。
+- **同一行 move+replace 分支**（Codex #2，复用积木、**绝不删行**）：
+  1. 预检查 `(W, target_uri)` 是否被**另一文档**（含软删行，uri 仍占用）占用 → 占用则 **409**；**先于**任何改动。
+  2. 在 `existing` 这一行上：相对旧 `uri` 做单行移动（提炼自 `move_file`：`minio_storage.move_file` + `move_document_hierarchy`，更新 `existing.uri`/`name` 为 `target_uri`/basename），随后 `replace_file_content(...)` 覆盖新内容、清旧块/向量、重入队。
+  3. 全程保留同一 `file.id` 与 `existing.tag`。
+- **安全性**：永不删行、永不释放 tag → **无"删了旧、新没建成就丢文档"窗口**；失败时 tag 仍绑在该行，最多是路径/内容更新未完成。
+- 返回元数据 dict + `action` + `task_id`。
+- **`target_path` 语义**（Codex #10）：始终是完整文件路径；创建分支以其 basename 作文件名。不再用泛化 `path` + 上传文件名隐式决定 uri，杜绝「改了上传文件名 → 误触发 move」。
+- 复用 `ingest_new_file` / `replace_file_content`（已 import）；新增单行 move helper（提炼自 `move_file`）。
+
+### 4.9 软删除（`deleted_at`）语义
+
+- **写入入口**（全部同事务，§4.7）：内部 `DELETE /files/{id}`、外部 `DELETE by-path`、前缀 `delete-path-prefix` 的 `background=true` 分支 → `deleted_at=now()` + `tag=None` + 入队物理清理任务，单次 commit。`background=false` 直接物删（行消失）。
+- **读路径过滤**（§3 已列）：列表 / 详情 / by-path / by-tag / tree / children / entries / search-by-name / **检索回查** 一律默认 `deleted_at IS NULL`。检索若先命中 Milvus/ES chunk 再回查 file，必须在回查阶段丢弃 `deleted_at IS NOT NULL` 的行。**实现计划须逐条审计读路径**。
+- **效果**：删除入队成功后旧文档对用户/外部 API/检索**立即不可见**，tag **立即可复用**；worker 仅负责物理清理（MinIO/层级/向量/chunks/行）。
+- **失败语义**：任务创建前事务失败 → `deleted_at`+tag 一起回滚；任务已建但 worker 失败 → 不恢复 tag、不清 `deleted_at`，任务保持 failure 待重试，旧文件继续逻辑不可见。
+- **`uri` 仍占用的边界**（重要）：软删行**保留 `uri`**（供 worker 清理），故 `(workspace_id, uri)` 唯一约束仍占用到物理删除——**同 uri 的裸 `POST upload` 仍会 409**。同路径刷新请走 `PUT upsert-by-tag` 的「更新」分支（原地替换、不依赖 uri 释放）。如要让同 uri 即时可重建，需把 `uq_files_workspace_uri` 改为 partial index `WHERE deleted_at IS NULL`（**改动现有约束，本次不做**，除非后续确认需要）。
+- tag 查找天然忽略软删行（tag 已 NULL）；uri 检查须包含软删行（uri 仍占用）。
 
 ## 5. 边界与不做（Non-goals）
 
-- **不**支持**修改 tag 的值**（改名 / 重打 / 清空）——tag 一经设定即不可变，reprocess 不动 tag。能做的是：`PUT upsert-by-tag` 按 tag **建 / 改 / 移**、`DELETE` **释放 tag**（删文档）。
-- **普通** `POST upload` 撞已占 tag 一律 **409**、不在上传端点做自动 reassign；自动「建/改/移」集中在独立的 `PUT upsert-by-tag`（显式 opt-in，破坏性 move 是其明确契约）。
-- 文件唯一性键是**完整 `uri`（含目录）**，**裸文件名不是唯一性键**：同名不同目录（`/a/doc.pdf` vs `/b/doc.pdf`）本就并存。故"删旧（异步）→ 在同 workspace **不同路径、即使同文件名**建同 tag 新文档"**安全**——异步清理严格按旧行的 `id`/`uri` 作用，碰不到新行（新行 id、uri 均不同）。
-- 删除文件即释放其 tag（行删除，unique 约束自然释放）。外部经新增的 `DELETE .../documents/by-path` 即可走完此路径；**目录/前缀级联删除**仍不在本次范围（内部 `POST /files/delete-path-prefix` 承担）。
-- 全局唯一的固有性质：上传时 tag 若与**他人工作区**文档撞车也会 409（提示语保持通用「标签已被占用」，不透露在哪个工作区）。
+- **不**支持**修改 tag 的值**（改名/重打/清空）——tag 不可变，reprocess 不动 tag。能做：`PUT upsert-by-tag` 建/改/移、`DELETE` 释放 tag。
+- 普通 `POST upload` 撞已占 tag 一律 **409**；自动「建/改/移」只在 `PUT upsert-by-tag`（显式 opt-in）。
+- 文件唯一性键是**完整 `uri`（含目录）**，裸文件名不是键：同名不同目录本就并存。
+- upsert 异路径采用**同一行 move**，**不**做「删旧建新」，故无 tag 丢失窗口；`file.id`/`created_at` 在 move 后**保持不变**（不是新文档）。
+- 软删除后 **uri 仍被占用**到物理清理：同 uri 裸上传仍 409（见 §4.9），同路径刷新用 upsert 更新分支。
+- **不**改 `uq_files_workspace_uri` 为 partial index（本次不让软删 uri 即时可重建）。
 - **不**为数据源连接器（批量同步）加 tag。
-- **不**新增内部 JWT 的按 tag 检索端点（检索仅外部 service token；内部 UI 通过文件元数据里的 tag 字段查看）。
-- tag 大小写敏感、精确匹配；**不**做模糊/前缀检索。
+- **不**新增内部 JWT 的按 tag 检索端点（检索仅外部 token；内部 UI 看文件元数据里的 tag）。
+- tag 大小写敏感、精确匹配，仅 `^[A-Za-z0-9._:-]{1,128}$`；**不**做模糊/前缀/Unicode。
 
 ## 6. 测试
 
-**后端**（沿用现有 PostgreSQL / SQLite 测试风格）：
-
+**后端**（PostgreSQL / SQLite）：
 - 带 tag 单文件上传 → `File.tag` 落库；响应回显 tag。
-- 重复 tag 上传 → 409（预检查路径）。
-- 多个**无 tag** 文件 → 互不冲突（多 NULL）。
-- `GET /service/v1/documents/by-tag` 命中 → 返回元数据 + tag + workspace 信息。
-- 无权 token 查他人工作区的 tag → 404（非 403）。
-- 未知 tag → 404。
-- 超长 tag → 400。
-- （可选）并发抢同一 tag → 恰一个成功、另一个 409。
-- `DELETE /service/v1/workspaces/{name}/documents/by-path` 删除文件 → 文档消失、其 tag 释放、可用同一 tag 重新上传成功。
-- 无 write 权限 token 删除 → 403；删不存在的 path → 404。
-- 异步删除（`background=true`）返回后，该 tag **立即**可用于新文档（**不同路径、即使同文件名**）且不 409；旧行异步清理只按 id/uri 作用，不影响新行。
-- `PUT .../upsert-by-tag`：tag 不存在→创建（`action=created`）；同 uri→更新（同 id/uri/tag、`action=updated`）；异 uri→删旧+建新（新 id、tag 移动、`action=moved`，旧行异步删不影响新行）；tag 在他 workspace→409；目标路径被他文档占→409；无 write→403。
+- **不同 workspace 可复用同一 tag**（互不冲突）；同 workspace 重复 tag → 409。
+- tag 规范化边界：合法字符集、超长(>128)→400、纯空白→NULL、非法字符（空白内、`/ ? # &`、Unicode 组合）→400、`ABC` vs `abc` 区分。
+- `IntegrityError`：并发抢同 `(workspace,tag)` → 一成一 409；并发抢同 `(workspace,uri)` → 命中 uri 语义而非 tag 语义。
+- tag 查重在 `ensure_directory_path` 之前：tag 冲突上传不残留空目录。
+- `GET /workspaces/{name}/documents/by-tag` 命中 → 元数据 + tag；无 read 权限 → 403；未知 tag → 404；命中软删行 → 404（被 `deleted_at` 过滤）。
+- `DELETE by-path`（异步）→ 文档**立即**从列表/by-path/by-tag/检索消失（`deleted_at` 过滤）、tag **立即**可复用；旧行物理清理异步、按 id/uri 作用不伤新行。
+- **任务创建失败时 tag 不被提前释放**（事务回滚）：模拟 `add_task`/commit 失败 → `deleted_at`/tag 未变。
+- 前缀删除含 tagged 文件 → 命中行 `deleted_at`+`tag=None` 同事务、对读不可见、tag 释放。
+- `upsert-by-tag`：tag 不存在→`created`；`target_path==existing.uri`→`updated`（同 id/uri/tag）；异 uri→`moved`（**同 file.id 不变**、tag 不变、旧路径消失、新路径有新内容）；目标路径被他文档占→409；**新建/移动失败时原 tag 与原文档可达性不丢**；无 write→403。
+- 同 uri 裸 `POST upload`（目标被软删行占）→ 仍 409（uri 未释放）。
 
-**前端**（`FileUpload` 相关测试）：
-
-- 单文件 + 填写 tag → `filesAPI.upload` 收到 tag 参数。
-- 填写 tag 后拖文件夹/多文件 → 被拦截、不调用上传、出现 warning。
-- 未填 tag 拖文件夹 → 批量正常、不带 tag（现状不回归）。
+**前端**（`FileUpload`）：
+- 单文件 + 填 tag → `filesAPI.upload` 收到 tag。
+- tag 非空 + 拖目录 / 多散文件 → 被拦截、不上传、出现 warning。
+- tag 为空拖文件夹/多文件 → 批量正常、不带 tag（不回归）。
 
 ## 7. 影响文件清单
 
-- `openrag/src/openrag/models/file.py`（`tag` 列 + `@validates` + `UniqueConstraint`）
-- `openrag/alembic/versions/20260626_0004_add_file_tag.py`（新建迁移）
-- `openrag/src/openrag/services/file_ingest.py`（`ingest_new_file` 加 `tag` 参数 + 校验 + 竞态兜底）
-- `openrag/src/openrag/api/files_api.py`（`/upload` 加 `tag` Form；`FileUploadResponse` / `_file_to_upload_response` 回显 tag；`DELETE /files/{id}` 异步分支入队前同步置 `tag=None`（已确认内外一致））
-- `openrag/src/openrag/api/service_api.py`（`/documents` 加 `tag` Form；新增 `GET /documents/by-tag`、`PUT /workspaces/{name}/documents/upsert-by-tag`（编排 `ingest_new_file` + `replace_file_content` + 删除链）、`DELETE /workspaces/{name}/documents/by-path`；新增 import `delete_file_with_storage` / `TaskService` / `TaskType` / `TaskStatus` / `build_file_uri`；`_upload_response_dict` / `_document_summary` 带 tag）
-- 文件详情/列表响应 schema（增加可选 `tag` 字段）
-- `web/src/components/FileUpload.tsx`（tag 输入 + 批量守卫 + 透传 + 清空 + 409 提示）
-- `web/src/services/api.ts`（`upload()` 加可选 `tag`）
-- `web/src/i18n/locales/zh.json`、`web/src/i18n/locales/en.json`（tag 相关文案）
+- `openrag/src/openrag/models/file.py`（`tag` 列 + `deleted_at` 列 + `@validates` + `uq_files_workspace_tag` + `idx_files_deleted_at`）
+- `openrag/alembic/versions/20260626_0004_add_file_tag_and_deleted_at.py`（新建迁移）
+- `openrag/src/openrag/services/task_service.py`（新增非提交 `add_task()`；`create_task()` 改为复用之）
+- `openrag/src/openrag/services/file_ingest.py`（`ingest_new_file` 加 `tag`：字符集正则 + workspace 内查重前置于建目录 + 按约束名区分 `IntegrityError`）
+- `openrag/src/openrag/api/files_api.py`（`/upload` 加 `tag` Form + 回显；`DELETE /files/{id}` 异步分支改用软删除 helper；`delete-path-prefix` 异步分支批量软删+释放 tag；提炼单行 move helper 供 upsert 复用；list/详情读路径加 `deleted_at IS NULL`）
+- `openrag/src/openrag/api/service_api.py`（`/documents` 加 `tag` Form；新增 `GET /workspaces/{name}/documents/by-tag`、`PUT /workspaces/{name}/documents/upsert-by-tag`、`DELETE /workspaces/{name}/documents/by-path`；`_upload_response_dict`/`_document_summary` 带 tag；相关 import）
+- `openrag/src/openrag/services/workspace_file_tree.py`（`build_nested_tree`/`get_file_document_by_path`/`list_entries_by_prefix`/`list_direct_children`/`search_documents_by_name` 加 `deleted_at IS NULL`）
+- `openrag/src/openrag/retrieval/retrieval_service.py`（chunk→file 回查阶段过滤 `deleted_at IS NOT NULL`）
+- 删除释放 tag 的内部 helper（`_release_tag_and_soft_delete`，置于 `file_deletion.py` 或 `file_ingest.py`，供内外删除入口复用）
+- 文件详情/列表响应 schema（加可选 `tag`）
+- `web/src/components/FileUpload.tsx`（tag 输入 + 显式多文件守卫 + 透传 + 清空 + 409 提示）、`web/src/services/api.ts`（`upload()` 加可选 `tag`）、`web/src/i18n/locales/{zh,en}.json`
 - 相应后端与前端测试文件
+
+## 8. Codex 评审结论（来自 Codex，2026-06-26）
+
+### 8.1 总体结论
+
+方案主体可行：把 `tag` 放在 `files` 表、用全局唯一约束兜底、在 `ingest_new_file()` 这一新建 chokepoint 透传、再补一个 service-token 的 `GET by-tag`，这些方向和现有代码结构匹配，改动面也基本可控。
+
+但不建议按当前方案原样直接进入实现。主要风险集中在两个地方：一是“异步删除前同步释放 tag”的事务边界，二是 `upsert-by-tag` 的异路径 move 分支把一个外部看起来像 upsert 的动作实现成“删旧再建新”，数据损坏窗口偏大。建议先收敛 MVP，再逐步加破坏性能力。
+
+### 8.2 主要风险与遗漏 case
+
+1. **异步删除先释放 tag 需要和任务创建放在同一个 DB 事务里。** `TaskService.create_task()` 内部会 `commit()`；应新增不自动提交的 `add_task(...)`，由删除 helper 在同一 session 内 `file.tag=None` + `add_task(...)` 后只 `commit()` 一次，失败 `rollback()`。
+2. **`upsert-by-tag` 的 move 分支存在较大的数据损坏窗口。** 不应「先清旧 tag + 排删旧行 + 建新行」；更稳的是抽一个同一行 helper（从 `move_file` 与 `replace_file_content` 提炼），在同一 `File` 行上移动 `uri/name` 并替换内容，始终保留同一 `file.id` 与 `file.tag`。
+3. **全局唯一 tag 与“防探测”天然张力；改为 `(workspace_id, tag)` 唯一。** 模型/迁移用 `uq_files_workspace_tag`，所有查重/查找/读取限定在 workspace 内，`GET by-tag` 改 workspace-scoped。
+4. **内部前缀/目录删除会碰到 tagged 文件；用 `deleted_at` 逻辑删除统一语义。** 所有异步删除入口同事务设置 `deleted_at=now()` + `tag=None` + 入队任务；所有读路径默认过滤 `deleted_at IS NULL`。
+5. **tag 规范化过宽；采用 `^[A-Za-z0-9._:-]{1,128}$`。** 先 `strip()`、纯空白转 NULL、非空必须匹配正则否则 400。
+6. **`IntegrityError` 兜底不能泛化成 tag 冲突；按约束名区分。** `uq_files_workspace_tag` → tag 占用；`uq_files_workspace_uri` → uri 语义；其它 → 通用。
+7. **前端多散文件拖拽守卫需显式实现。** 在拖拽捕获阶段显式检查 `dataTransfer.files.length > 1` 或 entries 数量；tag 非空 + 多散文件 → 整体拦截。
+8. **即时 tag 复用的旧文档搜索窗口由第 4 点 `deleted_at` 覆盖。** 检索回查阶段必须丢弃 `deleted_at IS NOT NULL`。
+9. **重复 tag 预检查前置到自动建目录之前。** tag 格式校验 + workspace 内查重不依赖 `path`，可在 `ensure_directory_path()` 前完成，冲突时不留空目录。
+10. **`upsert-by-tag` 的 `path` 语义易误用；改为显式 `target_path`（完整文件路径），不由 `file.filename` 隐式决定 URI。**
+
+### 8.3 建议实施顺序（Codex 原议）
+
+1. 第一阶段：`files.tag` + 唯一约束 + tag 格式校验 + 两个 POST 透传 + `GET by-tag` + 回显；普通重复 409；暂不做 move。
+2. 第二阶段：删除即时释放（同事务）；明确前缀删除 tag 释放语义。
+3. 第三阶段：upsert 先 create/update same URI；异 URI 用同一行 move+replace。
+
+### 8.4 Codex 建议补充测试
+
+见 §6（已并入）：任务插入失败不提前释放 tag；前缀删除含 tagged 文件的释放语义；upsert 异 URI 失败不丢原 tag/原文档；并发重复 tag 与 uri 分别命中正确语义；tag 规范化边界；前端 tag 非空多文件拦截。
+
+### 8.5 处置结论（2026-06-28，用户确认）
+
+**Codex 全部 10 条均采纳**，并已落实到上文 §1–§7：
+
+| # | 处置 |
+|---|---|
+| 1 事务边界 | ✅ 采纳——新增非提交 `add_task()` + `_release_tag_and_soft_delete` 单事务（§4.7）|
+| 2 move 损坏窗口 | ✅ 采纳 Codex「同一行 move+replace」方案（§4.8），保留 `file.id`/`tag`，无丢失窗口 |
+| 3 唯一性 | ✅ 采纳——改 `(workspace_id, tag)` 内唯一，`GET by-tag` workspace-scoped（§2/4.1/4.4/4.8）|
+| 4 `deleted_at` 软删除 | ✅ 采纳——统一软删除 + 读路径过滤（§4.7/4.9）。代价：读路径横切面较大，须逐条审计 |
+| 5 tag 字符集 | ✅ 采纳 `^[A-Za-z0-9._:-]{1,128}$`（§4.2）|
+| 6 `IntegrityError` 按约束名 | ✅ 采纳（§4.2）|
+| 7 前端显式多文件守卫 | ✅ 采纳（§4.6，原 spec 已含 `>1` 判断，明确不依赖 rc-upload 隐式行为）|
+| 8 搜索窗口 | ✅ 由第 4 点 `deleted_at` 覆盖（§4.9 检索回查过滤）|
+| 9 查重前置 | ✅ 采纳（§4.2）|
+| 10 显式 `target_path` | ✅ 采纳（§4.8）|
+
+**收敛差异**：Codex 第 2 点首选「第一版不做 move」，本方案据用户决策直接采用其「同一行 move+replace」备选（一步到位、对外即 `moved`）。**新增边界**（§4.9）：软删除仅释放 tag、不释放 uri，同 uri 裸上传仍 409，同路径刷新走 upsert 更新分支。
