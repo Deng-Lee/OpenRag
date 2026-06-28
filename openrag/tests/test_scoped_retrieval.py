@@ -141,3 +141,51 @@ def test_es_blend_filter_ids_within_scope():
         scope_file_ids={2, 3}, vector_similarity_weight=0.7,
     )
     assert ft.calls and set(ft.calls[0]["file_ids"]) <= {2, 3}
+
+
+import asyncio
+
+import pytest
+from fastapi import HTTPException
+
+import openrag.api.search_api as sapi
+
+
+def test_assert_search_workspace_read_blocks_without_permission(monkeypatch):
+    monkeypatch.setattr(
+        sapi.WorkspaceService, "check_user_permission",
+        lambda self, ws, uid, perm: False,
+    )
+    with pytest.raises(HTTPException) as ei:
+        sapi.assert_search_workspace_read(Mock(), user_id=1, workspace_id=7)
+    assert ei.value.status_code == 403
+
+
+def test_assert_search_workspace_read_allows_with_permission(monkeypatch):
+    monkeypatch.setattr(
+        sapi.WorkspaceService, "check_user_permission",
+        lambda self, ws, uid, perm: True,
+    )
+    sapi.assert_search_workspace_read(Mock(), user_id=1, workspace_id=7)
+
+
+def test_assert_search_workspace_read_skips_when_no_workspace():
+    sapi.assert_search_workspace_read(Mock(), user_id=1, workspace_id=None)
+
+
+def test_semantic_search_blocks_before_execute(monkeypatch):
+    """无 read 权限的 workspace 必须在进入 _execute_search（含 resolve/embedding）前 403。"""
+    monkeypatch.setattr(
+        sapi.WorkspaceService, "check_user_permission",
+        lambda self, ws, uid, perm: False,
+    )
+    called = {"exec": False}
+    monkeypatch.setattr(
+        sapi, "_execute_search",
+        lambda *a, **k: called.__setitem__("exec", True),
+    )
+    req = sapi.SearchRequest(query="q", workspace_id=7, paths=["/docs"])
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(sapi.semantic_search(req, user_id=1, db=Mock()))
+    assert ei.value.status_code == 403
+    assert called["exec"] is False

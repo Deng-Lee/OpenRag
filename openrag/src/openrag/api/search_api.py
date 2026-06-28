@@ -132,6 +132,10 @@ class SearchRequest(BaseModel):
         le=1.0,
         description="向量融合分权重；全文 BM25 权重为 1-该值。默认 0.7；1 表示仅向量侧。",
     )
+    paths: Optional[list[str]] = Field(
+        None,
+        description="限定检索范围到这些逻辑路径（文件夹递归 / 单文件）；需配合 workspace_id。空数组=空范围",
+    )
 
 
 class SearchResult(BaseModel):
@@ -222,6 +226,7 @@ class ChunkContextResponse(BaseModel):
 
 from openrag.api.deps import get_current_active_user
 from openrag.models.user import User
+from openrag.services.workspace_file_tree import resolve_scope_file_ids
 from openrag.services.workspace_service import WorkspaceService
 
 
@@ -234,6 +239,19 @@ def get_user_id(current_user: User = Depends(get_current_active_user)) -> int:
 # ---------------------------------------------------------------------------
 
 
+def assert_search_workspace_read(db: Session, user_id: int, workspace_id: Optional[int]) -> None:
+    """Internal JWT search entry workspace read-permission check. workspace_id=None keeps
+    the existing 'search across the user's accessible workspaces' semantics; admin is
+    allowed via check_user_permission. JWT endpoints only — not the service-token path."""
+    if workspace_id is None:
+        return
+    if not WorkspaceService(db).check_user_permission(workspace_id, user_id, "read"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Read permission required",
+        )
+
+
 def _execute_search(
     db: Session,
     user_id: int,
@@ -242,6 +260,12 @@ def _execute_search(
     endpoint: str,
     rerank_hierarchical_boost: Optional[float],
 ) -> SearchResponse:
+    if request.paths is not None and request.workspace_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="workspace_id is required when paths is set",
+        )
+    scope_file_ids = resolve_scope_file_ids(db, request.workspace_id, request.paths)
     start = time.time()
     trace_service, started_trace_run = _prepare_retrieval_trace(
         db=db,
@@ -282,6 +306,7 @@ def _execute_search(
                 retrieval_strategy=request.retrieval_strategy,
                 use_l1_llm_navigation=use_l1_llm_navigation,
                 vector_similarity_weight=request.vector_similarity_weight,
+                scope_file_ids=scope_file_ids,
             )
         else:
             fetch_k = request.top_k * 3 if request.use_rerank else request.top_k
@@ -294,6 +319,7 @@ def _execute_search(
                 retrieval_strategy=request.retrieval_strategy,
                 use_l1_llm_navigation=False,
                 vector_similarity_weight=request.vector_similarity_weight,
+                scope_file_ids=scope_file_ids,
             )
 
             pre_rerank_results = list(results)
@@ -397,6 +423,7 @@ async def semantic_search(
     db: Session = Depends(get_db),
 ):
     """Semantic search with permission filtering and optional reranking."""
+    assert_search_workspace_read(db, user_id, request.workspace_id)
     try:
         return _execute_search(
             db,
@@ -419,6 +446,7 @@ async def hierarchical_search(
     db: Session = Depends(get_db),
 ):
     """Hierarchical search (title/heading aware) with permission filtering."""
+    assert_search_workspace_read(db, user_id, request.workspace_id)
     try:
         return _execute_search(
             db,
