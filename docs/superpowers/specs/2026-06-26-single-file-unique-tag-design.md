@@ -118,13 +118,14 @@
 - `background=false`：`delete_file_with_storage(db, row, ws)` 同步物删（行消失）→ 200。
 - `user_id` 取 `ws.owner_id`。
 
-**内部 `DELETE /files/{id}`**：`background=true` 分支改用 `_release_tag_and_soft_delete(...)`（已确认内外一致）；`background=false` 不变。
+**内部 `DELETE /files/{id}`**：`background=true` 分支需要区分文件与目录。若命中普通文件，改用 `_release_tag_and_soft_delete(...)`（已确认内外一致）；若命中目录，不能只软删目录行，必须走与 `delete-path-prefix` 相同的 subtree 软删除 helper：同事务把目录及其全部子文件/子目录设置 `deleted_at=deleted_before`、`tag=None`，并入队 `DELETE_PATH_PREFIX`。这样目录删除下的 tagged 子文件也能“入队即释放 tag / 立即不可见”。`background=false` 不变，继续同步物删。
 
 **前缀删除 `POST /files/delete-path-prefix`**：`background=true` 分支必须同事务软删整个 subtree，而不是只记录 prefix：
 - 计算 `deleted_before = utcnow()`。
 - 查询 `workspace_id==body.workspace_id` 且 `uri == prefix OR uri LIKE prefix + "/%"` 且 `deleted_at IS NULL` 的全部文件/目录行；批量设置 `deleted_at=deleted_before`、`tag=None`。
 - `add_task(DELETE_PATH_PREFIX, payload={"path": prefix, "deleted_before": deleted_before.isoformat()})`，上述修改与任务插入**单次 commit**；失败 `rollback`。使前缀删除与单文件删除的 tag 释放语义一致（Codex #4）。
 - worker 执行 `DELETE_PATH_PREFIX` 时，物理删除查询必须限定为 `deleted_at IS NOT NULL AND deleted_at <= deleted_before` 的行，并按 URI 深度从深到浅删除。不能只按 prefix 删除当前所有行，否则会误删任务入队后在同 prefix 下新建的 active 文件。
+- `DELETE_PATH_PREFIX` worker 不能直接复用现有 `delete_files_under_uri_prefix()`，也不能把目录行传给现有 `delete_file_with_storage()` 的目录分支；后者会重新按 prefix 查询 children，并调用 prefix-wide 的 `remove_directory()`，会绕过 `deleted_before` 防线。应新增专用 physical cleanup：先固定本次待清理的软删行 ID 集合；文件行按 id 清理精确对象、层级、向量/全文索引、任务与 DB 行；目录行只在确认没有 active descendant 后删除目录 DB 行及目录自身元数据，不做 prefix-wide 对象删除。
 - 因为 `ensure_directory_path()` / 父目录校验不允许写入 pending deletion 的目录树，正常情况下不会出现“软删后又写入同 subtree”的 active 行；worker 侧仍保留 `deleted_at` 过滤作为最后防线。
 
 需在 `service_api.py` import：`delete_file_with_storage` / `TaskService` / `TaskType` / `TaskStatus`。
@@ -192,7 +193,9 @@ Form: tag=XXX, target_path=/dir/name.pdf, parser_type=auto, create_dirs=false   
 - `DELETE by-path`（异步）→ 文档**立即**从列表/by-path/by-tag/检索消失（`deleted_at` 过滤）、tag **立即**可复用；旧行物理清理异步、按 id/uri 作用不伤新行。
 - **任务创建失败时 tag 不被提前释放**（事务回滚）：模拟 `add_task`/commit 失败 → `deleted_at`/tag 未变。
 - 前缀删除含 tagged 文件 → 命中行 `deleted_at`+`tag=None` 同事务、对读不可见、tag 释放。
+- 内部 `DELETE /files/{id}` 删除目录且 `background=true` → 目录及 subtree 全部软删、子文件 tag 释放、任务类型为 `DELETE_PATH_PREFIX`；不能只软删目录本身。
 - 前缀删除任务入队后，在同 prefix 下后来出现的 active 行不会被 worker 物理删除；worker 只删除 `deleted_at IS NOT NULL AND deleted_at <= payload.deleted_before` 的行。
+- `DELETE_PATH_PREFIX` 物理清理不调用 prefix-wide 删除逻辑；构造“软删目录 + 后来 active 子文件/对象”的场景，worker 清理后 active 子文件 DB 行与对象仍保留。
 - pending deletion 的目录不能作为上传 / upsert / create_dirs 的 active 父目录；命中时返回 409 pending deletion。
 - `upsert-by-tag`：tag 不存在→`created`；`target_path==existing.uri`→`updated`（同 id/uri/tag）；异 uri→`moved`（**同 file.id 不变**、tag 不变、旧路径消失、新路径有新内容）；目标路径被他文档占→409；**新建/移动失败时原 tag 与原文档可达性不丢**；无 write→403。
 - `upsert-by-tag` 异 URI move 分支模拟 DB commit 失败 / MinIO 写失败：不清 tag、不删 File 行；若已写新对象则 best-effort 清理，旧行仍可通过原 tag 找到。
@@ -211,11 +214,11 @@ Form: tag=XXX, target_path=/dir/name.pdf, parser_type=auto, create_dirs=false   
 - `openrag/alembic/versions/20260626_0004_add_file_tag_and_deleted_at.py`（新建迁移）
 - `openrag/src/openrag/services/task_service.py`（新增非提交 `add_task()`；`create_task()` 改为复用之）
 - `openrag/src/openrag/services/file_ingest.py`（`ingest_new_file` 加 `tag`：字符集正则 + workspace 内查重前置于建目录 + 按约束名区分 `IntegrityError`）
-- `openrag/src/openrag/api/files_api.py`（`/upload` 加 `tag` Form + 回显；`DELETE /files/{id}` 异步分支改用软删除 helper；`delete-path-prefix` 异步分支批量软删+释放 tag 并写入 `deleted_before`；list/详情/preview 读路径加 `deleted_at IS NULL`）
+- `openrag/src/openrag/api/files_api.py`（`/upload` 加 `tag` Form + 回显；`DELETE /files/{id}` 异步分支按文件/目录分流，文件走单行软删除，目录走 subtree 软删除并入队 `DELETE_PATH_PREFIX`；`delete-path-prefix` 异步分支批量软删+释放 tag 并写入 `deleted_before`；list/详情/preview 读路径加 `deleted_at IS NULL`）
 - `openrag/src/openrag/api/service_api.py`（`/documents` 加 `tag` Form；新增 `GET /workspaces/{name}/documents/by-tag`、`PUT /workspaces/{name}/documents/upsert-by-tag`、`DELETE /workspaces/{name}/documents/by-path`；`replace-by-path`、`preview-links`、`_upload_response_dict`/`_document_summary` 处理 active 行和 tag；相关 import）
 - `openrag/src/openrag/services/workspace_file_tree.py`（`build_nested_tree`/`get_file_document_by_path`/`list_entries_by_prefix`/`list_direct_children`/`search_documents_by_name` 加 `deleted_at IS NULL`）
 - `openrag/src/openrag/retrieval/retrieval_service.py`（`_accessible_file_ids()` 只返回 active 文件；chunk→file 回查阶段过滤 `deleted_at IS NOT NULL`；admin 指定 workspace 无 active 文件时返回空结果）
-- `openrag/src/openrag/worker/task_worker.py` / `openrag/src/openrag/services/file_deletion.py`（`DELETE_PATH_PREFIX` 物理清理只删除 payload `deleted_before` 之前已软删的 subtree 行，避免误删后来 active 文件）
+- `openrag/src/openrag/worker/task_worker.py` / `openrag/src/openrag/services/file_deletion.py`（`DELETE_PATH_PREFIX` 物理清理只删除 payload `deleted_before` 之前已软删的 subtree 行；新增专用 cleanup，避免复用 prefix-wide `delete_files_under_uri_prefix()` / 目录版 `delete_file_with_storage()` 误删后来 active 文件）
 - `openrag/src/openrag/api/workspace_file_api.py` / `openrag/src/openrag/api/embed_preview_api.py`（预览路径过滤软删文件）
 - 删除释放 tag 的内部 helper（`_release_tag_and_soft_delete`，置于 `file_deletion.py` 或 `file_ingest.py`，供内外删除入口复用）
 - upsert move+replace 专用 helper（置于服务层，避免直接串联现有带中间 commit 的 `move_file` / `replace_file_content`）
@@ -298,3 +301,19 @@ Claude Code 根据 §8.1–§8.5 更新方案后，Codex 进行二次审查。�
 **复核补充**：URI 查重命中软删行 → `409 pending deletion`、命中 active 行 → `File already exists`，二者错误语义区分（§4.9）。
 
 **范围提示**：连同 §8.6，本功能已从"加一列 + 几个端点"扩展为含**软删除子系统**（横切 worker、检索、预览、目录写入）。强烈建议按 §8.3 **分三阶段**实施，每阶段独立可测，避免一次性大改难以验证。
+
+### 8.8 Codex 三次审查补充（来自 Codex 审查，2026-06-28）
+
+Claude Code 再次修改后，Codex 复审认为主体方案可继续推进，但补充 2 个必须落实的删除边界，已并入 §4.7、§6、§7：
+
+1. **内部 `DELETE /files/{id}` 删除目录时不能只软删目录行。** `background=true` 命中目录必须走 subtree 软删除 helper，把目录及其全部子文件/子目录同事务 `deleted_at=deleted_before`、`tag=None`，并入队 `DELETE_PATH_PREFIX`；普通文件仍走 `_release_tag_and_soft_delete(...)`。
+2. **`DELETE_PATH_PREFIX` 物理清理不能复用 prefix-wide 删除逻辑。** worker 必须固定本次待清理的软删行 ID 集合；文件行按 id 精确清理对象/层级/向量/全文索引/DB 行；目录行只在无 active descendant 后清理目录自身元数据，不能调用会重新扫 prefix 的 `delete_files_under_uri_prefix()` 或目录版 `delete_file_with_storage()`。
+
+### 8.9 三次审查处置（2026-06-28，Claude Code 复核）
+
+复核 §8.8 两条，**均可行、正确，且已并入 §4.7/§6/§7，正文无需再改**。
+
+- **第 1 条（目录删除级联软删）成立**：若只软删目录行不级联，子文件仍 `deleted_at IS NULL` 可见、父目录却已隐藏 → 孤儿/不一致。已落实于 §4.7（内部 `DELETE /files/{id}` 命中目录 → subtree 软删 + 入队 `DELETE_PATH_PREFIX`）、§6、§7。**行为变更提示**：内部按 id 删目录从「单 `DELETE_FILE`」改为「subtree 软删 + `DELETE_PATH_PREFIX`」。
+- **第 2 条（worker 固定 ID 集合、不复用 prefix-rescan）成立**：已用代码确认 `delete_files_under_uri_prefix()`（[file_deletion.py:137](../../../openrag/src/openrag/services/file_deletion.py)）与 `delete_file_with_storage()` 目录分支（[:92-108](../../../openrag/src/openrag/services/file_deletion.py)）都按 prefix 重扫 children——物理清理阶段若重扫，会绕过 `deleted_before` 快照、波及入队后新建的 active 行。已落实于 §4.7（新增专用 physical cleanup，按本次软删 ID 集合逐条清理；目录行仅在无 active descendant 后删 DB 行）、§6、§7。
+
+**结论**：本轮无需修改正文方案；至此 Codex 三轮审查（§8.2 十条 + §8.6 四条 + §8.8 两条）全部采纳并落实。建议据此停止反复审查、按 §8.3 分三阶段进入 `writing-plans`。
