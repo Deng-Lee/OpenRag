@@ -77,6 +77,11 @@ class File(Base, TimestampMixin):
         default=DEFAULT_DOCUMENT_TYPE,
         comment="Document type for chunking pipeline",
     )
+    tag: Mapped[Optional[str]] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="Per-workspace unique tag (single-file upload only)",
+    )
     workspace_id: Mapped[int] = mapped_column(
         ForeignKey("workspaces.id"), nullable=False, comment="Workspace ID"
     )
@@ -86,6 +91,7 @@ class File(Base, TimestampMixin):
         "name",
         "mime_type",
         "document_type",
+        "tag",
         "l0_path",
         "l1_path",
         "l2_path",
@@ -173,6 +179,7 @@ class File(Base, TimestampMixin):
     # Indexes
     __table_args__ = (
         UniqueConstraint("workspace_id", "uri", name="uq_files_workspace_uri"),
+        UniqueConstraint("workspace_id", "tag", name="uq_files_workspace_tag"),
         Index("idx_file_owner_id", "owner_id"),
         Index("idx_file_parent_id", "parent_id"),
     )
