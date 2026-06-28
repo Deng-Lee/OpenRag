@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import posixpath
+import re
 import uuid
 from typing import Optional, Tuple
 
@@ -28,6 +29,21 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 # Counted in BYTES (not chars): non-ASCII names cost >1 byte/char in UTF-8.
 # Mirror this value in web/src/utils/folderUpload.ts (MAX_FILENAME_BYTES).
 MAX_FILENAME_BYTES = 200
+
+_TAG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _normalize_tag(tag):
+    """Trim; blank -> None; else must match the tag charset (raises 400)."""
+    tag = (tag or "").strip()
+    if not tag:
+        return None
+    if not _TAG_RE.match(tag):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid tag. Allowed: ^[A-Za-z0-9._:-]{1,128}$",
+        )
+    return tag
 ALLOWED_MIME_TYPES = [
     "text/plain",
     "text/markdown",
@@ -355,6 +371,7 @@ def ingest_new_file(
     document_type: str = DEFAULT_DOCUMENT_TYPE,
     require_parent_dir: bool = False,
     duplicate_status_code: int = status.HTTP_400_BAD_REQUEST,
+    tag: Optional[str] = None,
 ) -> Tuple[FileModel, Optional[Task]]:
     """
     Create a new file object under ``parent_logical_path`` / ``upload_filename``,
@@ -398,6 +415,8 @@ def ingest_new_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
             )
+
+        normalized_tag = _normalize_tag(tag)
 
         # Reject over-long file names up front (before MinIO/DB writes) so the
         # caller gets a clear 400 instead of a silent worker failure: the worker
@@ -529,6 +548,7 @@ def ingest_new_file(
             mime_type=ct,
             document_type=normalized_document_type,
             parser_type=parser_type if parser_type != "auto" else None,
+            tag=normalized_tag,
         )
         db.add(file_record)
         db.commit()
