@@ -233,3 +233,8 @@ def test_resolve_scope_file_ids_empty_list_is_empty_scope(db_session, workspace,
 
 def test_resolve_scope_file_ids_nonexistent_path_is_empty(db_session, workspace, owner):
     assert resolve_scope_file_ids(db_session, workspace.id, ["/nope"]) == set()
+
+
+def test_resolve_scope_file_ids_root_with_other_path_is_unrestricted(db_session, workspace, owner):
+    _file(db_session, workspace, owner, "/docs/a.txt", "a.txt")
+    assert resolve_scope_file_ids(db_session, workspace.id, ["/docs", "/"]) is None

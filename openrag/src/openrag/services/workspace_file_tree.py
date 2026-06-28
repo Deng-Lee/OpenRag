@@ -36,11 +36,11 @@ def _normalize_logical_path(path: str) -> str:
     return normalized
 
 
-def normalize_scope_paths(paths):
-    """把请求传入的 paths 归一化为去重、有序的逻辑路径列表。
+def normalize_scope_paths(paths: Optional[List[str]]) -> Optional[List[str]]:
+    """Normalize request scope paths into a deduplicated, ordered list of logical paths.
 
-    None -> None（未指定范围）；[] -> []（显式空范围）。
-    超 50 个 / 单路径超 1024 字符 / 空白项 / `..` 穿越 -> 400。
+    None -> None (no scope); [] -> [] (explicit empty scope). Raises 400 for >50
+    paths, any path >1024 chars (pre-normalization), blank items, or `..` traversal.
     """
     if paths is None:
         return None
@@ -52,33 +52,39 @@ def normalize_scope_paths(paths):
     out: List[str] = []
     seen: set[str] = set()
     for raw in paths:
-        if raw is None or not str(raw).strip():
+        raw_str = str(raw) if raw is not None else ""
+        if not raw_str.strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Scope path must not be blank",
             )
-        if len(str(raw)) > SCOPE_MAX_PATH_LEN:
+        if len(raw_str) > SCOPE_MAX_PATH_LEN:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Scope path too long (limit {SCOPE_MAX_PATH_LEN})",
             )
-        norm = _normalize_logical_path(str(raw))  # `..` -> 400
+        norm = _normalize_logical_path(raw_str)  # `..` -> 400
         if norm not in seen:
             seen.add(norm)
             out.append(norm)
     return out
 
 
-def resolve_scope_file_ids(db: Session, workspace_id: int, paths):
-    """把 paths 解析为该 workspace 下的文件 id 集合（不含目录行）。
+def resolve_scope_file_ids(
+    db: Session, workspace_id: int, paths: Optional[List[str]]
+) -> Optional[set[int]]:
+    """Resolve scope paths into the set of file ids (excluding directories) under them
+    in the workspace.
 
-    返回 None 表示"不限范围"（paths 未指定，或含根 `/`）。
-    返回 set（可能为空）表示限定范围；空 set 表示空范围 -> 空结果。
-    复用与 `_under_prefix` 一致的前缀规则，但只查 File.id、不构树、不继承 TREE_MAX_NODES。
+    Returns None for 'unrestricted' (paths is None, or contains root '/'); returns a
+    set (possibly empty) otherwise; empty set means empty scope -> no results. Reuses
+    the same prefix rule as `_under_prefix` but queries File.id directly (no tree
+    build, no TREE_MAX_NODES limit).
     """
     norm = normalize_scope_paths(paths)
     if norm is None:
         return None
+    # Root among the paths -> unrestricted scope.
     if "/" in norm:
         return None
     ids: set[int] = set()
