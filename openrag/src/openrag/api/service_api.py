@@ -145,7 +145,9 @@ class ServicePreviewLinkResponse(BaseModel):
     ttl_seconds: int
 
 
-def _resolve_scope_paths(paths, path_prefix):
+def _resolve_scope_paths(
+    paths: Optional[List[str]], path_prefix: Optional[str]
+) -> Optional[List[str]]:
     """paths overrides path_prefix when explicitly provided (including []); only fall
     back to the legacy path_prefix when paths is None."""
     if paths is not None:

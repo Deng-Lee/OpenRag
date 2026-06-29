@@ -2,8 +2,6 @@
 
 from unittest.mock import MagicMock, patch
 
-from openrag.api.service_api import _resolve_scope_paths
-
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -16,6 +14,7 @@ import openrag.config as config_module
 from openrag.api.deps import get_db
 from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
+from openrag.api.service_api import _resolve_scope_paths
 from openrag.models import Base, DocumentChunk, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
 from openrag.security import hash_password
 from openrag.services.file_ingest import ensure_directory_path
