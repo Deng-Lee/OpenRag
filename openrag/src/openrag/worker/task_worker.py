@@ -457,6 +457,9 @@ class TaskWorker:
             if not file:
                 _logger.info("delete_file task: file %s already gone, skip", file_id)
                 return {"file_id": file_id, "status": "skipped", "reason": "not_found"}
+            if file.deleted_at is None:
+                _logger.warning("delete_file task: file %s not soft-deleted, skip", file_id)
+                return {"file_id": file_id, "status": "skipped", "reason": "active"}
 
             ws_service = WorkspaceService(db)
             workspace = ws_service.get_workspace(file.workspace_id)
@@ -476,9 +479,30 @@ class TaskWorker:
         if not workspace_id or not path:
             raise ValueError("delete_path_prefix task missing workspace_id or payload.path")
 
+        # Codex round-4 #1: never let a root/empty/"/" prefix trigger workspace-wide
+        # physical cleanup, even from a legacy/manual/malformed task. Guard BEFORE opening
+        # a session (no DB needed to reject); skip gracefully so the worker doesn't crash
+        # on a poisoned task. The helper raises ValueError too as a second line of defense.
+        if not path or path.rstrip("/") == "":
+            _logger.error(
+                "delete_path_prefix task with root/empty path=%r; skipping workspace-wide "
+                "cleanup (workspace_id=%s)", path, workspace_id,
+            )
+            return {
+                "workspace_id": workspace_id,
+                "path": path,
+                "deleted_count": 0,
+                "deleted_ids": [],
+                "status": "skipped",
+                "reason": "root_prefix",
+            }
+
         db = SessionLocal()
         try:
-            from openrag.services.file_deletion import delete_files_under_uri_prefix
+            from datetime import datetime
+            from openrag.services.file_deletion import (
+                physically_delete_soft_deleted_under_prefix,
+            )
             from openrag.services.workspace_service import WorkspaceService
 
             ws_service = WorkspaceService(db)
@@ -486,8 +510,28 @@ class TaskWorker:
             if not workspace:
                 raise ValueError(f"Workspace {workspace_id} not found")
 
-            deleted_ids = delete_files_under_uri_prefix(
-                db, workspace_id, path, workspace
+            deleted_before_raw = payload.get("deleted_before")
+            if not deleted_before_raw:
+                # Codex #1: fail closed. A prefix task without a watermark must NOT
+                # fall back to prefix-wide physical delete (that would drop active
+                # rows created after enqueue). Phase 2 always writes deleted_before;
+                # a task missing it is malformed/legacy — skip and let an operator requeue.
+                _logger.error(
+                    "delete_path_prefix task missing payload.deleted_before; skipping "
+                    "(workspace_id=%s path=%s)", workspace_id, path,
+                )
+                return {
+                    "workspace_id": workspace_id,
+                    "path": path,
+                    "deleted_count": 0,
+                    "deleted_ids": [],
+                    "status": "skipped",
+                    "reason": "missing_deleted_before",
+                }
+
+            deleted_before = datetime.fromisoformat(deleted_before_raw)
+            deleted_ids = physically_delete_soft_deleted_under_prefix(
+                db, workspace_id, path, deleted_before, workspace
             )
             return {
                 "workspace_id": workspace_id,
