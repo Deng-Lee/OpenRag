@@ -235,10 +235,10 @@ class RetrievalService:
         vector_similarity_weight: float = 1.0,
         scope_file_ids: Optional[set[int]] = None,
     ) -> list[dict]:
-        query_vec = self._embed_query(query)
         accessible_file_ids = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
         if accessible_file_ids is not None and len(accessible_file_ids) == 0:
             return []
+        query_vec = self._embed_query(query)
 
         self.trace_service.start_span(
             "retrieval.chunk_search",
@@ -339,13 +339,16 @@ class RetrievalService:
         vector_similarity_weight: float = 1.0,
         scope_file_ids: Optional[set[int]] = None,
     ) -> list[dict]:
-        query_vec = self._embed_query(query)
         accessible = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
         if accessible is not None and len(accessible) == 0:
             return []
+        query_vec = self._embed_query(query)
 
+        # Always hand the effective file ids to the layer store so a large scope
+        # (>512) uses its oversample+post-filter path instead of an unfiltered
+        # full-workspace L0 top-N that could squeeze out in-scope candidates.
         use_expr_filter = accessible is not None and len(accessible) <= 512
-        l0_file_filter = accessible if use_expr_filter else None
+        l0_file_filter = accessible if accessible is not None else None
         l0_cap = max(l0_top_n * 4, 80)
 
         l0_hits = self.layer_store.search_layers(

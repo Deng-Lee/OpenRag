@@ -730,6 +730,207 @@ git commit -m "docs(api): document paths scope and pre-filter change" -m "Co-Aut
 
 ---
 
+## Task 6: Codex 代码复审补充修复（空 scope 真提前返回 + 大 scope contextual L0 预过滤）
+
+**Files:**
+- Modify: `openrag/src/openrag/api/search_api.py`
+- Modify: `openrag/src/openrag/retrieval/retrieval_service.py`
+- Test: `openrag/tests/test_scoped_retrieval.py`
+
+**目标：**
+1. `paths=[]` / 不存在路径 / 空目录解析成空 scope 后，要在初始化 embedding、Milvus、layer/fulltext store 前直接返回空结果。
+2. scope 与 accessible file ids 交集为空时，`_search_flat` / `_search_contextual` 要在 `_embed_query()` 前返回空结果。
+3. contextual L0 即使遇到大 scope（>512 file ids），也要把 effective file ids 传给 `layer_store.search_layers()`，让 layer store 使用既有大列表兜底逻辑，而不是先全 workspace 取 L0 top 再过滤。
+
+- [ ] **Step 1: 写失败测试**（追加到 `test_scoped_retrieval.py`）
+
+```python
+class _FailingEmbeddingEngine:
+    dimension = 3
+
+    def embed_text(self, text):
+        raise AssertionError("embedding should not run for empty scope")
+
+
+class _FailingVectorStore:
+    def search(self, *args, **kwargs):
+        raise AssertionError("vector store should not run for empty scope")
+
+
+class _FailingLayerStore:
+    def search_layers(self, *args, **kwargs):
+        raise AssertionError("layer store should not run for empty scope")
+
+
+def test_execute_search_empty_scope_returns_before_external_dependencies(monkeypatch):
+    monkeypatch.setattr(sapi, "resolve_scope_file_ids", lambda *a, **k: set())
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("external dependency should not be initialized for empty scope")
+
+    monkeypatch.setattr(sapi, "_prepare_retrieval_trace", _fail)
+    monkeypatch.setattr(sapi, "_get_embedding_engine", _fail)
+    monkeypatch.setattr(sapi, "_get_vector_store", _fail)
+    monkeypatch.setattr(sapi, "_get_layer_store", _fail)
+    monkeypatch.setattr(sapi, "_get_fulltext_store", _fail)
+
+    resp = sapi._execute_search(
+        Mock(),
+        1,
+        sapi.SearchRequest(query="q", workspace_id=7, paths=[]),
+        endpoint="semantic",
+        rerank_hierarchical_boost=None,
+    )
+
+    assert resp.results == []
+    assert resp.total == 0
+
+
+@pytest.mark.parametrize("use_contextual", [False, True])
+def test_empty_scope_intersection_returns_before_embedding_and_store(use_contextual):
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FailingEmbeddingEngine(),
+        vector_store=_FailingVectorStore(),
+        layer_store=_FailingLayerStore() if use_contextual else None,
+    )
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+
+    results = svc.search(
+        "q",
+        user_id=1,
+        workspace_id=7,
+        top_k=5,
+        use_contextual=use_contextual,
+        retrieval_strategy="deep",
+        scope_file_ids={99},
+    )
+
+    assert results == []
+
+
+class _LargeScopeLayerStore:
+    def __init__(self):
+        self.calls = []
+
+    def search_layers(self, query_embedding, layer, top_k, file_ids=None):
+        self.calls.append({"layer": layer, "file_ids": file_ids})
+        fid = int(file_ids[0]) if file_ids else -1
+        return [{"file_id": fid, "score": 0.8, "layer_row_id": "r", "text": "t"}]
+
+
+def test_contextual_large_scope_passes_file_ids_to_l0_layer_store():
+    large_scope = set(range(1000, 1600))  # >512
+    vs = _FakeVectorStore()
+    ls = _LargeScopeLayerStore()
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FakeEmbeddingEngine(),
+        vector_store=vs,
+        layer_store=ls,
+    )
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: list(range(900, 1700))
+    svc._enrich_hits = lambda hits: None
+
+    svc.search(
+        "q",
+        user_id=1,
+        workspace_id=7,
+        top_k=5,
+        use_contextual=True,
+        retrieval_strategy="deep",
+        scope_file_ids=large_scope,
+    )
+
+    l0 = next(c for c in ls.calls if c["layer"] == "l0")
+    assert l0["file_ids"] is not None
+    assert set(l0["file_ids"]) == large_scope
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cd openrag && python -m pytest tests/test_scoped_retrieval.py -k "empty_scope or large_scope" -v`
+
+Expected:
+- `test_execute_search_empty_scope_returns_before_external_dependencies` 失败，暴露 `_execute_search` 仍初始化外部依赖。
+- `test_empty_scope_intersection_returns_before_embedding_and_store` 失败，暴露 `_search_flat` / `_search_contextual` 仍先 embedding。
+- `test_contextual_large_scope_passes_file_ids_to_l0_layer_store` 失败，暴露 L0 大 scope 传入 `file_ids=None`。
+
+- [ ] **Step 3: 修复 `_execute_search` 空 scope 真提前返回**
+
+在 `_execute_search()` 中，`resolve_scope_file_ids(...)` 之后、`_prepare_retrieval_trace(...)` 和所有 `_get_*store()` 之前增加：
+
+```python
+    if scope_file_ids is not None and len(scope_file_ids) == 0:
+        elapsed_ms = (time.time() - start) * 1000
+        return SearchResponse(
+            results=[],
+            total=0,
+            query_time_ms=elapsed_ms,
+            l1_llm_applied=None,
+            l1_llm_skip_reason=None,
+        )
+```
+
+注意：这只处理“请求 scope 本身为空”的情况；无权限 workspace 的 JWT 403 仍然由端点前置 `assert_search_workspace_read(...)` 先处理。
+
+- [ ] **Step 4: 修复 RetrievalService 空交集在 embedding 前返回**
+
+`_search_flat()` 中把 effective file ids 计算和空列表 guard 移到 `_embed_query(query)` 之前：
+
+```python
+        accessible_file_ids = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
+        if accessible_file_ids is not None and len(accessible_file_ids) == 0:
+            return []
+        query_vec = self._embed_query(query)
+```
+
+`_search_contextual()` 同样把 effective file ids 计算和空列表 guard 移到 `_embed_query(query)` 之前：
+
+```python
+        accessible = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
+        if accessible is not None and len(accessible) == 0:
+            return []
+        query_vec = self._embed_query(query)
+```
+
+- [ ] **Step 5: 修复 contextual 大 scope L0 预过滤**
+
+在 `_search_contextual()` 中，L0 调用不要因为 `len(accessible) > 512` 就传 `None`。改为始终把 effective file ids 交给 layer store；layer store 已有大列表兜底逻辑。
+
+```python
+        use_expr_filter = accessible is not None and len(accessible) <= 512
+        l0_file_filter = accessible if accessible is not None else None
+
+        l0_hits = self.layer_store.search_layers(
+            query_vec, "l0", top_k=l0_cap, file_ids=l0_file_filter
+        )
+        if accessible is not None and not use_expr_filter:
+            acc_set = set(accessible)
+            l0_hits = [h for h in l0_hits if h.get("file_id") in acc_set]
+```
+
+说明：这里保留大列表后的内存二次过滤作为防御；真实 `MilvusLayerStore.search_layers()` 收到大列表后会扩大召回并做 post-filter，避免 retrieval 层先全 workspace top-N 再过滤导致范围内候选被挤掉。
+
+- [ ] **Step 6: 跑测试确认通过**
+
+Run: `cd openrag && python -m pytest tests/test_scoped_retrieval.py -v`
+
+Expected: PASS。
+
+Run: `cd openrag && python -m pytest tests/test_scoped_retrieval.py tests/test_workspace_file_tree.py tests/test_service_api.py -v`
+
+Expected: PASS。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add openrag/src/openrag/api/search_api.py openrag/src/openrag/retrieval/retrieval_service.py openrag/tests/test_scoped_retrieval.py
+git commit -m "fix(retrieval): return empty scopes before external search dependencies" -m "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+```
+
+---
+
 ## Self-Review（计划对照 spec）
 
 - **§4.0 鉴权**：Task 3（`assert_search_workspace_read` + JWT 端点前置 + 403）。✓
@@ -774,3 +975,15 @@ git commit -m "docs(api): document paths scope and pre-filter change" -m "Co-Aut
 - **P1（旧 `path_prefix` 用例冲突）→ Task 4 Step 1b（新增）。** 已核实 `test_service_search_path_prefix_filter`、`test_service_multi_workspace_search_applies_path_prefix_per_workspace` 均 mock `_execute_search` 并断言后过滤裁剪。新增步骤把它们改为断言 `SearchRequest.paths` 转发 + 结果不再裁剪；Step 4 Expected 同步为"含已更新用例"。
 - **P2（contextual 全链路受限证明不足）→ Task 2 Step 2（扩充）。** 新增 `test_contextual_scope_limits_l0_l1_l2`（断言 L0 收到 effective ids、L1/L2 候选在范围内）、`test_contextual_fallback_to_flat_carries_scope`（无 L0 命中回退仍带 scope）、`test_es_blend_filter_ids_within_scope`（`vector_similarity_weight=0.7` 时 ES `filter_file_ids` 在范围内）。
 - **P3（端点调用顺序未验证）→ Task 3 Step 1（扩充）+ Step 3（明确位置）。** 新增 `test_semantic_search_blocks_before_execute`：无权限时 403 且 `_execute_search` 未被调用；并把 `assert_search_workspace_read` 明确放在端点 `try:` 之前（先于 resolve/embedding/向量检索）。
+
+---
+
+## 代码复审补充记录（来自 Codex，2026-06-29）
+
+- **P1（空 scope 未真正提前返回）→ Task 6 Step 1-4（新增）。** 已把 `paths=[]` / 不存在路径 / 空目录解析成空 scope 后的返回时机明确为：`_execute_search` 在初始化 trace、embedding、Milvus、layer/fulltext store 前直接返回空 `SearchResponse`；`_search_flat` / `_search_contextual` 在 scope 与 accessible 交集为空时，也必须在 `_embed_query()` 前返回 `[]`。新增测试覆盖 `_execute_search` 不初始化外部依赖，以及 flat/contextual 空交集不调用 embedding/store。
+- **P2（contextual 大 scope L0 仍先全 workspace 搜）→ Task 6 Step 1、Step 5（新增）。** 已明确当 effective file ids 超过 512 时，L0 仍要把 `file_ids` 传给 `layer_store.search_layers()`，由 layer store 的大列表 post-filter/oversampling 逻辑兜底；retrieval 层可保留二次内存过滤作为防御。新增测试用 >512 的 scope 断言 L0 收到完整 effective file ids，而不是 `None`。
+
+**实现确认（2026-06-29）：** 两点均已落地并验证（先复核 diff 确认问题真实存在）。
+- P1：`search_api._execute_search` 在 `resolve_scope_file_ids` 之后、`_prepare_retrieval_trace`/`_get_*store()` 之前对空 scope 直接返回空 `SearchResponse`；`retrieval_service._search_flat` / `_search_contextual` 把 `_effective_file_ids` 计算与空交集 guard 移到 `_embed_query()` 之前。
+- P2：`_search_contextual` 的 `l0_file_filter = accessible if accessible is not None else None`（不再因 >512 置 `None`），保留 `not use_expr_filter` 时的内存二次过滤作为防御；已核实 `milvus_layer_store.search_layers()` 对 >512 列表用 `limit = min(max(top_k*50,500),4096)` 过采样 + 内部 post-filter。
+- 测试：`tests/test_scoped_retrieval.py` 新增 3 个用例（`test_execute_search_empty_scope_returns_before_external_dependencies`、参数化的 `test_empty_scope_intersection_returns_before_embedding_and_store`、`test_contextual_large_scope_passes_file_ids_to_l0_layer_store`）；默认收集集 172 passed（唯一 1 failed 为既有 `test_upload_file_large_file`，与本次无关）。

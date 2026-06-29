@@ -186,3 +186,112 @@ def test_semantic_search_blocks_before_execute(monkeypatch):
         asyncio.run(sapi.semantic_search(req, user_id=1, db=Mock()))
     assert ei.value.status_code == 403
     assert called["exec"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 6: empty scope must return before external deps; large scope L0 prefilter
+# ---------------------------------------------------------------------------
+
+
+class _FailingEmbeddingEngine:
+    dimension = 3
+
+    def embed_text(self, text):
+        raise AssertionError("embedding should not run for empty scope")
+
+
+class _FailingVectorStore:
+    def search(self, *args, **kwargs):
+        raise AssertionError("vector store should not run for empty scope")
+
+
+class _FailingLayerStore:
+    def search_layers(self, *args, **kwargs):
+        raise AssertionError("layer store should not run for empty scope")
+
+
+def test_execute_search_empty_scope_returns_before_external_dependencies(monkeypatch):
+    monkeypatch.setattr(sapi, "resolve_scope_file_ids", lambda *a, **k: set())
+
+    def _fail(*args, **kwargs):
+        raise AssertionError(
+            "external dependency should not be initialized for empty scope"
+        )
+
+    monkeypatch.setattr(sapi, "_prepare_retrieval_trace", _fail)
+    monkeypatch.setattr(sapi, "_get_embedding_engine", _fail)
+    monkeypatch.setattr(sapi, "_get_vector_store", _fail)
+    monkeypatch.setattr(sapi, "_get_layer_store", _fail)
+    monkeypatch.setattr(sapi, "_get_fulltext_store", _fail)
+
+    resp = sapi._execute_search(
+        Mock(),
+        1,
+        sapi.SearchRequest(query="q", workspace_id=7, paths=[]),
+        endpoint="semantic",
+        rerank_hierarchical_boost=None,
+    )
+
+    assert resp.results == []
+    assert resp.total == 0
+
+
+@pytest.mark.parametrize("use_contextual", [False, True])
+def test_empty_scope_intersection_returns_before_embedding_and_store(use_contextual):
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FailingEmbeddingEngine(),
+        vector_store=_FailingVectorStore(),
+        layer_store=_FailingLayerStore() if use_contextual else None,
+    )
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+
+    results = svc.search(
+        "q",
+        user_id=1,
+        workspace_id=7,
+        top_k=5,
+        use_contextual=use_contextual,
+        retrieval_strategy="deep",
+        scope_file_ids={99},
+    )
+
+    assert results == []
+
+
+class _LargeScopeLayerStore:
+    def __init__(self):
+        self.calls = []
+
+    def search_layers(self, query_embedding, layer, top_k, file_ids=None):
+        self.calls.append({"layer": layer, "file_ids": file_ids})
+        fid = int(file_ids[0]) if file_ids else -1
+        return [{"file_id": fid, "score": 0.8, "layer_row_id": "r", "text": "t"}]
+
+
+def test_contextual_large_scope_passes_file_ids_to_l0_layer_store():
+    large_scope = set(range(1000, 1600))  # >512
+    vs = _FakeVectorStore()
+    ls = _LargeScopeLayerStore()
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FakeEmbeddingEngine(),
+        vector_store=vs,
+        layer_store=ls,
+    )
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: list(range(900, 1700))
+    svc._enrich_hits = lambda hits: None
+
+    svc.search(
+        "q",
+        user_id=1,
+        workspace_id=7,
+        top_k=5,
+        use_contextual=True,
+        retrieval_strategy="deep",
+        scope_file_ids=large_scope,
+    )
+
+    l0 = next(c for c in ls.calls if c["layer"] == "l0")
+    assert l0["file_ids"] is not None
+    assert set(l0["file_ids"]) == large_scope

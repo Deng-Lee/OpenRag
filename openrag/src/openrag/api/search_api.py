@@ -269,6 +269,16 @@ def _execute_search(
                 detail="workspace_id is required when paths is set",
             )
         scope_file_ids = resolve_scope_file_ids(db, request.workspace_id, request.paths)
+    # Empty scope (paths=[], non-existent path, empty dir) can never match anything.
+    # Short-circuit before initializing trace/embedding/Milvus/layer/fulltext stores.
+    if scope_file_ids is not None and len(scope_file_ids) == 0:
+        return SearchResponse(
+            results=[],
+            total=0,
+            query_time_ms=(time.time() - start) * 1000,
+            l1_llm_applied=None,
+            l1_llm_skip_reason=None,
+        )
     trace_service, started_trace_run = _prepare_retrieval_trace(
         db=db,
         user_id=user_id,
