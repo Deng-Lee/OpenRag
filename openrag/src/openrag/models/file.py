@@ -82,6 +82,11 @@ class File(Base, TimestampMixin):
         nullable=True,
         comment="Per-workspace unique tag (single-file upload only)",
     )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP,
+        nullable=True,
+        comment="Soft-delete marker; row pending physical cleanup",
+    )
     workspace_id: Mapped[int] = mapped_column(
         ForeignKey("workspaces.id"), nullable=False, comment="Workspace ID"
     )
@@ -182,6 +187,7 @@ class File(Base, TimestampMixin):
         UniqueConstraint("workspace_id", "tag", name="uq_files_workspace_tag"),
         Index("idx_file_owner_id", "owner_id"),
         Index("idx_file_parent_id", "parent_id"),
+        Index("idx_files_deleted_at", "deleted_at"),
     )
 
     def __repr__(self) -> str:
