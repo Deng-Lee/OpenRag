@@ -875,11 +875,20 @@ async def delete_path_prefix(
             detail="Cannot delete workspace root path",
         )
 
+    from openrag.services.file_deletion import (
+        _escape_like,
+        soft_delete_subtree_and_enqueue,
+    )
+
     n = (
         db.query(FileModel)
         .filter(
             FileModel.workspace_id == body.workspace_id,
-            or_(FileModel.uri == prefix, FileModel.uri.like(f"{prefix}/%")),
+            or_(
+                FileModel.uri == prefix,
+                FileModel.uri.like(f"{_escape_like(prefix)}/%", escape="\\"),
+            ),
+            FileModel.deleted_at.is_(None),
         )
         .count()
     )
@@ -887,17 +896,9 @@ async def delete_path_prefix(
         return MessageResponse(message="No files or directories under this path")
 
     if background:
-        task_service = TaskService(db)
-        task_record = task_service.create_task(
-            workspace_id=body.workspace_id,
-            user_id=current_user.id,
-            file_id=None,
-            task_type=TaskType.DELETE_PATH_PREFIX.value,
-            queue="normal",
-            priority=6,
-            max_retries=3,
-            status=TaskStatus.PENDING,
-            payload={"path": prefix},
+        # subtree soft-delete + DELETE_PATH_PREFIX(watermark) in one commit (rollback on failure)
+        task_record = soft_delete_subtree_and_enqueue(
+            db, body.workspace_id, prefix, user_id=current_user.id
         )
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,

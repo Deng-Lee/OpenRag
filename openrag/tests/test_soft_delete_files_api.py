@@ -108,3 +108,69 @@ def test_delete_root_directory_returns_400(client, db, test_user, test_workspace
         assert db.query(Task).filter(Task.task_type == "delete_path_prefix").count() == 0
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_delete_path_prefix_async_soft_deletes_and_writes_watermark(client, db, test_user, test_workspace):
+    app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    try:
+        a = _mk(db, test_workspace, test_user.id, "/docs/a.txt", tag="p1")
+        b = _mk(db, test_workspace, test_user.id, "/docs/sub/b.txt", tag="p2")
+        r = client.post(
+            "/files/delete-path-prefix",
+            params={"background": "true"},
+            json={"workspace_id": test_workspace.id, "path": "/docs"},
+        )
+        assert r.status_code == status.HTTP_202_ACCEPTED
+        db.expire_all()
+        for fid in (a.id, b.id):
+            row = db.query(File).filter(File.id == fid).first()
+            assert row.deleted_at is not None and row.tag is None
+        task = db.query(Task).filter(Task.task_type == "delete_path_prefix").first()
+        assert task is not None
+        assert "deleted_before" in (task.payload or {})
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_delete_path_prefix_rollback_when_add_task_fails(client, db, test_user, test_workspace, monkeypatch):
+    """Codex #4: prefix soft-delete rolls back fully if enqueue fails (no rows marked)."""
+    app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    try:
+        a = _mk(db, test_workspace, test_user.id, "/docs/a.txt", tag="p1")
+
+        def _boom(*a, **k):
+            raise RuntimeError("enqueue failed")
+        monkeypatch.setattr("openrag.services.task_service.TaskService.add_task", _boom)
+
+        with pytest.raises(RuntimeError):
+            client.post(
+                "/files/delete-path-prefix",
+                params={"background": "true"},
+                json={"workspace_id": test_workspace.id, "path": "/docs"},
+            )
+        db.expire_all()
+        row = db.query(File).filter(File.id == a.id).first()
+        assert row.deleted_at is None and row.tag == "p1"  # rolled back
+        assert db.query(Task).filter(Task.task_type == "delete_path_prefix").count() == 0
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_delete_path_prefix_count_escapes_like_wildcards(client, db, test_user, test_workspace):
+    """Codex LIKE review: count query must not treat '_' as wildcard and enqueue falsely."""
+    app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    try:
+        neighbor = _mk(db, test_workspace, test_user.id, "/axb/two.txt", tag="neighbor")
+        r = client.post(
+            "/files/delete-path-prefix",
+            params={"background": "true"},
+            json={"workspace_id": test_workspace.id, "path": "/a_b"},
+        )
+        assert r.status_code == status.HTTP_200_OK
+        assert "No files" in r.json()["message"]
+        db.expire_all()
+        row = db.query(File).filter(File.id == neighbor.id).first()
+        assert row.deleted_at is None and row.tag == "neighbor"
+        assert db.query(Task).filter(Task.task_type == "delete_path_prefix").count() == 0
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
