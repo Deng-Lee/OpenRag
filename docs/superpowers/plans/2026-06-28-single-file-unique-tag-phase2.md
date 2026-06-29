@@ -2334,3 +2334,21 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
 - Task 6 正文实现说明要求 count 查询同时加 `FileModel.deleted_at.is_(None)` 与转义后的 prefix `LIKE`。
 - Task 12 全量回归清单新增 “prefix LIKE 通配符不误匹配” 验收项。
 - （采纳「非必改但建议」）Task 9 (f) 把 active 过滤下沉到 `ShareLinkManager.create_share_link()`（manager 层），并新增「manager 直接建链对软删文件抛 `ValueError`」回归，杜绝绕过 API 直接调 manager 为软删文件铸造公开链接。
+
+## Codex 实现后回归问题记录（2026-06-29）
+> 来源：Codex 审查。范围：Claude Code 按 Phase 2 文档完成 11 个提交后的代码 diff 与受影响测试回归。
+
+### 必须补齐
+
+1. **旧 share 测试 fixture 缺少 `workspace_id`，导致现有 share 回归无法运行。**
+   - 现象：运行 `tests/test_share_manager.py` / `tests/test_share_api.py` 时，fixture 直接创建 `File(...)` 但未传 `workspace_id`，当前 `files.workspace_id` 为非空列，触发 `sqlite3.IntegrityError: NOT NULL constraint failed: files.workspace_id`。
+   - 性质：不是 Phase 2 soft-delete 主逻辑漏洞，但 Phase 2 修改了 share 读路径，合并前必须保证 share 既有回归能跑通。
+   - 建议实现：在两个测试文件中补充最小 `Workspace` fixture，并让 `test_file` 使用 `workspace_id=test_workspace.id`。不要改动 share 生产逻辑来迁就错误 fixture。
+   - 建议回归：运行 `tests/test_share_manager.py tests/test_share_api.py`，确认旧 share 回归恢复为绿色；保留 Phase 2 已新增的 soft-deleted share 404/manager guard 用例。
+
+2. **大文件上传既有测试使用了陈旧边界，导致误判 100MB 应返回 413。**
+   - 现象：`tests/test_files_api.py::TestFileUpload::test_upload_file_large_file` 构造 100MB 文件，期望 `413 Request Entity Too Large`，实际上传成功返回 `201 Created`。
+   - 根因：当前后端 `file_ingest.MAX_FILE_SIZE`、前端 `web/src/utils/folderUpload.ts` 与历史诊断文档均已统一为 100MB；旧测试注释中的“assuming limit is 50MB”已经过时。100MB 等于上限，不应被当作超限文件。
+   - 性质：与 soft-delete 无直接耦合，但如果合并前执行 `tests/test_files_api.py`，分支仍为红灯；需要修正测试边界，避免把正确的 100MB 语义误改回 50MB。
+   - 建议实现：测试改为使用 `MAX_FILE_SIZE + 1` 构造超限文件，生产代码继续复用共享 ingest 层已有大小检查；不要为了旧测试把产品上限降回 50MB。
+   - 建议回归：补强超限返回 413 的测试，并断言失败时不会创建 `File` 行和 `process_document` 任务。

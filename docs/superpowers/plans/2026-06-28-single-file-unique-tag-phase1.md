@@ -1058,7 +1058,16 @@ import { shouldBlockTaggedBatch } from './fileUploadGuard';
           </Form.Item>
 ```
 
-(f) `customRequest` 的 catch 分支：识别 409 时提示 `t('files.upload.tag_conflict')`（与现有错误处理并列）。
+(f) `customRequest` 的 catch 分支：只在 `409` 且后端 `detail` 明确为 tag 冲突时提示 `t('files.upload.tag_conflict')`（与现有错误处理并列）。不要把所有 `409` 都映射成 tag 冲突，因为上传链路里还有其他 `409`，例如父路径分量已是文件时后端会返回 `Path component already exists as a file: ...`。
+
+```tsx
+        const isTagConflict = code === 409 && /Tag already in use/i.test(detailMsg);
+        const errorMsg = isTagConflict
+          ? t('files.upload.tag_conflict')
+          : isFilenameTooLongError(code, detailMsg)
+          ? t('files.upload.name_too_long')
+          : detailMsg || '文件上传失败';
+```
 
 - [ ] **Step 8: 加 i18n 文案**
 
@@ -1112,6 +1121,8 @@ Expected: 全 PASS + 无类型错误。
 
 必须确认 `web/src/types/index.ts` 的 `File` 接口包含 `tag?: string | null`，并由 `npx tsc --noEmit` 覆盖。
 
+必须确认来自 Codex 阶段 1 代码复审的前端错误提示回归已覆盖：当 `filesAPI.upload()` 返回 `409` 且 `detail` 为 `Tag already in use` 时显示 `files.upload.tag_conflict`；当返回 `409` 但 `detail` 为 `Path component already exists as a file: /x` 或 `File already exists at /x` 时，不显示 tag 冲突文案，而是展示后端 `detail`。
+
 - [ ] **Step 3: 标记阶段完成**
 
 Phase 1 完成。Phase 2（软删除 `deleted_at` 子系统）、Phase 3（upsert）各自独立计划。
@@ -1143,3 +1154,13 @@ Phase 1 完成。Phase 2（软删除 `deleted_at` 子系统）、Phase 3（upser
 | 7 | `3f7111b` | T7 | **前端单文件 tag 输入与批量守卫。** `filesAPI.upload()` 加可选第 6 参 `tag` 透传；`File` 类型补 `tag?: string \| null`；抽纯函数 `shouldBlockTaggedBatch()` 并在 `FileUpload` 的 tag 输入框、拖拽 `onDrop` 守卫（填了 tag 时拖目录/多文件即拦截）、成功后清空、409→tag 冲突文案中接线；附守卫与透传单测、中英文案。 |
 
 **验证（Task 8 全量回归）**：后端 tag 套件 + `ingest_creates_dirs` + `service_api` 既有用例 66 passed；`test_files_api.py` 32 passed（唯一失败 `test_upload_file_large_file` 为既有陈旧用例——构造 100MB 而上限恰为 100MB，与本功能无关）；前端 `vitest` 全量 104 passed、`tsc --noEmit` 零错误。
+
+---
+
+## Codex 阶段 1 代码复审必改项
+
+**来源：Codex 审查 `52494ca..3f7111b` 阶段 1 实现 diff。**
+
+- **必改：前端不能把所有 `409` 都提示成 tag 冲突。** 当前 `web/src/components/FileUpload.tsx` 的 `customRequest` catch 分支只要 `code === 409` 就显示 `files.upload.tag_conflict`。但后端上传链路还会用 `409` 表示非 tag 冲突，例如 `Path component already exists as a file: ...`，以及部分路径/URI 占用场景。若用户未填写 tag、只是路径冲突，也会看到“标签已被占用”，属于误导性回归。
+- **修复要求：** 前端只在 `code === 409 && /Tag already in use/i.test(detailMsg)` 时显示 `files.upload.tag_conflict`；其他 `409` 保持原错误语义，优先展示后端 `detailMsg`，再 fallback 到通用上传失败文案。
+- **必须补的回归：** 覆盖两个前端错误分支：`409 + "Tag already in use"` 显示 tag 冲突文案；`409 + "Path component already exists as a file: /x"`（或 `File already exists at /x`）不显示 tag 冲突文案，展示后端 detail。若直接测 `FileUpload` 组件成本过高，可先把错误文案选择抽成小纯函数并对纯函数加单测，保持改动小而可验证。

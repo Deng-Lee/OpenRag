@@ -15,9 +15,11 @@ from openrag.api.deps import get_db, get_current_user
 from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.file import File, ProcessingStatus
+from openrag.models.task import Task
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.models.permission import FilePermission, EntityType, Permission
 from openrag.security import hash_password
+from openrag.services.file_ingest import MAX_FILE_SIZE
 
 
 class FakeMinioStorage:
@@ -246,14 +248,15 @@ class TestFileUpload:
         """Test file upload with large file (exceeds limit)"""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
 
-        # Create 100MB file (assuming limit is 50MB)
-        file_content = b"x" * (100 * 1024 * 1024)
+        file_content = b"x" * (MAX_FILE_SIZE + 1)
         files = {"file": ("large.txt", io.BytesIO(file_content), "text/plain")}
         data = {"workspace_id": str(test_workspace.id)}
 
         response = client.post("/files/upload", files=files, data=data)
 
         assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+        assert db.query(File).count() == 0
+        assert db.query(Task).count() == 0
 
 
 class TestFileList:
