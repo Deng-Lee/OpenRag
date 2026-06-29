@@ -789,18 +789,27 @@ async def delete_file(
                 detail=f"Workspace {file.workspace_id} not found",
             )
 
-        if background:
-            task_service = TaskService(db)
-            task_record = task_service.create_task(
-                workspace_id=file.workspace_id,
-                user_id=current_user.id,
-                file_id=file.id,
-                task_type=TaskType.DELETE_FILE.value,
-                queue="normal",
-                priority=6,
-                max_retries=3,
-                status=TaskStatus.PENDING,
+        if file.is_directory and file.uri.rstrip("/") == "":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete workspace root",
             )
+
+        if background:
+            from openrag.services.file_deletion import (
+                _release_tag_and_soft_delete,
+                soft_delete_subtree_and_enqueue,
+            )
+
+            if file.is_directory:
+                # subtree soft-delete + DELETE_PATH_PREFIX in one commit (rollback on failure)
+                task_record = soft_delete_subtree_and_enqueue(
+                    db, file.workspace_id, file.uri.rstrip("/"), user_id=current_user.id
+                )
+            else:
+                task_record = _release_tag_and_soft_delete(
+                    db, file, user_id=current_user.id
+                )
             return JSONResponse(
                 status_code=status.HTTP_202_ACCEPTED,
                 content={
