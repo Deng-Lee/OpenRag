@@ -74,6 +74,10 @@ class ServiceSearchRequest(BaseModel):
         None,
         description="If set, only hits whose file uri is under this logical path prefix",
     )
+    paths: Optional[List[str]] = Field(
+        None,
+        description="限定检索范围到这些逻辑路径；显式传入时覆盖 path_prefix（含 []=空范围）",
+    )
     top_k: int = Field(10, gt=0, le=100)
     use_rerank: bool = True
     use_contextual_retrieval: bool = False
@@ -92,6 +96,10 @@ class ServiceMultiWorkspaceSearchRequest(BaseModel):
     path_prefix: Optional[str] = Field(
         None,
         description="If set, only hits whose file uri is under this logical path prefix",
+    )
+    paths: Optional[List[str]] = Field(
+        None,
+        description="限定检索范围到这些逻辑路径；显式传入时覆盖 path_prefix（含 []=空范围）",
     )
     top_k: int = Field(10, gt=0, le=100)
     use_rerank: bool = True
@@ -137,24 +145,14 @@ class ServicePreviewLinkResponse(BaseModel):
     ttl_seconds: int
 
 
-def _apply_path_prefix_filter(resp: SearchResponse, path_prefix: Optional[str]) -> SearchResponse:
-    if path_prefix is None or not str(path_prefix).strip() or str(path_prefix).strip() == "/":
-        return resp
-    prefix = validate_path(path_prefix).rstrip("/")
-    kept: list[SearchResult] = []
-    for hit in resp.results:
-        uri = (hit.uri or "").rstrip("/")
-        if not uri:
-            continue
-        if uri == prefix or uri.startswith(prefix + "/"):
-            kept.append(hit)
-    return SearchResponse(
-        results=kept,
-        total=len(kept),
-        query_time_ms=resp.query_time_ms,
-        l1_llm_applied=resp.l1_llm_applied,
-        l1_llm_skip_reason=resp.l1_llm_skip_reason,
-    )
+def _resolve_scope_paths(paths, path_prefix):
+    """paths overrides path_prefix when explicitly provided (including []); only fall
+    back to the legacy path_prefix when paths is None."""
+    if paths is not None:
+        return paths
+    if path_prefix and str(path_prefix).strip() and str(path_prefix).strip() != "/":
+        return [path_prefix]
+    return None
 
 
 def _file_summary(f: DbFile) -> dict[str, Any]:
@@ -416,6 +414,7 @@ async def service_multi_workspace_semantic_search(
                 contextual_chunk_fetch_multiplier=body.contextual_chunk_fetch_multiplier,
                 retrieval_strategy=body.retrieval_strategy,
                 use_l1_llm_navigation=body.use_l1_llm_navigation,
+                paths=_resolve_scope_paths(body.paths, body.path_prefix),
             )
             resp = _execute_search(
                 db,
@@ -424,7 +423,6 @@ async def service_multi_workspace_semantic_search(
                 endpoint="service_multi_workspace",
                 rerank_hierarchical_boost=None,
             )
-            resp = _apply_path_prefix_filter(resp, body.path_prefix)
             workspace_count += 1
             query_time_ms += resp.query_time_ms
             l1_applied_values.append(resp.l1_llm_applied)
@@ -483,6 +481,7 @@ async def service_semantic_search(
         contextual_chunk_fetch_multiplier=body.contextual_chunk_fetch_multiplier,
         retrieval_strategy=body.retrieval_strategy,
         use_l1_llm_navigation=body.use_l1_llm_navigation,
+        paths=_resolve_scope_paths(body.paths, body.path_prefix),
     )
     try:
         resp = _execute_search(
@@ -492,7 +491,7 @@ async def service_semantic_search(
             endpoint="service_semantic",
             rerank_hierarchical_boost=None,
         )
-        return _apply_path_prefix_filter(resp, body.path_prefix)
+        return resp
     except HTTPException:
         raise
     except Exception as exc:

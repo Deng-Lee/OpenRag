@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from openrag.api.service_api import _resolve_scope_paths
+
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -399,11 +401,11 @@ def test_service_search_path_prefix_filter(
     )
     assert r.status_code == 200
     data = r.json()
-    assert data["total"] == 1
-    assert data["results"][0]["uri"] == "/docs/a.txt"
+    assert data["total"] == 2                        # no longer post-filter trimmed
+    assert [h["uri"] for h in data["results"]] == ["/docs/a.txt", "/other/b.txt"]
     mock_search.assert_called_once()
-    call_kw = mock_search.call_args
-    assert call_kw[0][2].workspace_id == workspace.id
+    assert mock_search.call_args[0][2].workspace_id == workspace.id
+    assert mock_search.call_args[0][2].paths == ["/docs"]   # path_prefix -> paths
 
 
 def test_service_multi_workspace_search_requires_token(
@@ -640,10 +642,14 @@ def test_service_multi_workspace_search_applies_path_prefix_per_workspace(
 
     assert r.status_code == 200
     data = r.json()
-    assert data["total"] == 2
+    assert data["total"] == 4                         # no longer post-filter trimmed
     assert data["l1_llm_applied"] is True
     assert data["l1_llm_skip_reason"] == "mixed"
-    assert [hit["uri"] for hit in data["results"]] == ["/docs/a.txt", "/docs/b.txt"]
+    assert [h["uri"] for h in data["results"]] == [
+        "/docs/a.txt", "/other/x.txt", "/docs/b.txt", "/other/y.txt",
+    ]
+    for call in mock_search.call_args_list:
+        assert call[0][2].paths == ["/docs"]          # paths forwarded per workspace
 
 
 @patch("openrag.api.service_api._execute_search")
@@ -1111,3 +1117,26 @@ def test_service_upload_create_dirs_file_is_navigable(
     assert children.status_code == 200, children.text
     names = [item.get("name") for item in children.json()]
     assert "n.txt" in names
+
+
+def test_resolve_scope_paths_prefers_paths_over_prefix():
+    assert _resolve_scope_paths(["/a"], "/b") == ["/a"]
+    assert _resolve_scope_paths([], "/b") == []          # explicit empty scope overrides
+    assert _resolve_scope_paths(None, "/b") == ["/b"]    # fall back only when paths is None
+    assert _resolve_scope_paths(None, "/") is None
+    assert _resolve_scope_paths(None, "  ") is None
+    assert _resolve_scope_paths(None, None) is None
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_search_forwards_paths_over_prefix(
+    mock_search, client, workspace, service_token_headers
+):
+    mock_search.return_value = SearchResponse(results=[], total=0, query_time_ms=1.0)
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/search",
+        json={"query": "q", "paths": ["/docs"], "path_prefix": "/ignored"},
+        headers=service_token_headers,
+    )
+    assert r.status_code == 200
+    assert mock_search.call_args[0][2].paths == ["/docs"]   # paths overrides path_prefix
