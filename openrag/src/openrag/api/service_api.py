@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,10 @@ from openrag.config import get_preview_public_web_base_url
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as DbFile
 from openrag.models.workspace import Workspace
+from openrag.services.file_deletion import (
+    _release_tag_and_soft_delete,
+    delete_file_with_storage,
+)
 from openrag.services.file_ingest import (
     ingest_new_file,
     replace_file_content,
@@ -359,6 +364,39 @@ async def service_replace_document(
     )
     db.refresh(row)
     return _upload_response_dict(row, task.id if task else None)
+
+
+@router.delete("/workspaces/{workspace_name}/documents/by-path")
+async def service_delete_document_by_path(
+    workspace_name: str,
+    path: str = Query(..., description="Full file logical path"),
+    background: bool = Query(True, description="true: async soft-delete (202); false: sync physical delete (200)"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    p = validate_path(path)
+    row = (
+        db.query(DbFile)
+        .filter(
+            DbFile.workspace_id == ws.id,
+            DbFile.uri == p,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    if background:
+        task = _release_tag_and_soft_delete(db, row, user_id=ws.owner_id)
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"message": "File deletion queued", "task_id": task.id, "async": True},
+        )
+    delete_file_with_storage(db, row, ws)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "File deleted", "async": False})
 
 
 @router.post("/workspaces/multi_space/search", response_model=MultiWorkspaceSearchResponse)
