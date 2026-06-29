@@ -31,7 +31,7 @@
 | `openrag/src/openrag/models/file.py`（改） | `File` 加 `deleted_at` 列 + `idx_files_deleted_at` 索引 |
 | `openrag/alembic/versions/20260626_0005_add_file_deleted_at.py`（建） | 加 `deleted_at` 列 + 索引的迁移 |
 | `openrag/src/openrag/services/task_service.py`（改） | 新增非提交 `add_task()`；`create_task()` 改为复用之 |
-| `openrag/src/openrag/services/file_deletion.py`（改） | 工具 `utcnow()`（naive）；`_release_tag_and_soft_delete()`、`soft_delete_subtree()`（拒绝空/`"/"` prefix）、`soft_delete_subtree_and_enqueue()`（单事务+回滚）、`_physically_delete_row_only()`（不级联 children、目录不碰 MinIO）、`physically_delete_soft_deleted_under_prefix()`（root/空 prefix `ValueError` fail-closed）|
+| `openrag/src/openrag/services/file_deletion.py`（改） | 工具 `utcnow()`（naive）、`_escape_like()`（LIKE `_`/`%`/`\` 转义）；`_release_tag_and_soft_delete()`、`soft_delete_subtree()`（拒绝空/`"/"` prefix）、`soft_delete_subtree_and_enqueue()`（单事务+回滚）、`_physically_delete_row_only()`（不级联 children、目录不碰 MinIO）、`physically_delete_soft_deleted_under_prefix()`（root/空 prefix `ValueError` fail-closed）；现有 `delete_file_with_storage()`/`delete_files_under_uri_prefix()` 的 prefix `LIKE` 同步改转义 |
 | `openrag/src/openrag/api/files_api.py`（改） | `DELETE /files/{id}` 异步软删除（文件单行 / 目录 subtree+`DELETE_PATH_PREFIX`；拒绝删根 `uri="/"`）；`delete-path-prefix` 异步批量软删 + `deleted_before`；list/详情/content/reprocess/move 读路径加 active 过滤；`create_directory`/`move_file` 接入 pending-deletion 写守卫 |
 | `openrag/src/openrag/api/service_api.py`（改） | 新增 `DELETE .../documents/by-path`（异步软删 202 / 同步物删 200）；`GET by-tag`、`by-path`、replace、preview-link 定位加 active 过滤 |
 | `openrag/src/openrag/services/file_ingest.py`（改） | 父目录校验 / `ensure_directory_path` 只把 active 目录视为存在；新增 `assert_no_pending_deleted_ancestor()` 写守卫并接入 `ingest_new_file` |
@@ -40,7 +40,7 @@
 | `openrag/src/openrag/api/embed_preview_api.py`（改） | `resolve_claims_file_and_chunk` 加 active 过滤 |
 | `openrag/src/openrag/api/search_api.py`（改） | `GET /search/chunks/{chunk_id}` 取文件行加 active 过滤 |
 | `openrag/src/openrag/api/share_api.py`（改） | `create_share_link` 定位加 active 过滤（软删文件不可再分享）|
-| `openrag/src/openrag/services/share_manager.py`（改） | `access_share_link` 取文件加 active 过滤 + None 守卫（公开 `GET /share/{token}` 软删后 404，兼修物删崩 500）|
+| `openrag/src/openrag/services/share_manager.py`（改） | `create_share_link` + `access_share_link` 取文件加 active 过滤（manager 层下沉），`access` 补 None 守卫（公开 `GET /share/{token}` 软删后 404，兼修物删崩 500）|
 | `openrag/src/openrag/retrieval/retrieval_service.py`（改） | `_accessible_file_ids()` 只返回 active；admin+workspace 无 active 返回 `[]`；新增 `_filter_to_active_file_ids()` 在 `_search_contextual` L0 后早过滤 `candidate_files`；`_filter_hits_to_active_files()` 在 `_search_flat`/`_search_contextual` enrich 后兜底丢弃软删 hit |
 | `openrag/src/openrag/worker/task_worker.py`（改） | `DELETE_PATH_PREFIX` 按 `deleted_before` 的新 helper（缺水位 + root/空 prefix 双重 fail-closed）；`DELETE_FILE` 加 `deleted_at` 防御 |
 | `openrag/tests/test_soft_delete_*.py`（建） | 各任务测试（model / helpers / files_api / service / worker / read_paths〔含 share〕/ write_guard / retrieval）|
@@ -443,6 +443,20 @@ def test_soft_delete_subtree_marks_all_active_rows(db, wsowner):
     assert isinstance(before, datetime)
 
 
+def test_soft_delete_subtree_escapes_like_wildcards(db, wsowner):
+    """Codex LIKE review: '_' in a logical path is literal, not a SQL wildcard."""
+    w, u = wsowner
+    target = _mk(db, w, u, "/a_b/one.txt", tag="target")
+    neighbor = _mk(db, w, u, "/axb/two.txt", tag="neighbor")
+
+    soft_delete_subtree(db, w.id, "/a_b")
+    db.commit()
+
+    db.refresh(target); db.refresh(neighbor)
+    assert target.deleted_at is not None and target.tag is None
+    assert neighbor.deleted_at is None and neighbor.tag == "neighbor"
+
+
 def _stub_storage(monkeypatch):
     """Stub external storage/vector deletes so cleanup runs DB-only.
 
@@ -525,6 +539,27 @@ def test_physical_cleanup_rejects_root_prefix(db, wsowner, monkeypatch):
                 db, w.id, bad, watermark, w
             )
     assert db.query(File).filter(File.id == dead_id).first() is not None  # NOT wiped
+
+
+def test_physical_cleanup_escapes_like_percent_wildcard(db, wsowner, monkeypatch):
+    """Codex LIKE review: '%' in a logical path is literal during physical cleanup."""
+    w, u = wsowner
+    target = _mk(db, w, u, "/100%/a.txt")
+    neighbor = _mk(db, w, u, "/100x/b.txt")
+    stamp = utcnow()
+    target.deleted_at = stamp; target.tag = None
+    neighbor.deleted_at = stamp; neighbor.tag = None
+    db.commit()
+    _stub_storage(monkeypatch)
+
+    ids = file_deletion.physically_delete_soft_deleted_under_prefix(
+        db, w.id, "/100%", utcnow(), w
+    )
+
+    assert target.id in ids
+    assert neighbor.id not in ids
+    assert db.query(File).filter(File.id == target.id).first() is None
+    assert db.query(File).filter(File.id == neighbor.id).first() is not None
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -553,6 +588,11 @@ def utcnow() -> datetime:
     """Naive UTC (Codex #5): match the project's naive DateTime/TIMESTAMP columns so
     ``deleted_at <= deleted_before`` compares identically on PostgreSQL and SQLite."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE wildcard chars in a logical URI prefix."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _release_tag_and_soft_delete(db: Session, file: FileModel, *, user_id: int) -> Task:
@@ -600,7 +640,10 @@ def soft_delete_subtree(db: Session, workspace_id: int, prefix: str) -> datetime
         db.query(FileModel)
         .filter(
             FileModel.workspace_id == workspace_id,
-            or_(FileModel.uri == p, FileModel.uri.like(f"{p}/%")),
+            or_(
+                FileModel.uri == p,
+                FileModel.uri.like(f"{_escape_like(p)}/%", escape="\\"),
+            ),
             FileModel.deleted_at.is_(None),
         )
         .all()
@@ -695,7 +738,10 @@ def physically_delete_soft_deleted_under_prefix(
         db.query(FileModel)
         .filter(
             FileModel.workspace_id == workspace_id,
-            or_(FileModel.uri == p, FileModel.uri.like(f"{p}/%")),
+            or_(
+                FileModel.uri == p,
+                FileModel.uri.like(f"{_escape_like(p)}/%", escape="\\"),
+            ),
             FileModel.deleted_at.is_not(None),
             FileModel.deleted_at <= deleted_before,
         )
@@ -712,12 +758,28 @@ def physically_delete_soft_deleted_under_prefix(
     return deleted_ids
 ```
 
-> `or_`、`Task`、`MinioStorage`、`HierarchyStorage`、`delete_milvus_vectors_for_file`、`FileModel`、`Workspace` 均已在 `file_deletion.py` import（现有函数在用）。
+同时修改 `file_deletion.py` 中保留的现有同步 prefix 查询，避免同步物删路径继续继承 LIKE 通配符误匹配风险：
+
+```python
+# delete_file_with_storage(): directory children query
+directory_prefix = file.uri.rstrip("/")
+if not directory_prefix:
+    raise ValueError("Refusing to delete workspace root path")
+FileModel.uri.like(f"{_escape_like(directory_prefix)}/%", escape="\\")
+
+# delete_files_under_uri_prefix(): prefix query
+or_(
+    FileModel.uri == prefix,
+    FileModel.uri.like(f"{_escape_like(prefix)}/%", escape="\\"),
+)
+```
+
+> `or_`、`Task`、`MinioStorage`、`HierarchyStorage`、`delete_milvus_vectors_for_file`、`FileModel`、`Workspace` 均已在 `file_deletion.py` import（现有函数在用）。`_escape_like()` 放在本模块即可复用给新 helper 与保留的同步物删函数。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_helpers.py -v`
-Expected: PASS（5 passed，含目录不级联 active 子项 + root-prefix 物理清理拒绝）。
+Expected: PASS（7 passed，含目录不级联 active 子项 + root-prefix 物理清理拒绝 + LIKE `_`/`%` 转义边界）。
 
 - [ ] **Step 5: 提交**
 
@@ -967,6 +1029,26 @@ def test_delete_path_prefix_rollback_when_add_task_fails(client, db, test_user, 
         assert db.query(Task).filter(Task.task_type == "delete_path_prefix").count() == 0
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_delete_path_prefix_count_escapes_like_wildcards(client, db, test_user, test_workspace):
+    """Codex LIKE review: count query must not treat '_' as wildcard and enqueue falsely."""
+    app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    try:
+        neighbor = _mk(db, test_workspace, test_user.id, "/axb/two.txt", tag="neighbor")
+        r = client.post(
+            "/files/delete-path-prefix",
+            params={"background": "true"},
+            json={"workspace_id": test_workspace.id, "path": "/a_b"},
+        )
+        assert r.status_code == status.HTTP_200_OK
+        assert "No files" in r.json()["message"]
+        db.expire_all()
+        row = db.query(File).filter(File.id == neighbor.id).first()
+        assert row.deleted_at is None and row.tag == "neighbor"
+        assert db.query(Task).filter(Task.task_type == "delete_path_prefix").count() == 0
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -997,12 +1079,12 @@ In `openrag/src/openrag/api/files_api.py`，`delete_path_prefix` 的 `if backgro
         )
 ```
 
-> 上方的 `n == 0 → 返回` 检查应只数 active 行——把 L869-876 的 count 查询加 `FileModel.deleted_at.is_(None)`，避免对全已软删的 prefix 反复入队。`background=false` 分支保持原同步物删。
+> 上方的 `n == 0 → 返回` 检查应只数 active 行，并且 prefix `LIKE` 必须转义（Codex LIKE review）——把 L869-876 的 count 查询改成 `or_(FileModel.uri == prefix, FileModel.uri.like(f"{_escape_like(prefix)}/%", escape="\\"))` + `FileModel.deleted_at.is_(None)`，避免对全已软删的 prefix 反复入队，也避免 `/a_b` 误匹配 `/axb` 后错误入队。`_escape_like` 可从 `openrag.services.file_deletion` 复用；`background=false` 分支保持原同步物删。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_files_api.py -v`
-Expected: PASS（6 passed：含 prefix 软删 + prefix 回滚）。
+Expected: PASS（8 passed：含 prefix 软删 + prefix 回滚 + count 查询 LIKE 转义边界）。
 
 - [ ] **Step 5: 提交**
 
@@ -1505,6 +1587,21 @@ def test_share_link_access_404_after_soft_delete(client, db, test_user, test_wor
         ).status_code == status.HTTP_404_NOT_FOUND
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_share_manager_create_rejects_soft_deleted(db, test_user, test_workspace):
+    """Codex LIKE-review follow-up: the active filter also lives in the manager layer, so a
+    DIRECT ShareLinkManager.create_share_link (bypassing the API) cannot mint a public link
+    for a soft-deleted file."""
+    import pytest
+    from openrag.services.share_manager import ShareLinkManager
+    from openrag.services.file_deletion import utcnow
+
+    f = _mk(db, test_workspace, test_user.id, "/m.txt")
+    f.deleted_at = utcnow(); f.tag = None
+    db.commit()
+    with pytest.raises(ValueError):
+        ShareLinkManager(db).create_share_link(file_id=f.id, created_by=test_user.id)
 ```
 
 并在 `tests/test_service_api_soft_delete.py`（已有 service fixtures）追加：软删行 `GET by-tag` → 404、`GET by-path` → 404、workspace_file_api 的 `chunk-source` → 404（Codex #3）：
@@ -1596,6 +1693,10 @@ def _query_subtree(db: Session, workspace_id: int, path_prefix: str) -> List[Fil
   ```python
   file = db.query(File).filter(File.id == request.file_id, File.deleted_at.is_(None)).first()
   ```
+- `share_manager.py` 的 `create_share_link`（L69 校验文件存在处）**同样加** active 过滤——把 active 过滤下沉到 manager 层，使绕过 API 直接调用 manager 时也无法为软删文件铸造公开链接（命中软删→现有 `raise ValueError("File with id ... not found")` 生效，API 层 `except ValueError` 转 400；经 API 时 share_api.py:82 的 404 先触发，二者不冲突）：
+  ```python
+  stmt = select(File).where(File.id == file_id, File.deleted_at.is_(None))
+  ```
 - `share_manager.py` 的 `access_share_link`（L190 取文件处）加 active 过滤 **并补 None 守卫**——公开访问端点 `GET /share/{token}` 在文件软删后返回 `not_found`（同时修掉「文件被物删后 `access_share_link` 返回 `(None, None)`、API 层 `file.id` 崩 500」的既有潜在 bug）：
   ```python
           # Codex round-4: hide soft-deleted (or already-removed) files from public share access.
@@ -1611,7 +1712,7 @@ def _query_subtree(db: Session, workspace_id: int, path_prefix: str) -> List[Fil
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_read_paths.py tests/test_service_api_soft_delete.py tests/test_workspace_file_tree.py -v`
-Expected: 全 PASS（含既有 tree 测试不回归；reprocess / by-tag / by-path / share 公开链接 软删 404）。
+Expected: 全 PASS（含既有 tree 测试不回归；reprocess / by-tag / by-path / share 公开链接 软删 404；manager 直接建链对软删文件抛 ValueError）。
 
 - [ ] **Step 5: 提交**
 
@@ -2021,6 +2122,7 @@ Expected: 全 PASS。
 - 删除（内部 `/files/{id}`、外部 `by-path`、`delete-path-prefix`，`background=true`）→ 文档**立即**从 list / by-tag / by-path / tree 消失、**tag 立即可复用**（同 tag 重新上传 201）。
 - **回滚**（Codex #4）：`add_task`/`commit` 失败时，内部单文件删除、内部目录/prefix 删除、外部 by-path 删除三处的 `deleted_at`/`tag`/task 三者同事务回滚。
 - **prefix 清理不误删**（Codex #1）：前缀删除任务入队后，同 prefix 下新建的 active 行不被 worker 物理删除（worker 只删 `deleted_at <= deleted_before`）；软删目录下后来出现的 active 子项不被目录行级联删除；缺 `deleted_before` 的任务 fail-closed（不物删）。
+- **prefix LIKE 通配符不误匹配**（Codex LIKE review）：逻辑路径中的 `_`/`%` 按普通字符处理；删除 `/a_b` 不影响 `/axb`，清理 `/100%` 不影响 `/100x`，且不存在真实 `/a_b` 时 count 查询不会因为 `/axb` 误入队。
 - **root prefix 物理清理 fail-closed**（Codex round-4 #1）：`payload.path="/"`（或空）的 `DELETE_PATH_PREFIX` 任务即便带合法 `deleted_before`，worker 也 `skipped`、`physically_delete_soft_deleted_under_prefix` 也 `ValueError`，**绝不**全 workspace 物删已软删行。
 - **pending-deletion 写入守卫**（Codex #2）：上传到 `/dir`、`create_directory("/dir/new")`、`move_file(... -> "/dir/new.txt")` 在 `/dir` 已软删时均 `409 pending deletion`。
 - **软删后不可读**（Codex #3）：`reprocess`、workspace chunks/content/preview/chunk-source、service preview-link、embed preview、search chunk context 均 404；`GET by-tag`/`by-path` 命中软删行 → 404。
@@ -2061,6 +2163,10 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
   - round-4 #1 物理清理侧 root prefix 未 fail-closed（`"/".rstrip("/")=="" → uri LIKE "/%"` 匹配整个 workspace，软删侧已防、清理侧未防）→ T4 `physically_delete_soft_deleted_under_prefix` 对空/`"/"` prefix `raise ValueError`（worker 上下文用 ValueError 而非 HTTPException）；T8 worker `_delete_path_prefix_task` 在开 session 前对 root/空 path `skipped`(reason=`root_prefix`)；T4/T8 各加 root-prefix fail-closed 回归。
   - round-4 #2 `_search_contextual` 过滤偏晚（软删文件经 `candidate_files` 污染 L1/LLM 导航/chunk 检索/ES 融合/归一化）→ T11 新增 `_filter_to_active_file_ids(file_ids)`，在 L0 得出 `candidate_files` 后**立即**早过滤，hit 级 `_filter_hits_to_active_files` 保留为兜底；T11 加早过滤回归。
   - round-4 范围确认（share/public-link）→ T9 (f) 纳入：`share_api.create_share_link` + `share_manager.access_share_link` 加 active 过滤（公开 `GET /share/{token}` 软删后 404，兼修文件物删后 `file.id` 崩 500 的既有 bug）；T9 加 share 软删 404 回归。permission 类端点不返回文件内容/元数据，标注 out-of-scope。
+- **Codex LIKE 转义复审（2026-06-29，见下「Codex LIKE 转义复审补充」）全部采纳**（已核实 `validate_path` 放行 `_`/`%`、`delete_file_with_storage`/`delete_files_under_uri_prefix` 的 LIKE 确实未转义，且与既有 `workspace_file_tree._escape_ilike` 同款）：
+  - 逻辑路径 prefix 的 `LIKE` 未转义 → 删 `/a_b` 误匹配 `/axb`、删 `/100%` 误匹配 `/100x`。T4 新增 `_escape_like()`，`soft_delete_subtree()`/`physically_delete_soft_deleted_under_prefix()` 改 `like(f"{_escape_like(p)}/%", escape="\\")`；保留的同步物删 `delete_file_with_storage()`（+根防御）/`delete_files_under_uri_prefix()` 同步转义；`files_api.delete_path_prefix` 的 count 查询加转义 + `deleted_at IS NULL`。
+  - 回归：T4 加 `_`/`%` 两条边界（`/a_b`不碰`/axb`、`/100%`不碰`/100x`）；T6 加 count 查询 `_` 边界；T12 验收加「prefix LIKE 通配符不误匹配」。
+  - 「非必改但建议」项（manager 层 create 过滤）一并采纳 → T9 (f) `share_manager.create_share_link` 同加 active 过滤，T9 加「manager 直接建链对软删文件抛 ValueError」回归。
 - **明确不做（保持 spec 决策）**：软删除**只释放 tag、不释放 uri**——ingest 同 uri 查重**不加** `deleted_at` 过滤（同 uri 裸上传仍 409，T9 (c) 已显式标注「此条不改」）；同 tag+同路径立即重建走 Phase 3 upsert 更新分支。
 - **占位符扫描**：每个实现步骤含完整代码/精确锚点，每个测试步骤含完整测试代码与可跑命令。「视实现微调」处已显式标注：T8 worker 测试若 `__new__` 旁路不便则降级为 helper 直测；T11 回查兜底以 `_accessible_file_ids` active-only 为主。
 - **类型/签名一致性**：`TaskService.add_task(...)` T3 定义、T4/T5/T6/T7 复用；`_release_tag_and_soft_delete(db, file, *, user_id) -> Task`、`soft_delete_subtree(db, workspace_id, prefix) -> datetime`、`soft_delete_subtree_and_enqueue(db, workspace_id, prefix, *, user_id) -> Task`、`_physically_delete_row_only(db, file, workspace)`、`physically_delete_soft_deleted_under_prefix(db, workspace_id, prefix, deleted_before, workspace) -> list[int]`、`assert_no_pending_deleted_ancestor(db, workspace_id, target_uri)` 定义与调用各处一致；`payload={"path", "deleted_before"}` 写入（T5/T6）与读取（T8）一致。
@@ -2175,3 +2281,56 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
 - 暂未看到明显的无关功能多余改动；当前计划的修改范围仍围绕 soft-delete/tag 语义。
 - 如果 Phase 2 的产品语义是“软删后任何旧入口都不可见”，需要明确 share/public link、permission 这类 direct file_id 入口是否纳入本阶段。若纳入，应同样加 `deleted_at IS NULL` 过滤并补最小回归；若不纳入，建议在文档中标注为后续范围，避免执行时默认遗漏。
 - 文档末尾保留了多轮历史 Codex 审查原文，其中部分旧建议已经被新计划采纳或被覆盖。为避免执行者误读，建议把历史段落明确标注为“历史审查原文（已采纳/已覆盖）”，最终执行以本文档正文和本节最新复审补充为准。
+
+---
+
+## Codex LIKE 转义复审补充（2026-06-29）
+
+> **【已核实并全部采纳，含「非必改但建议」项，见上方 Self-Review「Codex LIKE 转义复审」条】** 必改（prefix `LIKE` 转义 → T4/T6/T12）与建议补强（manager 层 create 过滤 → T9 (f)）均已落入正文并补回归。本段保留供追溯。
+
+> 来源：Codex 审查。结论：当前 Phase 2 计划已基本可执行，但 prefix 匹配仍有一个真实误删边界需要补齐：SQL `LIKE` 中 `_` 与 `%` 是通配符，而现有 `validate_path()` 不禁止这些字符。若继续直接使用 `FileModel.uri.like(f"{prefix}/%")`，删除 `/a_b` 可能误匹配 `/axb/...`，删除 `/100%` 可能误匹配 `/100x/...`。这是软删与物理清理都会继承的风险，应在执行前补入计划。
+
+### 必须补齐
+
+1. **所有逻辑路径 prefix 的 DB `LIKE` 查询必须转义 `_`、`%` 和 `\`。**
+   - 建议在 `file_deletion.py` 新增最小 helper：
+     ```python
+     def _escape_like(value: str) -> str:
+         return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+     ```
+   - 将逻辑路径 prefix 查询统一写成：
+     ```python
+     or_(
+         FileModel.uri == p,
+         FileModel.uri.like(f"{_escape_like(p)}/%", escape="\\"),
+     )
+     ```
+   - 至少覆盖这些位置：
+     - `soft_delete_subtree()`：避免软删 prefix 时误标记相邻路径。
+     - `physically_delete_soft_deleted_under_prefix()`：避免 worker 物理清理误删相邻路径下的 soft-deleted 行。
+     - `delete_files_under_uri_prefix()`：保留的同步 prefix 物删也应避免同类误删。
+     - `delete_file_with_storage()` 的目录 children 查询：同步删除目录时避免因目录名含 `_`/`%` 误级联其它目录。
+     - `files_api.delete_path_prefix` 的 count 查询：避免误判“该 prefix 下存在文件”并错误入队。
+
+### 建议补充回归
+
+- `LIKE "_"` 边界：创建 `/a_b/one.txt` 与 `/axb/two.txt`，对 `/a_b` 执行 async prefix soft-delete，断言只有 `/a_b/one.txt` 被 soft-delete 且 tag 释放，`/axb/two.txt` 仍 active、tag 不变，入队 payload 仍为 `/a_b`。
+- `LIKE "%"` 边界：创建 `/100%/a.txt` 与 `/100x/b.txt`，调用 `physically_delete_soft_deleted_under_prefix(db, workspace_id, "/100%", deleted_before, workspace)` 或对应 worker helper，断言只清理 `/100%/...` 下满足水位的 soft-deleted 行，不触碰 `/100x/...`。
+
+### 非必改但建议同步补强
+
+- `share_api.create_share_link` 已计划加 `File.deleted_at.is_(None)`，但 `ShareLinkManager.create_share_link()` 自身也会按 `file_id` 查 `File`。建议把 active 过滤同步下沉到 manager，避免未来绕过 API 直接调用 manager 时为 soft-deleted 文件创建公开链接。对应回归可复用现有 share 软删 404 用例，额外断言 manager 直接创建 soft-deleted file 的 share link 会抛 `ValueError("File with id ... not found")` 或等价错误。
+
+---
+
+## Codex 正文修订记录（2026-06-29）
+
+> 来源：Codex。根据上方 LIKE 转义复审结论，已将必须修改项从审查补充段落落入正文执行计划，避免实现者只按 Task 代码块执行时遗漏。
+
+- Task 4 `test_soft_delete_helpers.py` 正文代码块新增两条回归：`/a_b` 不误匹配 `/axb`，`/100%` 物理清理不误匹配 `/100x`。
+- Task 4 `file_deletion.py` 正文 helper 代码块新增 `_escape_like()`，并把 `soft_delete_subtree()`、`physically_delete_soft_deleted_under_prefix()` 的 prefix 查询改为 `like(..., escape="\\")`。
+- Task 4 正文补充要求同步修改保留的 `delete_file_with_storage()` 目录 children 查询与 `delete_files_under_uri_prefix()` 同步 prefix 物删查询，避免同步删除路径继续继承未转义 `LIKE` 风险。
+- Task 6 `delete_path_prefix` 正文测试新增 count 查询边界：只有 `/axb/...`、不存在 `/a_b/...` 时，删除 `/a_b` 应返回 “No files” 且不入队。
+- Task 6 正文实现说明要求 count 查询同时加 `FileModel.deleted_at.is_(None)` 与转义后的 prefix `LIKE`。
+- Task 12 全量回归清单新增 “prefix LIKE 通配符不误匹配” 验收项。
+- （采纳「非必改但建议」）Task 9 (f) 把 active 过滤下沉到 `ShareLinkManager.create_share_link()`（manager 层），并新增「manager 直接建链对软删文件抛 `ValueError`」回归，杜绝绕过 API 直接调 manager 为软删文件铸造公开链接。
