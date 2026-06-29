@@ -81,7 +81,11 @@ class WorkspaceFilePreviewResponse(BaseModel):
 def get_readable_workspace_file_or_404(
     db: Session, workspace_id: int, file_id: int, current_user: User
 ) -> FileModel:
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = (
+        db.query(FileModel)
+        .filter(FileModel.id == file_id, FileModel.deleted_at.is_(None))
+        .first()
+    )
     if not file or file.workspace_id != workspace_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"

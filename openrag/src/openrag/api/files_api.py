@@ -501,7 +501,10 @@ async def list_files(
     has_filters = any([filename, file_type, owner_username, simple_status, created_after, created_before])
 
     # Build SQLAlchemy query with DB-level filters
-    query = db.query(FileModel).filter(FileModel.workspace_id.in_(workspace_ids))
+    query = db.query(FileModel).filter(
+        FileModel.workspace_id.in_(workspace_ids),
+        FileModel.deleted_at.is_(None),
+    )
 
     if has_filters:
         # Exclude directories when search filters are active
@@ -584,7 +587,7 @@ async def list_files(
 def _get_readable_file_or_404(
     file_id: int, current_user: User, db: Session
 ) -> FileModel:
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
@@ -765,7 +768,7 @@ async def delete_file(
         202 + task_id（异步）或 200 + message（同步）
     """
     try:
-        file = db.query(FileModel).filter(FileModel.id == file_id).first()
+        file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
         if not file:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
@@ -944,7 +947,7 @@ async def move_file(
         Updated file metadata
     """
     # Get file
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
@@ -1117,7 +1120,7 @@ async def reprocess_file(
 ):
     """Reprocess a file - clears existing chunks/vectors and re-triggers processing"""
     # Get file
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"

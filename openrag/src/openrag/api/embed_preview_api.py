@@ -62,6 +62,7 @@ def resolve_claims_file_and_chunk(
         .filter(
             FileModel.id == claims.file_id,
             FileModel.workspace_id == claims.workspace_id,
+            FileModel.deleted_at.is_(None),
         )
         .first()
     )

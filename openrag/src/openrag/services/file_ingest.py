@@ -192,6 +192,13 @@ def _get_or_create_directory_row(
         .first()
     )
     if row is not None:
+        if row.deleted_at is not None:
+            # Soft-deleted directory still occupies its uri (uq_files_workspace_uri);
+            # don't reuse it and don't try to recreate (would hit IntegrityError).
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Parent path pending deletion; retry after cleanup completes",
+            )
         if not row.is_directory:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -351,6 +358,7 @@ def _assert_parent_directory_exists(db: Session, workspace_id: int, parent_logic
                 FileModel.workspace_id == workspace_id,
                 FileModel.uri == "/",
                 FileModel.is_directory.is_(True),
+                FileModel.deleted_at.is_(None),
             )
             .first()
         )
@@ -361,6 +369,7 @@ def _assert_parent_directory_exists(db: Session, workspace_id: int, parent_logic
                 FileModel.workspace_id == workspace_id,
                 FileModel.uri == parent,
                 FileModel.is_directory.is_(True),
+                FileModel.deleted_at.is_(None),
             )
             .first()
         )

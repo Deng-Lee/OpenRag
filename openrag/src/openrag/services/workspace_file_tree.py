@@ -62,7 +62,7 @@ def _under_prefix(uri: str, prefix: str) -> bool:
 
 def _query_subtree(db: Session, workspace_id: int, path_prefix: str) -> List[File]:
     p = path_prefix.rstrip("/") or "/"
-    q = db.query(File).filter(File.workspace_id == workspace_id)
+    q = db.query(File).filter(File.workspace_id == workspace_id, File.deleted_at.is_(None))
     if p == "/":
         rows = q.all()
     else:
@@ -83,6 +83,7 @@ def list_direct_children(db: Session, workspace_id: int, dir_path: str) -> List[
             File.workspace_id == workspace_id,
             File.uri == d,
             File.is_directory.is_(True),
+            File.deleted_at.is_(None),
         )
         .first()
     )
@@ -95,14 +96,14 @@ def list_direct_children(db: Session, workspace_id: int, dir_path: str) -> List[
     if d == "/":
         candidates = (
             db.query(File)
-            .filter(File.workspace_id == workspace_id, File.uri != "/")
+            .filter(File.workspace_id == workspace_id, File.uri != "/", File.deleted_at.is_(None))
             .all()
         )
         children = [f for f in candidates if _parent_uri(f.uri) == "/"]
     else:
         candidates = (
             db.query(File)
-            .filter(File.workspace_id == workspace_id, File.uri.startswith(d + "/"))
+            .filter(File.workspace_id == workspace_id, File.uri.startswith(d + "/"), File.deleted_at.is_(None))
             .all()
         )
         children = [f for f in candidates if _parent_uri(f.uri) == d]
@@ -125,7 +126,7 @@ def list_entries_by_prefix(db: Session, workspace_id: int, path_prefix: str) -> 
     - prefix ``/`` includes all rows in the workspace.
     """
     prefix = _normalize_logical_path(path_prefix).rstrip("/") or "/"
-    q = db.query(File).filter(File.workspace_id == workspace_id)
+    q = db.query(File).filter(File.workspace_id == workspace_id, File.deleted_at.is_(None))
     if prefix == "/":
         rows = q.all()
     else:
@@ -145,7 +146,7 @@ def get_file_document_by_path(db: Session, workspace_id: int, file_path: str) ->
     p = _normalize_logical_path(file_path)
     row = (
         db.query(File)
-        .filter(File.workspace_id == workspace_id, File.uri == p)
+        .filter(File.workspace_id == workspace_id, File.uri == p, File.deleted_at.is_(None))
         .first()
     )
     if row is None:
@@ -246,6 +247,7 @@ def build_nested_tree(
                 File.workspace_id == workspace_id,
                 File.uri == prefix,
                 File.is_directory.is_(True),
+                File.deleted_at.is_(None),
             )
             .first()
         )
@@ -290,6 +292,7 @@ def search_documents_by_name(
     q = db.query(File).filter(
         File.workspace_id == workspace_id,
         File.is_directory.is_(False),
+        File.deleted_at.is_(None),
     )
     if pattern:
         escaped = _escape_ilike(pattern)

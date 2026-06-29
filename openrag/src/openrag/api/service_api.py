@@ -263,7 +263,11 @@ def resolve_preview_target(
 ) -> tuple[DbFile, DocumentChunk]:
     file_row = (
         db.query(DbFile)
-        .filter(DbFile.id == file_id, DbFile.workspace_id == workspace_id)
+        .filter(
+            DbFile.id == file_id,
+            DbFile.workspace_id == workspace_id,
+            DbFile.deleted_at.is_(None),
+        )
         .first()
     )
     if file_row is None:
@@ -347,7 +351,12 @@ async def service_replace_document(
     p = validate_path(path)
     row = (
         db.query(DbFile)
-        .filter(DbFile.workspace_id == ws.id, DbFile.uri == p, DbFile.is_directory.is_(False))
+        .filter(
+            DbFile.workspace_id == ws.id,
+            DbFile.uri == p,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
         .first()
     )
     if row is None:
@@ -669,6 +678,7 @@ async def service_document_by_tag(
             DbFile.workspace_id == ws.id,
             DbFile.tag == tag,
             DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
         )
         .first()
     )

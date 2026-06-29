@@ -72,3 +72,19 @@ def test_delete_by_path_rollback_when_add_task_fails(client, db, workspace, owne
     row = db.query(File).filter(File.id == f.id).first()
     assert row.deleted_at is None and row.tag == "dt"  # rolled back
     assert db.query(Task).filter(Task.file_id == f.id).count() == 0
+
+
+def test_get_by_tag_and_by_path_hide_soft_deleted(client, db, workspace, owner, service_token_headers):
+    f = _mk(db, workspace, owner, "/dead.txt", tag="dt")
+    # soft-delete directly
+    from openrag.services.file_deletion import utcnow
+    f.deleted_at = utcnow(); f.tag = None
+    db.commit()
+    assert client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-tag",
+        params={"tag": "dt"}, headers=service_token_headers,
+    ).status_code == 404
+    assert client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-path",
+        params={"path": "/dead.txt"}, headers=service_token_headers,
+    ).status_code == 404
