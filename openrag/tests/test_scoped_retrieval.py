@@ -1,7 +1,12 @@
 """RetrievalService scope intersection + empty-scope early-return."""
 
+import asyncio
 from unittest.mock import Mock
 
+import pytest
+from fastapi import HTTPException
+
+import openrag.api.search_api as sapi
 from openrag.retrieval.retrieval_service import RetrievalService
 
 
@@ -141,14 +146,6 @@ def test_es_blend_filter_ids_within_scope():
         scope_file_ids={2, 3}, vector_similarity_weight=0.7,
     )
     assert ft.calls and set(ft.calls[0]["file_ids"]) <= {2, 3}
-
-
-import asyncio
-
-import pytest
-from fastapi import HTTPException
-
-import openrag.api.search_api as sapi
 
 
 def test_assert_search_workspace_read_blocks_without_permission(monkeypatch):

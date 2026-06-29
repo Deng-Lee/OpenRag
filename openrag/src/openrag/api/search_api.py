@@ -260,13 +260,15 @@ def _execute_search(
     endpoint: str,
     rerank_hierarchical_boost: Optional[float],
 ) -> SearchResponse:
-    if request.paths is not None and request.workspace_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="workspace_id is required when paths is set",
-        )
-    scope_file_ids = resolve_scope_file_ids(db, request.workspace_id, request.paths)
     start = time.time()
+    scope_file_ids = None
+    if request.paths is not None:
+        if request.workspace_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="workspace_id is required when paths is set",
+            )
+        scope_file_ids = resolve_scope_file_ids(db, request.workspace_id, request.paths)
     trace_service, started_trace_run = _prepare_retrieval_trace(
         db=db,
         user_id=user_id,

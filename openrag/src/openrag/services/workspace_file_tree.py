@@ -93,7 +93,7 @@ def resolve_scope_file_ids(
             select(File.id).where(
                 File.workspace_id == workspace_id,
                 File.is_directory.is_(False),
-                (File.uri == p) | (File.uri.startswith(p + "/")),
+                (File.uri == p) | (File.uri.startswith(p + "/", autoescape=True)),
             )
         ).scalars().all()
         ids.update(int(r) for r in rows)

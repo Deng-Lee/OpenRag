@@ -4,10 +4,9 @@ import os
 import sys
 from pathlib import Path
 
-# Ensure L0/L1 retrieval is enabled by default in tests.
-# docker/.env sets OPENRAG_RETRIEVAL_USE_L0_L1=false (for non-Milvus deployments)
-# but config.py loads it via load_dotenv (no override), so setting it here first
-# (before config.py is imported) pins it to "true" for tests that rely on it.
+# Set the default to "true" if not already set in the environment. config.py loads
+# docker/.env (which sets this to "false") on import of search_api; this keeps unit
+# tests aligned with the code's own default (true) without overriding an explicit env.
 os.environ.setdefault("OPENRAG_RETRIEVAL_USE_L0_L1", "true")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent

@@ -238,3 +238,9 @@ def test_resolve_scope_file_ids_nonexistent_path_is_empty(db_session, workspace,
 def test_resolve_scope_file_ids_root_with_other_path_is_unrestricted(db_session, workspace, owner):
     _file(db_session, workspace, owner, "/docs/a.txt", "a.txt")
     assert resolve_scope_file_ids(db_session, workspace.id, ["/docs", "/"]) is None
+
+
+def test_resolve_scope_file_ids_underscore_is_literal_not_wildcard(db_session, workspace, owner):
+    f1 = _file(db_session, workspace, owner, "/data_2025/a.txt", "a.txt")
+    _file(db_session, workspace, owner, "/dataX2025/b.txt", "b.txt")
+    assert resolve_scope_file_ids(db_session, workspace.id, ["/data_2025"]) == {f1.id}
