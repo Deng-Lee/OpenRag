@@ -380,6 +380,35 @@ def _assert_parent_directory_exists(db: Session, workspace_id: int, parent_logic
         )
 
 
+def assert_no_pending_deleted_ancestor(db: Session, workspace_id: int, target_uri: str) -> None:
+    """409 if ``target_uri`` or any ancestor path has a soft-deleted row (pending
+    physical cleanup). Prevents writing/moving active rows into a deleting subtree
+    (Codex #2). Soft-delete frees tag but not uri, so a soft-deleted ancestor row
+    still occupies its uri until the worker cleans it.
+    """
+    candidates: list[str] = []
+    cumulative = ""
+    for part in [p for p in target_uri.split("/") if p]:
+        cumulative = f"{cumulative}/{part}"
+        candidates.append(cumulative)
+    if not candidates:
+        return
+    clash = (
+        db.query(FileModel)
+        .filter(
+            FileModel.workspace_id == workspace_id,
+            FileModel.uri.in_(candidates),
+            FileModel.deleted_at.is_not(None),
+        )
+        .first()
+    )
+    if clash is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Path is pending deletion; retry after cleanup completes",
+        )
+
+
 def ingest_new_file(
     db: Session,
     workspace: Workspace,
@@ -505,6 +534,8 @@ def ingest_new_file(
             _assert_parent_directory_exists(db, workspace.id, parent_logical_path)
 
         validated_path = validate_path(parent_logical_path)
+        # Codex #2: refuse writing into a subtree pending physical deletion.
+        assert_no_pending_deleted_ancestor(db, workspace.id, validated_path)
         if not require_parent_dir:
             # Auto-create the parent directory chain so the directory tree (web
             # lazy-load and the service-token /tree, /children endpoints) can show

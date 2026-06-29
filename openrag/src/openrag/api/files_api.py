@@ -967,6 +967,9 @@ async def move_file(
 
     new_path = validate_path(request.new_path)
 
+    from openrag.services.file_ingest import assert_no_pending_deleted_ancestor
+    assert_no_pending_deleted_ancestor(db, file.workspace_id, new_path)
+
     # Check if target already exists
     existing_file = (
         db.query(FileModel)
@@ -1072,6 +1075,9 @@ async def create_directory(
         parent_path = "/"
     validated_parent_path = validate_path(parent_path)
     dir_path = build_file_uri(validated_parent_path, dir_name)
+
+    from openrag.services.file_ingest import assert_no_pending_deleted_ancestor
+    assert_no_pending_deleted_ancestor(db, workspace_id, dir_path)
 
     existing_dir = (
         db.query(FileModel)
