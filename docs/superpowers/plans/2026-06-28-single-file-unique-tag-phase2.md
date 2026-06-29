@@ -31,7 +31,7 @@
 | `openrag/src/openrag/models/file.py`（改） | `File` 加 `deleted_at` 列 + `idx_files_deleted_at` 索引 |
 | `openrag/alembic/versions/20260626_0005_add_file_deleted_at.py`（建） | 加 `deleted_at` 列 + 索引的迁移 |
 | `openrag/src/openrag/services/task_service.py`（改） | 新增非提交 `add_task()`；`create_task()` 改为复用之 |
-| `openrag/src/openrag/services/file_deletion.py`（改） | 工具 `utcnow()`（naive）；`_release_tag_and_soft_delete()`、`soft_delete_subtree()`（拒绝空/`"/"` prefix）、`soft_delete_subtree_and_enqueue()`（单事务+回滚）、`_physically_delete_row_only()`（不级联 children、目录不碰 MinIO）、`physically_delete_soft_deleted_under_prefix()` |
+| `openrag/src/openrag/services/file_deletion.py`（改） | 工具 `utcnow()`（naive）；`_release_tag_and_soft_delete()`、`soft_delete_subtree()`（拒绝空/`"/"` prefix）、`soft_delete_subtree_and_enqueue()`（单事务+回滚）、`_physically_delete_row_only()`（不级联 children、目录不碰 MinIO）、`physically_delete_soft_deleted_under_prefix()`（root/空 prefix `ValueError` fail-closed）|
 | `openrag/src/openrag/api/files_api.py`（改） | `DELETE /files/{id}` 异步软删除（文件单行 / 目录 subtree+`DELETE_PATH_PREFIX`；拒绝删根 `uri="/"`）；`delete-path-prefix` 异步批量软删 + `deleted_before`；list/详情/content/reprocess/move 读路径加 active 过滤；`create_directory`/`move_file` 接入 pending-deletion 写守卫 |
 | `openrag/src/openrag/api/service_api.py`（改） | 新增 `DELETE .../documents/by-path`（异步软删 202 / 同步物删 200）；`GET by-tag`、`by-path`、replace、preview-link 定位加 active 过滤 |
 | `openrag/src/openrag/services/file_ingest.py`（改） | 父目录校验 / `ensure_directory_path` 只把 active 目录视为存在；新增 `assert_no_pending_deleted_ancestor()` 写守卫并接入 `ingest_new_file` |
@@ -39,9 +39,11 @@
 | `openrag/src/openrag/api/workspace_file_api.py`（改） | `get_readable_workspace_file_or_404` 加 active 过滤（覆盖 chunks/content/preview/chunk-source）|
 | `openrag/src/openrag/api/embed_preview_api.py`（改） | `resolve_claims_file_and_chunk` 加 active 过滤 |
 | `openrag/src/openrag/api/search_api.py`（改） | `GET /search/chunks/{chunk_id}` 取文件行加 active 过滤 |
-| `openrag/src/openrag/retrieval/retrieval_service.py`（改） | `_accessible_file_ids()` 只返回 active；admin+workspace 无 active 返回 `[]`；新增 `_filter_hits_to_active_files()` 在 `_search_flat`/`_search_contextual` enrich 后丢弃软删 hit |
-| `openrag/src/openrag/worker/task_worker.py`（改） | `DELETE_PATH_PREFIX` 按 `deleted_before` 的新 helper（缺水位 fail-closed）；`DELETE_FILE` 加 `deleted_at` 防御 |
-| `openrag/tests/test_soft_delete_*.py`（建） | 各任务测试（model / helpers / files_api / service / worker / read_paths / write_guard / retrieval）|
+| `openrag/src/openrag/api/share_api.py`（改） | `create_share_link` 定位加 active 过滤（软删文件不可再分享）|
+| `openrag/src/openrag/services/share_manager.py`（改） | `access_share_link` 取文件加 active 过滤 + None 守卫（公开 `GET /share/{token}` 软删后 404，兼修物删崩 500）|
+| `openrag/src/openrag/retrieval/retrieval_service.py`（改） | `_accessible_file_ids()` 只返回 active；admin+workspace 无 active 返回 `[]`；新增 `_filter_to_active_file_ids()` 在 `_search_contextual` L0 后早过滤 `candidate_files`；`_filter_hits_to_active_files()` 在 `_search_flat`/`_search_contextual` enrich 后兜底丢弃软删 hit |
+| `openrag/src/openrag/worker/task_worker.py`（改） | `DELETE_PATH_PREFIX` 按 `deleted_before` 的新 helper（缺水位 + root/空 prefix 双重 fail-closed）；`DELETE_FILE` 加 `deleted_at` 防御 |
+| `openrag/tests/test_soft_delete_*.py`（建） | 各任务测试（model / helpers / files_api / service / worker / read_paths〔含 share〕/ write_guard / retrieval）|
 
 ---
 
@@ -506,6 +508,23 @@ def test_cleanup_does_not_cascade_active_children_of_soft_deleted_dir(db, wsowne
     assert new_active.deleted_at is None
     # Codex round-3 #1: directory row cleanup must NOT prefix-recursive delete objects
     assert rmdir_calls == []
+
+
+def test_physical_cleanup_rejects_root_prefix(db, wsowner, monkeypatch):
+    """Codex round-4 #1: even with a valid watermark, a root/empty/"/" prefix must NOT
+    physically wipe the whole workspace's soft-deleted rows — the helper fails closed."""
+    w, u = wsowner
+    dead = _mk(db, w, u, "/docs/dead.txt")
+    soft_delete_subtree(db, w.id, "/docs"); db.commit()
+    dead_id = dead.id
+    _stub_storage(monkeypatch)
+    watermark = utcnow()
+    for bad in ("/", "", "//"):
+        with pytest.raises(ValueError):
+            file_deletion.physically_delete_soft_deleted_under_prefix(
+                db, w.id, bad, watermark, w
+            )
+    assert db.query(File).filter(File.id == dead_id).first() is not None  # NOT wiped
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -663,7 +682,15 @@ def physically_delete_soft_deleted_under_prefix(
     the task was enqueued are never touched. Uses the no-cascade single-row helper
     so a soft-deleted directory never drags active children with it (Codex #1).
     """
-    p = prefix.rstrip("/")
+    p = (prefix or "").rstrip("/")
+    if not p:
+        # Codex round-4 #1: a root/empty/"/" prefix collapses to "" and the query below
+        # becomes ``uri LIKE "/%"`` — i.e. EVERY row in the workspace. The soft-delete
+        # side (soft_delete_subtree) already rejects this, but the worker can be handed a
+        # legacy/manual/malformed task; fail closed here too so physical cleanup can NEVER
+        # wipe an entire workspace's soft-deleted rows. ValueError (not HTTPException):
+        # this runs in the worker, not an HTTP handler — the task fails loudly, deletes 0.
+        raise ValueError("Refusing workspace-wide physical cleanup (empty/root prefix)")
     rows = (
         db.query(FileModel)
         .filter(
@@ -690,7 +717,7 @@ def physically_delete_soft_deleted_under_prefix(
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_helpers.py -v`
-Expected: PASS（4 passed，含目录不级联 active 子项）。
+Expected: PASS（5 passed，含目录不级联 active 子项 + root-prefix 物理清理拒绝）。
 
 - [ ] **Step 5: 提交**
 
@@ -1240,6 +1267,37 @@ def test_legacy_task_without_watermark_is_fail_closed(session_factory):
     db2 = session_factory()
     assert db2.query(File).filter(File.id == keep_id).first() is not None  # NOT deleted
     db2.close()
+
+
+def test_root_prefix_task_is_fail_closed(session_factory):
+    """Codex round-4 #1: a DELETE_PATH_PREFIX task with path='/' (even carrying a valid
+    deleted_before) must NOT physically wipe the whole workspace's soft-deleted rows.
+    The worker skips it before opening a session."""
+    from openrag.worker.task_worker import TaskWorker
+
+    db = session_factory()
+    u = User(username="u", email="u@e.com", password_hash="h", full_name="U", is_active=True)
+    db.add(u); db.commit(); db.refresh(u)
+    w = Workspace(name="W", slug="w", owner_id=u.id)
+    db.add(w); db.commit(); db.refresh(w)
+    dead = File(uri="/docs/dead.txt", name="dead.txt", owner_id=u.id, workspace_id=w.id,
+                size=0, deleted_at=utcnow())
+    db.add(dead); db.commit(); db.refresh(dead)
+    watermark = utcnow()
+    dead_id = dead.id
+    db.close()
+
+    worker = TaskWorker.__new__(TaskWorker)
+    result = worker._delete_path_prefix_task({
+        "workspace_id": w.id,
+        "payload": {"path": "/", "deleted_before": watermark.isoformat()},
+    })
+    assert result["status"] == "skipped"
+    assert result.get("reason") == "root_prefix"
+
+    db2 = session_factory()
+    assert db2.query(File).filter(File.id == dead_id).first() is not None  # NOT wiped
+    db2.close()
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1252,6 +1310,24 @@ Expected: FAIL — 当前 `_delete_path_prefix_task` 用 `delete_files_under_uri
 In `openrag/src/openrag/worker/task_worker.py`，`_delete_path_prefix_task` 体（L479-500）替换为：
 
 ```python
+        # Codex round-4 #1: never let a root/empty/"/" prefix trigger workspace-wide
+        # physical cleanup, even from a legacy/manual/malformed task. Guard BEFORE opening
+        # a session (no DB needed to reject); skip gracefully so the worker doesn't crash
+        # on a poisoned task. The helper raises ValueError too as a second line of defense.
+        if not path or path.rstrip("/") == "":
+            _logger.error(
+                "delete_path_prefix task with root/empty path=%r; skipping workspace-wide "
+                "cleanup (workspace_id=%s)", path, workspace_id,
+            )
+            return {
+                "workspace_id": workspace_id,
+                "path": path,
+                "deleted_count": 0,
+                "deleted_ids": [],
+                "status": "skipped",
+                "reason": "root_prefix",
+            }
+
         db = SessionLocal()
         try:
             from datetime import datetime
@@ -1316,7 +1392,7 @@ In `openrag/src/openrag/worker/task_worker.py`，`_delete_path_prefix_task` 体�
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_worker_soft_delete_cleanup.py -v`
-Expected: PASS（2 passed：按水位清理 + 缺水位 fail-closed）。
+Expected: PASS（3 passed：按水位清理 + 缺水位 fail-closed + root-prefix fail-closed）。
 
 > 若 `TaskWorker.__new__` 旁路 `__init__` 后 `_delete_path_prefix_task` 仍依赖未初始化的实例属性，改为在测试里直接调用 `physically_delete_soft_deleted_under_prefix(...)`（Task 4 已覆盖其语义），并把本测试降级为「worker 分派读 `deleted_before` 并调用该 helper」的轻量断言。
 
@@ -1334,8 +1410,8 @@ git commit -m "feat(worker): prefix cleanup deletes only pre-watermark soft-dele
 软删行必须对**所有读/替换/预览/父目录校验/检索候选**立即不可见。逐文件加过滤，每处配最小回归。**含 Codex #3 补充的所有按 `file_id` 直接取文件的入口。**
 
 **Files:**
-- Modify: `files_api.py`、`service_api.py`、`file_ingest.py`、`workspace_file_tree.py`、`workspace_file_api.py`、`embed_preview_api.py`、`search_api.py`
-- Test: `openrag/tests/test_soft_delete_read_paths.py`、`openrag/tests/test_service_api_soft_delete.py`（追加 by-tag/by-path 隐藏断言）
+- Modify: `files_api.py`、`service_api.py`、`file_ingest.py`、`workspace_file_tree.py`、`workspace_file_api.py`、`embed_preview_api.py`、`search_api.py`、`share_api.py`、`services/share_manager.py`
+- Test: `openrag/tests/test_soft_delete_read_paths.py`（含 share 公开链接软删 404）、`openrag/tests/test_service_api_soft_delete.py`（追加 by-tag/by-path 隐藏断言）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1394,6 +1470,39 @@ def test_reprocess_404_for_soft_deleted(client, db, test_user, test_workspace):
         f = _mk(db, test_workspace, test_user.id, "/dead.txt", deleted=True)
         r = client.post(f"/files/{f.id}/reprocess", json={})
         assert r.status_code == status.HTTP_404_NOT_FOUND
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_share_link_access_404_after_soft_delete(client, db, test_user, test_workspace):
+    """Codex round-4 范围确认: the public, unauthenticated share endpoint must 404 once
+    the file is soft-deleted (and must not crash on a now-missing file row).
+
+    The public link is created via ShareLinkManager directly, so the critical leak-point
+    assertion (access_share_link) does NOT depend on the create-link permission flow.
+    ShareLink is registered in openrag.models.__init__, so the in-memory DB has the table.
+    """
+    from openrag.services.share_manager import ShareLinkManager
+    from openrag.services.file_deletion import utcnow
+
+    f = _mk(db, test_workspace, test_user.id, "/s.txt")  # active
+    link = ShareLinkManager(db).create_share_link(file_id=f.id, created_by=test_user.id)
+    assert client.get(f"/share/{link.token}").status_code == status.HTTP_200_OK  # visible while active
+
+    f.deleted_at = utcnow(); f.tag = None  # soft-delete
+    db.commit()
+
+    # the previously-issued PUBLIC link now 404s instead of leaking metadata
+    assert client.get(f"/share/{link.token}").status_code == status.HTTP_404_NOT_FOUND
+
+    # creating a NEW share link for the soft-deleted file is also rejected. The share_api
+    # 404 (missing file) is raised BEFORE the permission check, so this is 404 regardless
+    # of the fixture's permission model.
+    app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    try:
+        assert client.post(
+            "/share/links", json={"file_id": f.id}
+        ).status_code == status.HTTP_404_NOT_FOUND
     finally:
         app.dependency_overrides.pop(get_current_user, None)
 ```
@@ -1482,16 +1591,33 @@ def _query_subtree(db: Session, workspace_id: int, path_prefix: str) -> List[Fil
 - `embed_preview_api.py` 的 `resolve_claims_file_and_chunk`（embed preview）：定位 `FileModel.id == claims.file_id, FileModel.workspace_id == claims.workspace_id` 处追加 `FileModel.deleted_at.is_(None)`。
 - `search_api.py` 的 `GET /search/chunks/{chunk_id}`（chunk context）：取文件行 `f = db.query(FileModel).filter(FileModel.id == row.file_id).first()` 追加 `FileModel.deleted_at.is_(None)`；命中软删→现有的 "File not found" 404 分支自然生效。
 
+**(f) 公开分享链接（Codex round-4 范围确认）——`share` 子系统按 `file_id` 取文件，是软删后唯一的「公开、免鉴权」旧入口，必须同样隐藏：**
+- `share_api.py` 的 `create_share_link`（L82）定位查询加 `File.deleted_at.is_(None)`：软删文件不能再被分享（命中软删→现有 404 "File not found" 分支生效）：
+  ```python
+  file = db.query(File).filter(File.id == request.file_id, File.deleted_at.is_(None)).first()
+  ```
+- `share_manager.py` 的 `access_share_link`（L190 取文件处）加 active 过滤 **并补 None 守卫**——公开访问端点 `GET /share/{token}` 在文件软删后返回 `not_found`（同时修掉「文件被物删后 `access_share_link` 返回 `(None, None)`、API 层 `file.id` 崩 500」的既有潜在 bug）：
+  ```python
+          # Codex round-4: hide soft-deleted (or already-removed) files from public share access.
+          stmt = select(File).where(File.id == share_link.file_id, File.deleted_at.is_(None))
+          file = self.db.execute(stmt).scalar_one_or_none()
+          if file is None:
+              return None, "not_found"
+          return file, None
+  ```
+
+> **范围边界说明（Codex round-4 范围确认）：** `permission` / workspace 成员管理类端点不返回文件内容或元数据，不属于「读文件」路径，本阶段**不**改（无需 `deleted_at` 过滤）；如未来产品要求权限列表也隐藏软删文件，另起范围。除 share 外未发现其它按 `file_id` 直接吐文件内容/元数据的旧入口。
+
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_read_paths.py tests/test_service_api_soft_delete.py tests/test_workspace_file_tree.py -v`
-Expected: 全 PASS（含既有 tree 测试不回归；reprocess / by-tag / by-path 软删 404）。
+Expected: 全 PASS（含既有 tree 测试不回归；reprocess / by-tag / by-path / share 公开链接 软删 404）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add openrag/src/openrag/api/files_api.py openrag/src/openrag/api/service_api.py openrag/src/openrag/services/file_ingest.py openrag/src/openrag/services/workspace_file_tree.py openrag/src/openrag/api/workspace_file_api.py openrag/src/openrag/api/embed_preview_api.py openrag/src/openrag/api/search_api.py openrag/tests/test_soft_delete_read_paths.py openrag/tests/test_service_api_soft_delete.py
-git commit -m "feat(read-paths): filter deleted_at IS NULL across all read/preview/chunk entry points"
+git add openrag/src/openrag/api/files_api.py openrag/src/openrag/api/service_api.py openrag/src/openrag/services/file_ingest.py openrag/src/openrag/services/workspace_file_tree.py openrag/src/openrag/api/workspace_file_api.py openrag/src/openrag/api/embed_preview_api.py openrag/src/openrag/api/search_api.py openrag/src/openrag/api/share_api.py openrag/src/openrag/services/share_manager.py openrag/tests/test_soft_delete_read_paths.py openrag/tests/test_service_api_soft_delete.py
+git commit -m "feat(read-paths): filter deleted_at IS NULL across all read/preview/chunk/share entry points"
 ```
 
 ---
@@ -1744,12 +1870,25 @@ def test_filter_hits_drops_soft_deleted_files(db):
     ]
     kept = _svc(db)._filter_hits_to_active_files(hits)
     assert [h["file_id"] for h in kept] == [live.id]
+
+
+def test_filter_to_active_file_ids_drops_soft_deleted(db):
+    """Codex round-4 #2: L0 candidate_files must be filtered to active ids BEFORE they
+    reach L1 retrieval / LLM navigation / chunk search, so a soft-deleted file can never
+    influence contextual ranking (not just be dropped from the final hits). Order kept."""
+    u, w = _seed(db, is_admin=True)
+    live = File(uri="/a.txt", name="a", owner_id=u.id, workspace_id=w.id, size=0)
+    dead = File(uri="/b.txt", name="b", owner_id=u.id, workspace_id=w.id, size=0,
+                deleted_at=datetime.now(timezone.utc))
+    db.add_all([live, dead]); db.commit(); db.refresh(live); db.refresh(dead)
+    assert _svc(db)._filter_to_active_file_ids([dead.id, live.id]) == [live.id]
+    assert _svc(db)._filter_to_active_file_ids([]) == []
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_retrieval.py -v`
-Expected: FAIL — 软删文件 ID 仍被返回；admin 全删时返回 `None`（扩大为全量）；`_filter_hits_to_active_files` 不存在。
+Expected: FAIL — 软删文件 ID 仍被返回；admin 全删时返回 `None`（扩大为全量）；`_filter_to_active_file_ids` / `_filter_hits_to_active_files` 不存在。
 
 - [ ] **Step 3: 实现 active-only + admin-empty 修复**
 
@@ -1789,9 +1928,30 @@ In `openrag/src/openrag/retrieval/retrieval_service.py`，`_accessible_file_ids`
 
 **回查兜底 helper（Codex round-3 #3，落成具体实现）：** admin 且 `workspace_id=None` 时 `_accessible_file_ids` 返回 `None`（不按 id 过滤），向量/层级索引里尚未物理清理的软删文件仍可能命中。新增按 hits 的 `file_id` 批量过滤 helper，并在两条检索路径 enrich 之后调用。
 
-在 `_accessible_file_ids` 旁新增：
+在 `_accessible_file_ids` 旁新增两个 helper：
 
 ```python
+    def _filter_to_active_file_ids(self, file_ids: list[int]) -> list[int]:
+        """Keep only file_ids whose row is active (deleted_at IS NULL), order preserved.
+
+        Codex round-4 #2: contextual search derives ``candidate_files`` from L0 hits and
+        feeds them into L1 retrieval, the LLM navigation summary, chunk vector search, ES
+        score blending, and L0/L1 score normalization. A soft-deleted file in that list
+        pollutes ALL of those even if its chunks are dropped from the final result. Filter
+        the candidate ids up front so soft-deleted files never influence contextual ranking.
+        """
+        if not file_ids:
+            return []
+        active = set(
+            self.db.execute(
+                select(File.id).where(
+                    File.id.in_(file_ids),
+                    File.deleted_at.is_(None),
+                )
+            ).scalars().all()
+        )
+        return [fid for fid in file_ids if fid in active]
+
     def _filter_hits_to_active_files(self, hits: list[dict]) -> list[dict]:
         """Drop hits whose file is missing or soft-deleted (Codex round-3 #3).
 
@@ -1813,22 +1973,36 @@ In `openrag/src/openrag/retrieval/retrieval_service.py`，`_accessible_file_ids`
         return [h for h in hits if h.get("file_id") in active]
 ```
 
-调用点（两处，enrich 之后）：
-- `_search_flat`：`self._enrich_hits(hits)` 之后加 `hits = self._filter_hits_to_active_files(hits)`。
-- `_search_contextual`：`self._enrich_hits(chunk_hits)` 之后加 `chunk_hits = self._filter_hits_to_active_files(chunk_hits)`。
+调用点：
+- **`_search_contextual` 早过滤（Codex round-4 #2）**：在 `candidate_files = list(file_l0_raw.keys())`（L355）**之后、现有 `if not candidate_files:` 之前**插入一行，使软删文件在进入 L1/LLM/chunk 检索前就被剔除；若过滤后为空，沿用既有「无 L0 命中 → fallback 到 flat」分支（flat 本身已 active-only，故安全）：
+  ```python
+          file_l0_raw = _max_score_per_file(l0_hits)
+          candidate_files = list(file_l0_raw.keys())
+          candidate_files = self._filter_to_active_file_ids(candidate_files)  # round-4 #2
+          if not candidate_files:
+              logger.info("Contextual search: no active L0 hits; fallback to flat chunk search")
+              return self._search_flat(
+                  query, user_id, workspace_id, top_k,
+                  vector_similarity_weight=vector_similarity_weight,
+              )
+  ```
+  > 下游 `{fid: file_l0_raw[fid] for fid in candidate_files ...}`（L420）按 `candidate_files` 取值，已软删 file 的 L0 原始分自然不再参与归一化，无需另改。
+- **enrich 之后的兜底过滤（保留 round-3 #3）**：
+  - `_search_flat`：`self._enrich_hits(hits)` 之后加 `hits = self._filter_hits_to_active_files(hits)`。
+  - `_search_contextual`：`self._enrich_hits(chunk_hits)` 之后加 `chunk_hits = self._filter_hits_to_active_files(chunk_hits)`（向量库里未及物理清理的软删 chunk 的最后一道兜底）。
 
-> `select` 与 `File` 已在 `retrieval_service.py` import（`_accessible_file_ids` 在用）。hits 的 `file_id` 由 `_enrich_hits` / 向量库返回，键名为 `"file_id"`（见 `_search_contextual` 用 `h.get("file_id")`）。
+> `select` 与 `File` 已在 `retrieval_service.py` import（`_accessible_file_ids` 在用）。hits 的 `file_id` 由 `_enrich_hits` / 向量库返回，键名为 `"file_id"`（见 `_search_contextual` 用 `h.get("file_id")`）。`candidate_files` 元素为 `File.id`（见 L355 `file_l0_raw` 的键来自 `_max_score_per_file(l0_hits)`）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_soft_delete_retrieval.py -v`
-Expected: PASS（3 passed：admin workspace active-only + admin 全删空 + hits 过滤丢弃软删）。
+Expected: PASS（4 passed：admin workspace active-only + admin 全删空 + hits 过滤丢弃软删 + candidate_files 早过滤）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add openrag/src/openrag/retrieval/retrieval_service.py openrag/tests/test_soft_delete_retrieval.py
-git commit -m "feat(retrieval): active-only file ids + _filter_hits_to_active_files drops soft-deleted hits"
+git commit -m "feat(retrieval): active-only file ids + early candidate_files filter + hit-level fallback drop soft-deleted"
 ```
 
 ---
@@ -1847,11 +2021,14 @@ Expected: 全 PASS。
 - 删除（内部 `/files/{id}`、外部 `by-path`、`delete-path-prefix`，`background=true`）→ 文档**立即**从 list / by-tag / by-path / tree 消失、**tag 立即可复用**（同 tag 重新上传 201）。
 - **回滚**（Codex #4）：`add_task`/`commit` 失败时，内部单文件删除、内部目录/prefix 删除、外部 by-path 删除三处的 `deleted_at`/`tag`/task 三者同事务回滚。
 - **prefix 清理不误删**（Codex #1）：前缀删除任务入队后，同 prefix 下新建的 active 行不被 worker 物理删除（worker 只删 `deleted_at <= deleted_before`）；软删目录下后来出现的 active 子项不被目录行级联删除；缺 `deleted_before` 的任务 fail-closed（不物删）。
+- **root prefix 物理清理 fail-closed**（Codex round-4 #1）：`payload.path="/"`（或空）的 `DELETE_PATH_PREFIX` 任务即便带合法 `deleted_before`，worker 也 `skipped`、`physically_delete_soft_deleted_under_prefix` 也 `ValueError`，**绝不**全 workspace 物删已软删行。
 - **pending-deletion 写入守卫**（Codex #2）：上传到 `/dir`、`create_directory("/dir/new")`、`move_file(... -> "/dir/new.txt")` 在 `/dir` 已软删时均 `409 pending deletion`。
 - **软删后不可读**（Codex #3）：`reprocess`、workspace chunks/content/preview/chunk-source、service preview-link、embed preview、search chunk context 均 404；`GET by-tag`/`by-path` 命中软删行 → 404。
+- **公开分享链接隐藏**（Codex round-4 范围）：软删后 `POST /share/links` 对该文件 404，且删除前已签发的 `GET /share/{token}` 公开链接 404（不再泄漏元数据）。
 - **目录物理清理不删 active 对象**（Codex round-3 #1）：软删 `/dir` 后出现 active `/dir/new.txt`，worker 清理 `/dir` 时**不调用** `remove_directory`（prefix 递归），active 子项对象与 DB 行均保留。
 - **根目录删除拒绝**（Codex round-3 #2）：`DELETE /files/{root_id}`（`uri="/"`）→ 400，根下文件 `deleted_at`/`tag`/task 不变；`soft_delete_subtree` 对空/`"/"` prefix 直接 400。
 - **检索兜底**（Codex round-3 #3）：admin + `workspace_id=None`、向量命中软删文件时，`_filter_hits_to_active_files` 把软删 hit 过滤掉。
+- **检索早过滤**（Codex round-4 #2）：contextual 检索从 L0 得到的 `candidate_files` 经 `_filter_to_active_file_ids` 剔除软删文件后才进入 L1/LLM 导航/chunk 检索/ES 融合/归一化——软删文件不影响 active 结果的排序与召回。
 - **语义边界**：软删后同 tag + 不同 URI 可重新上传 201；同 tag + 同 URI 裸上传仍 409（uri 未释放，spec §4.9，等 Phase 3 upsert）。
 
 - [ ] **Step 2: 前端全量（应无改动，仅确认不回归）**
@@ -1880,6 +2057,10 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
   - round-3 #2 删根目录 → `soft_delete_subtree` 对空/`"/"` prefix 400；`DELETE /files/{id}` 显式拒绝 `uri=="/"`；T5 加根目录 400 回归。
   - round-3 #3 检索兜底落地 → 新增 `_filter_hits_to_active_files(hits)`，在 `_search_flat`/`_search_contextual` 的 enrich 后调用；T11 加 hits 过滤回归。
   - round-3 命令一致性 → 文首约定块显式说明**不加** `--import-mode=importlib`（Phase 1 已证默认模式可行），消除与旧审查段的冲突。
+- **Codex 第四轮复审（2026-06-29，见下「Codex 最新复审补充」）全部采纳**（均已对照真实源码核实属实）：
+  - round-4 #1 物理清理侧 root prefix 未 fail-closed（`"/".rstrip("/")=="" → uri LIKE "/%"` 匹配整个 workspace，软删侧已防、清理侧未防）→ T4 `physically_delete_soft_deleted_under_prefix` 对空/`"/"` prefix `raise ValueError`（worker 上下文用 ValueError 而非 HTTPException）；T8 worker `_delete_path_prefix_task` 在开 session 前对 root/空 path `skipped`(reason=`root_prefix`)；T4/T8 各加 root-prefix fail-closed 回归。
+  - round-4 #2 `_search_contextual` 过滤偏晚（软删文件经 `candidate_files` 污染 L1/LLM 导航/chunk 检索/ES 融合/归一化）→ T11 新增 `_filter_to_active_file_ids(file_ids)`，在 L0 得出 `candidate_files` 后**立即**早过滤，hit 级 `_filter_hits_to_active_files` 保留为兜底；T11 加早过滤回归。
+  - round-4 范围确认（share/public-link）→ T9 (f) 纳入：`share_api.create_share_link` + `share_manager.access_share_link` 加 active 过滤（公开 `GET /share/{token}` 软删后 404，兼修文件物删后 `file.id` 崩 500 的既有 bug）；T9 加 share 软删 404 回归。permission 类端点不返回文件内容/元数据，标注 out-of-scope。
 - **明确不做（保持 spec 决策）**：软删除**只释放 tag、不释放 uri**——ingest 同 uri 查重**不加** `deleted_at` 过滤（同 uri 裸上传仍 409，T9 (c) 已显式标注「此条不改」）；同 tag+同路径立即重建走 Phase 3 upsert 更新分支。
 - **占位符扫描**：每个实现步骤含完整代码/精确锚点，每个测试步骤含完整测试代码与可跑命令。「视实现微调」处已显式标注：T8 worker 测试若 `__new__` 旁路不便则降级为 helper 直测；T11 回查兜底以 `_accessible_file_ids` active-only 为主。
 - **类型/签名一致性**：`TaskService.add_task(...)` T3 定义、T4/T5/T6/T7 复用；`_release_tag_and_soft_delete(db, file, *, user_id) -> Task`、`soft_delete_subtree(db, workspace_id, prefix) -> datetime`、`soft_delete_subtree_and_enqueue(db, workspace_id, prefix, *, user_id) -> Task`、`_physically_delete_row_only(db, file, workspace)`、`physically_delete_soft_deleted_under_prefix(db, workspace_id, prefix, deleted_before, workspace) -> list[int]`、`assert_no_pending_deleted_ancestor(db, workspace_id, target_uri)` 定义与调用各处一致；`payload={"path", "deleted_before"}` 写入（T5/T6）与读取（T8）一致。
@@ -1889,6 +2070,8 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
 ---
 
 ## Codex 审查补充（2026-06-29）
+
+> **【历史审查原文 — 第二轮，已全部采纳并落入正文 T1–T12】** 保留供追溯；执行以正文与 Self-Review 为准，本段不再单独执行。
 
 > 来源：Codex 审查。结论：Phase 2 的方向正确，但执行前建议先修正以下会影响核心语义的风险点；这些不是措辞问题，可能导致软删除后仍可见、误删新文件，或测试无法稳定运行。
 
@@ -1934,6 +2117,8 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
 
 ## Codex 再次审查补充（2026-06-29）
 
+> **【历史审查原文 — 第三轮，已全部采纳并落入正文 T4/T5/T11】** 保留供追溯；执行以正文与 Self-Review 为准，本段不再单独执行。
+
 > 来源：Codex 审查。结论：Claude 已采纳上一轮主要意见，Phase 2 方向基本可执行；但执行前仍建议补掉以下几个实质性边界，避免对象存储被误删、根目录被软删，或检索继续返回软删文件。
 
 ### 必须修改
@@ -1956,3 +2141,37 @@ Phase 2 完成。Phase 3（`PUT upsert-by-tag`：create / update / 同行 move+r
 - 根目录删除：`DELETE /files/{root_id}` 返回 400，root 下文件的 `deleted_at`、`tag`、task 均不变。
 - 检索兜底：admin、`workspace_id=None`、vector/layer 命中 soft-deleted file 时，结果过滤为空或只保留 active hit。
 - 测试命令：正文所有后端 pytest 命令建议统一加 `--import-mode=importlib`；当前文档开头命令没有加，末尾旧 Codex 审查段仍建议加，存在轻微冲突。
+
+---
+
+## Codex 最新复审补充（2026-06-29）
+
+> **【第四轮复审 — 已核实并全部采纳，见上方 Self-Review「Codex 第四轮复审」条】** 两条必改（#1 物理清理 root prefix fail-closed → T4/T8；#2 `_search_contextual` 早过滤 → T11）与范围确认（share 公开链接 → T9 (f)；permission 非读路径，out-of-scope）均已落入正文并补回归。本段保留供追溯。
+
+> 来源：Codex 审查。结论：ClaudeCode 修改后的 Phase 2 计划已经基本收敛，不建议再大面积推翻；当前主要还需要补齐两个会影响核心语义的边界，以及一组读路径回归。以下意见用于执行前落地，避免继续在无关小点上反复审查。
+
+### 必须补齐
+
+1. **`DELETE_PATH_PREFIX` worker/helper 仍需要对 root prefix fail-closed。**
+   - API 层和 `soft_delete_subtree()` 已经计划拒绝 root/空 prefix，但 worker 可能吃到历史任务、手工写入任务或异常 payload。若 `payload.path="/"` 且携带 `deleted_before`，`physically_delete_soft_deleted_under_prefix()` 内部执行 `prefix.rstrip("/")` 后会得到空字符串，后续按 `uri == p or uri.like(f"{p}/%")` 查询时，存在清理该 workspace 下所有 soft-deleted 行的风险。
+   - 建议实现：`physically_delete_soft_deleted_under_prefix()` 开头统一规范化 `prefix`，对 `None`、空字符串、`"/"` 直接拒绝或返回 skipped；`_delete_path_prefix_task()` 在调用 helper 前也做同样 guard，并记录日志，保证 malformed task 也不会触发 workspace 级清理。
+   - 建议回归：构造 `DELETE_PATH_PREFIX` 任务，`payload={"path": "/", "deleted_before": ...}`，断言 worker/helper fail-closed，已有 soft-deleted 文件未被物理删除，task 不应被当作成功清理全 workspace。
+
+2. **`_search_contextual()` 的 soft-deleted 过滤位置仍偏晚。**
+   - 当前计划主要在 `_enrich_hits(chunk_hits)` 后过滤返回结果；但 contextual 搜索会先从 L0 得到 `candidate_files`，再进入 L1 查询、LLM navigation summary、chunk search。如果 soft-deleted 文件进入 `candidate_files`，即使最终结果被过滤，也可能影响 L1/LLM 决策和 active 结果排序/召回。
+   - 建议实现：新增或复用一个批量 `active_file_ids` helper，在 `candidate_files = list(file_l0_raw.keys())` 后立即过滤，只保留 `deleted_at IS NULL` 的文件；过滤后为空则返回空结果。最终返回前保留 hit-level `_filter_hits_to_active_files()` 作为兜底。
+   - 建议回归：模拟 L0 同时命中 deleted file 与 active file，断言传给 L1/chunk search 的 `file_ids` 不包含 deleted id；再断言最终结果只包含 active hit。
+
+### 建议补充回归
+
+- workspace 文件读路径：soft-deleted file 的 content、preview、chunks、chunk-source 返回 404。
+- service preview-link：soft-deleted file 不能生成或解析 preview link，返回 404。
+- embed preview：删除前签发的 token，在文件 soft-delete 后不能继续访问，返回 404。
+- search chunk context：chunk 所属文件已 soft-delete 时，`/search/chunks/{chunk_id}` 返回 404 或被过滤。
+- malformed prefix task：`path="/"`、空字符串、缺少 `path` 的 `DELETE_PATH_PREFIX` 任务均不执行物理清理。
+
+### 范围确认
+
+- 暂未看到明显的无关功能多余改动；当前计划的修改范围仍围绕 soft-delete/tag 语义。
+- 如果 Phase 2 的产品语义是“软删后任何旧入口都不可见”，需要明确 share/public link、permission 这类 direct file_id 入口是否纳入本阶段。若纳入，应同样加 `deleted_at IS NULL` 过滤并补最小回归；若不纳入，建议在文档中标注为后续范围，避免执行时默认遗漏。
+- 文档末尾保留了多轮历史 Codex 审查原文，其中部分旧建议已经被新计划采纳或被覆盖。为避免执行者误读，建议把历史段落明确标注为“历史审查原文（已采纳/已覆盖）”，最终执行以本文档正文和本节最新复审补充为准。
