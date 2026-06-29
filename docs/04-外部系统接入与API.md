@@ -593,7 +593,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 字段 | 类型 | 必填 | 默认 | 约束 | 说明 |
 |------|------|------|------|------|------|
 | `query` | string | **是** | — | min_length=1 | 检索语句 |
-| `path_prefix` | string | 否 | `null` | — | 非 `/` 时仅保留 `uri` 在该前缀下的命中 |
+| `paths` | array[string] | 否 | `null` | — | 把检索范围限定到这些逻辑路径（文件夹按子树递归，单个文件精确匹配）。传入时**覆盖** `path_prefix`；`paths: []` 表示空范围，直接返回空结果。仅当本字段缺省（未传或 `null`）时才回退使用 `path_prefix`。 |
+| `path_prefix` | string | 否 | `null` | — | 把检索范围限定到该逻辑路径前缀下的文件（**预过滤**，在 top_k 之前就限定候选文件）。当 `paths` 已显式传入时本字段被忽略。⚠️ **行为变更**：旧版为检索后过滤（post-filter），现已升级为检索前预过滤（pre-filter），与 `paths` 语义一致；结果更准、召回更充分，但与旧版本不完全一致（旧版先在整个工作区取 top_k 再裁剪，可能漏掉目录内排名靠后的命中）。 |
 | `top_k` | int | 否 | `10` | gt=0, le=100 | 返回结果数 |
 | `use_rerank` | bool | 否 | `true` | — | 是否使用 cross-encoder 重排 |
 | `use_contextual_retrieval` | bool | 否 | `false` | — | 启用 L0→L1→L2 层级检索 |
@@ -604,6 +605,12 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `use_l1_llm_navigation` | bool | 否 | `false` | — | 启用 LLM 辅助 chunk 选择（需 OPENAI_API_KEY） |
 
 > 工作区由 URL 路径决定，**body 中不要传 `workspace_id`**。`ServiceSearchRequest` 不包含 `vector_similarity_weight`（内部默认 1.0）。
+
+**`paths` 与 `path_prefix` 优先级规则：**
+
+1. 显式传入 `paths`（含 `paths: []`）→ 使用 `paths`，忽略 `path_prefix`。
+2. `paths` 缺省（未传或 `null`）且 `path_prefix` 非 `null`/非 `/` → 使用 `path_prefix` 预过滤。
+3. 两者均缺省 → 在整个工作区检索，不限范围。
 
 **响应示例：**
 
@@ -662,7 +669,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `source_block_id` | string/null | 源块标识 |
 | `source_char_start/end` | int/null | 源字符偏移 |
 | `filename` | string/null | 源文件名 |
-| `uri` | string/null | 源文件逻辑路径（`path_prefix` 过滤基于此字段） |
+| `uri` | string/null | 源文件逻辑路径（`paths` / `path_prefix` 的预过滤基于此字段） |
 | `object_key` / `object_url` | string/null | MinIO 存储 |
 | `local_chunk_path` | string/null | 本地 chunk 跷径 |
 | `text_preview` | string/null | 短文本预览 |
@@ -674,7 +681,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `results` | array | 检索命中列表 |
-| `total` | int | 命中数（`path_prefix` 过滤后） |
+| `total` | int | 命中数 |
 | `query_time_ms` | float | 查询耗时（毫秒） |
 | `l1_llm_applied` | bool/null | L1 LLM 导航是否执行 |
 | `l1_llm_skip_reason` | string/null | L1 LLM 被跳过的原因（如 `no_api_key`、`not_contextual`、`no_l1_hits`） |
@@ -790,7 +797,8 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 |------|------|------|------|------|------|
 | `workspace_names` | array[string] | **是** | — | min_length=1, max_length=20 | 要检索的真实工作区名称列表，使用 `Workspace.name`；后端会 trim、去空并按首次出现顺序去重 |
 | `query` | string | **是** | — | min_length=1 | 检索语句 |
-| `path_prefix` | string/null | 否 | `null` | — | 非 `/` 时仅保留 `uri` 在该前缀下的命中；同一前缀应用于所有目标工作区 |
+| `paths` | array[string] | 否 | `null` | — | 把检索范围限定到这些逻辑路径（文件夹按子树递归，单个文件精确匹配），同一范围应用于所有目标工作区。传入时**覆盖** `path_prefix`；`paths: []` 直接返回空结果。仅当本字段缺省（未传或 `null`）时才回退使用 `path_prefix`。 |
+| `path_prefix` | string/null | 否 | `null` | — | 把检索范围限定到该逻辑路径前缀下的文件（**预过滤**），同一前缀应用于所有目标工作区。当 `paths` 已显式传入时本字段被忽略。⚠️ **行为变更**：已由检索后过滤（post-filter）升级为检索前预过滤（pre-filter）。 |
 | `top_k` | int | 否 | `10` | gt=0, le=100 | 全局返回结果数；多工作区结果合并后按分数截断 |
 | `use_rerank` | bool | 否 | `true` | — | 是否使用 cross-encoder 重排 |
 | `use_contextual_retrieval` | bool | 否 | `false` | — | 启用 L0→L1→L2 层级检索 |
@@ -817,7 +825,7 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
   "workspace_names": ["MyWorkspace", "AnotherWS"],
   "query": "合同金额",
   "top_k": 5,
-  "path_prefix": "/法务",
+  "paths": ["/法务"],
   "use_rerank": true,
   "use_contextual_retrieval": false,
   "contextual_l0_top_n": 40,
@@ -961,7 +969,16 @@ curl -sS -H "X-OpenRag-Token: sk-xxxxxxxx" \
   "https://api.example.com/service/v1/workspaces/MyWorkspace/tree?path_prefix=%2F"
 ```
 
-**语义检索：**
+**语义检索（按逻辑路径列表限定范围）：**
+
+```bash
+curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/search" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"合同金额","top_k":5,"paths":["/法务","/合规/2026"]}'
+```
+
+**语义检索（兼容旧字段 path_prefix）：**
 
 ```bash
 curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/search" \
@@ -976,7 +993,7 @@ curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/sear
 curl -sS -X POST "https://api.example.com/service/v1/workspaces/multi_space/search" \
   -H "X-OpenRag-Token: sk-xxxxxxxx" \
   -H "Content-Type: application/json" \
-  -d '{"workspace_names":["MyWorkspace","AnotherWS"],"query":"合同金额","top_k":5,"path_prefix":"/法务"}'
+  -d '{"workspace_names":["MyWorkspace","AnotherWS"],"query":"合同金额","top_k":5,"paths":["/法务"]}'
 ```
 
 **创建文档片段预览链接：**
@@ -1050,7 +1067,17 @@ r = requests.get(f"{WS_URL}/tree", params={"path_prefix": "/"}, headers=HEADERS,
 r.raise_for_status()
 print(r.json())
 
-# 语义检索
+# 语义检索（按路径列表限定范围，覆盖 path_prefix）
+r = requests.post(
+    f"{WS_URL}/search",
+    json={"query": "合同金额", "top_k": 5, "paths": ["/法务", "/合规/2026"]},
+    headers=HEADERS,
+    timeout=60,
+)
+r.raise_for_status()
+print(r.json())
+
+# 语义检索（兼容旧字段 path_prefix，paths 缺省时生效）
 r = requests.post(
     f"{WS_URL}/search",
     json={"query": "合同金额", "top_k": 5, "path_prefix": "/法务"},
@@ -1067,7 +1094,7 @@ r = requests.post(
         "workspace_names": ["MyWorkspace", "AnotherWS"],
         "query": "合同金额",
         "top_k": 5,
-        "path_prefix": "/法务",
+        "paths": ["/法务"],
     },
     headers=HEADERS,
     timeout=60,
