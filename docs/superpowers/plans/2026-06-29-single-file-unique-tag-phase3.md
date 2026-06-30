@@ -4,7 +4,7 @@
 
 **Goal:** 新增外部服务端点 `PUT /service/v1/workspaces/{name}/documents/upsert-by-tag`，以 workspace 内唯一 `tag` 为幂等键：tag 不存在→在目标路径创建；tag 已存在且目标路径相同→原地替换内容；tag 已存在但目标路径不同→把该 tag 文档**搬移到新路径并替换内容**。
 
-**Architecture:** 在 `file_ingest.py` 新增编排函数 `upsert_file_by_tag()`，以**显式 `target_path`（完整文件路径，spec §4.8/§8.5#10）**为输入，在一处判定三分支：create 复用 `ingest_new_file(..., tag=...)`（由 `target_path` 拆 parent/basename）；update（`existing.uri == target_uri`）复用 `replace_file_content()`；move+replace（异 uri）**不串联** `replace_file_content`/`move_file`（二者多次 commit、失败窗口大），而用专用 helper `_move_replace_no_intermediate_commit()`——先校验、先写新对象到 `target_uri`，再在**单次 DB 事务**内更新同一行 `uri/name/size/mime_type/parser_type/processing` 字段 + 删旧 `DocumentChunk` + 非提交 `add_task(process_document)`，单次 `commit`；commit 失败 `rollback` + best-effort 删刚写的新对象；commit 成功后 best-effort 清旧 `old_uri` 对象/层级/向量（绝不删行、绝不释放 tag → 失败时原 tag 与原文档至少一者可达）。复用 Phase 2 `assert_no_pending_deleted_ancestor()` 写守卫与 `deleted_at IS NULL` 活跃判定。`service_api.py` 加一个薄端点，按 **`action`**（`created`/`updated`/`moved`，spec §4.8）映射 `201`/`200`。
+**Architecture:** 在 `file_ingest.py` 新增编排函数 `upsert_file_by_tag()`，以**显式 `target_path`（完整文件路径，spec §4.8/§8.5#10）**为输入。**分支前统一预校验** tag/basename 非空/`parser_type`/文件大小/`mime`（spec §4.8），使三分支语义一致（`ingest_new_file` 本身对不支持 MIME 不报 400，须靠此层补齐）。再在一处判定三分支：create 复用 `ingest_new_file(..., tag=...)`（由 `target_path` 拆 parent/basename；进 ingest 前用**完整 `target_uri`** 调 `assert_no_pending_deleted_ancestor` 以正确返回 `pending deletion`）；update（`existing.uri == target_uri`）复用 `replace_file_content()`；move+replace（异 uri）**不串联** `replace_file_content`/`move_file`（二者多次 commit、失败窗口大），而用专用 helper `_move_replace_no_intermediate_commit()`——先校验、先写新对象到 `target_uri`，再在**单次 DB 事务**内更新同一行 `uri/name/size/mime_type/parser_type/processing` 字段 + 删旧 `DocumentChunk` + 非提交 `add_task(process_document)`，单次 `commit`；commit 失败 `rollback` + best-effort 删刚写的新对象；commit 成功后 best-effort 清旧 `old_uri` 对象/层级/向量（绝不删行、绝不释放 tag → 失败时原 tag 与原文档至少一者可达）。复用 Phase 2 `assert_no_pending_deleted_ancestor()` 写守卫与 `deleted_at IS NULL` 活跃判定。`service_api.py` 加一个薄端点，按 **`action`**（`created`/`updated`/`moved`，spec §4.8）映射 `201`/`200`。
 
 **Tech Stack:** Python 3.12 / FastAPI / SQLAlchemy（生产 PostgreSQL、测试 SQLite in-memory）；pytest；无前端改动（与 by-tag/by-path 一样是 service-token M2M 端点）。
 
@@ -69,10 +69,12 @@ assert_token_workspace_permission(ctx, ws_id, "write") -> None
 
 **已核对的关键事实：**
 - `ingest_new_file` 的 tag 查重为 `FileModel.tag == normalized_tag`（无 `deleted_at` 过滤）；软删行 `tag=NULL` 不会命中，故 tag 释放后可复用。**create 分支天然正确。**
+- **`ingest_new_file` 对不支持 MIME 不报 400**：它 `resolve_effective_mime_type` 后**照样落库存储**，仅 `if ct in ALLOWED_MIME_TYPES` 时才建 `process_document` 任务（[file_ingest.py:572/641](../../../openrag/src/openrag/services/file_ingest.py)）。而 update/move 分支（经 `replace_file_content` / move helper）对不支持 MIME **返回 400**。故 upsert **必须在分支前做统一预校验**（Codex MF1），否则同一端点 create 放行、update/move 拒绝，自相矛盾且违背 spec §4.8「先校验 parser/文件大小/mime」。
 - **`target_path` 是完整文件路径**（spec §4.8/§8.5#10）；upsert 入口 `target_uri = validate_path(target_path)`，**不**由 multipart `file.filename` 派生 uri（避免「改了上传文件名→误触发 move」）。create 分支由 `target_uri` 拆 `parent = posixpath.dirname(target_uri) or "/"`、`basename = posixpath.basename(target_uri)`。
 - **move 分支不串联 `replace_file_content`/`move_file`**（spec §4.8 L151-157）：二者各自多次 commit / 带存储副作用，无法满足「失败时原 tag 与原文档可达性不丢」。改用专用 `_move_replace_no_intermediate_commit()`：先写新对象 → 单事务改行+删 chunk+`add_task` → 单 commit → 失败回滚并删新对象 → 成功后才清旧对象/层级/向量。**绝不删行、绝不释放 tag。**
 - `move_file`（files_api）改 uri/name 时**不更新 `parent_id`**（uri 为路径真相源）。本计划 move 分支沿用此先例：只改 uri/name，不动 parent_id；目录树由 uri 推导。
-- `uq_files_workspace_uri` 保证同 workspace 同 uri 唯一；create 分支撞 uri 由 `ingest_new_file` 现有 IntegrityError 分类成 409。`assert_no_pending_deleted_ancestor` 把 `target_uri` 自身纳入 candidates，故软删目标 uri 已能命中 pending deletion 409，无需额外逻辑。
+- `uq_files_workspace_uri` 保证同 workspace 同 uri 唯一；create 分支撞 **active** uri 由 `ingest_new_file` 现有 IntegrityError/`existing_file` 查重分类成 409 `File already exists`。
+- `assert_no_pending_deleted_ancestor(db, ws_id, uri)` 的 candidates 由 `uri` **所有路径分量累积**构成（**含 `uri` 自身**），命中任意软删行 → 409 `Path is pending deletion`。**但** `ingest_new_file` 内部只对**父路径**调它（[file_ingest.py:536-538](../../../openrag/src/openrag/services/file_ingest.py)），目标 uri 自身的软删行会落到其无 `deleted_at` 过滤的 `existing_file` 查重（[file_ingest.py:548-570](../../../openrag/src/openrag/services/file_ingest.py)）→ 返回语义错误的 `File already exists`。故 **create 分支必须在进入 `ingest_new_file` 前用完整 `target_uri` 显式调 `assert_no_pending_deleted_ancestor`**（Codex MF3），才能让软删目标返回 `pending deletion`。move 分支已在其校验段调用（Task 3）。
 
 ---
 
@@ -80,7 +82,7 @@ assert_token_workspace_permission(ctx, ws_id, "write") -> None
 
 | 文件 | 职责 |
 |---|---|
-| `openrag/src/openrag/services/file_ingest.py`（改） | 新增 `upsert_file_by_tag()` 编排（以 `target_path` 为输入；三分支 create/update/move）+ 专用 `_move_replace_no_intermediate_commit()`（单事务、失败不丢原文档）+ `_active_tagged_file()`；返回 `(FileModel, Optional[Task], action)`，`action ∈ {"created","updated","moved"}`。新增 import：`ProcessingStatus`、`DocumentChunk`、`delete_milvus_vectors_for_file` |
+| `openrag/src/openrag/services/file_ingest.py`（改） | 新增 `upsert_file_by_tag()` 编排（以 `target_path` 为输入；**分支前统一预校验** parser/size/mime + basename 非空；create 进 ingest 前用完整 `target_uri` 调 pending-deletion 守卫；三分支 create/update/move）+ 专用 `_move_replace_no_intermediate_commit()`（单事务、失败不丢原文档）+ `_active_tagged_file()`；返回 `(FileModel, Optional[Task], action)`，`action ∈ {"created","updated","moved"}`。新增 import：`ProcessingStatus`、`DocumentChunk`、`delete_milvus_vectors_for_file` |
 | `openrag/src/openrag/api/service_api.py`（改） | 新增 `PUT .../documents/upsert-by-tag` 端点：Form `tag` + `target_path` + `parser_type` + `create_dirs`；按 `action` 映射 `201`(created) / `200`(updated\|moved)；响应体含 `action` |
 | `openrag/tests/test_file_ingest_upsert.py`（建） | `upsert_file_by_tag` 三分支 + 边界的服务层单测（SQLite，stub MinIO） |
 | `openrag/tests/test_service_api_upsert.py`（建） | 端点级 E2E（service token，状态码 + 响应体 + tag/路径语义） |
@@ -221,15 +223,50 @@ def upsert_file_by_tag(
         )
 
     target_uri = validate_path(target_path)
+    basename = posixpath.basename(target_uri)
+    if not basename:
+        # target_path must point at a file, not the root / a directory (no basename).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target_path must be a full file path (file name required)",
+        )
+
+    # Unified pre-validation BEFORE branching (spec §4.8: validate parser/size/mime first)
+    # so create/update/move reject the same bad inputs. Without this, the create branch's
+    # ingest_new_file would store an unsupported-MIME file and skip the task WITHOUT a 400,
+    # diverging from the update/move branches (which 400 on unsupported MIME).
+    if parser_type not in SUPPORTED_PARSER_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+        )
+    if len(file_content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
+        )
+    effective_mime = resolve_effective_mime_type(content_type, basename, parser_type)
+    if effective_mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type {effective_mime} is not supported for processing",
+        )
+
     existing = _active_tagged_file(db, workspace.id, normalized_tag)
 
     if existing is None:
+        # CREATE. Check the FULL target_uri for a pending-deletion row first: ingest_new_file
+        # only guards the PARENT path, so a soft-deleted row sitting at target_uri itself
+        # would otherwise fall through to its generic "File already exists" (409). spec §4.9
+        # wants "pending deletion" semantics so callers can distinguish "occupied by an
+        # active doc" from "old doc still being physically cleaned up".
+        assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)
         file_record, task = ingest_new_file(
             db,
             workspace,
             owner_user_id,
             parent_logical_path=posixpath.dirname(target_uri) or "/",
-            upload_filename=posixpath.basename(target_uri),
+            upload_filename=basename,
             file_content=file_content,
             content_type=content_type,
             parser_type=parser_type,
@@ -242,7 +279,7 @@ def upsert_file_by_tag(
     raise NotImplementedError  # update / move branches added in Task 2 / Task 3
 ```
 
-> `_normalize_tag`、`validate_path`、`ingest_new_file`、`posixpath`、`FileModel`、`Task`、`Optional`、`Tuple`、`HTTPException`、`status`、`Workspace`、`Session` 均已在 `file_ingest.py` import（现有函数在用）。`target_path` 是完整文件路径，create 分支以其 `dirname`/`basename` 喂 `ingest_new_file`，**不再用 multipart 文件名决定 uri**。
+> `_normalize_tag`、`validate_path`、`ingest_new_file`、`assert_no_pending_deleted_ancestor`、`resolve_effective_mime_type`、`posixpath`、常量 `SUPPORTED_PARSER_TYPES`/`MAX_FILE_SIZE`/`ALLOWED_MIME_TYPES`、`FileModel`、`Task`、`Optional`、`Tuple`、`HTTPException`、`status`、`Workspace`、`Session` 均已在 `file_ingest.py` 定义/import（现有函数在用）。`target_path` 是完整文件路径，create 分支以其 `dirname`/`basename` 喂 `ingest_new_file`，**不再用 multipart 文件名决定 uri**。统一预校验用 `content_type` + `basename`（与 create 经 `ingest_new_file` 的 `resolve_effective_mime_type(content_type, upload_filename, parser_type)` 同口径）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -500,6 +537,52 @@ def test_upsert_move_db_failure_rolls_back_and_keeps_old_reachable(db, wsowner, 
     db.expire_all()
     row = db.query(File).filter(File.tag == "report", File.deleted_at.is_(None)).first()
     assert row is not None and row.id == f0.id and row.uri == "/r.txt"  # rolled back, reachable
+
+
+def test_upsert_move_commit_failure_rolls_back_and_cleans_new_object(db, wsowner, monkeypatch):
+    """spec §4.8/§6: a REAL db.commit() failure inside the move transaction must roll back
+    (row keeps its old uri/tag, never deleted) AND best-effort remove the just-written
+    target object. Uses a recording MinIO stub to assert the new object is cleaned up.
+
+    Distinct from the add_task-failure case above: that fails BEFORE commit; this fails the
+    commit itself, which is the path spec §4.8 step (4) calls out explicitly.
+    """
+    w, u = wsowner
+    put_calls: list = []
+    removed: list = []
+
+    class _RecMinio:
+        def put_file(self, bucket, key, *a, **k): put_calls.append(key)
+        def remove_file(self, bucket, key, *a, **k): removed.append(key)
+        def remove_document_hierarchy(self, *a, **k): return None
+
+    monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", lambda *a, **k: _RecMinio())
+    monkeypatch.setattr("openrag.services.file_ingest.delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr("openrag.api.files_api.MinioStorage", lambda *a, **k: _RecMinio())
+    monkeypatch.setattr("openrag.api.files_api.delete_milvus_vectors_for_file", lambda *a, **k: [])
+
+    f0, _, _ = upsert_file_by_tag(
+        db, w, u.id, tag="report", target_path="/r.txt",
+        file_content=b"v1", content_type="text/plain", parser_type="txt", create_dirs=True,
+    )
+    # pre-create the parent so the move uses create_dirs=False (no internal commit before
+    # the helper's own commit), then make that commit fail.
+    file_ingest.ensure_directory_path(db, w, "/archive")
+
+    def _commit_boom():
+        raise RuntimeError("commit failed")
+    monkeypatch.setattr(db, "commit", _commit_boom)
+
+    with pytest.raises(RuntimeError):
+        upsert_file_by_tag(
+            db, w, u.id, tag="report", target_path="/archive/r2.txt",
+            file_content=b"v2", content_type="text/plain", parser_type="txt",  # create_dirs=False
+        )
+    db.expire_all()  # SELECT-only; no commit needed even with commit patched
+    row = db.query(File).filter(File.tag == "report", File.deleted_at.is_(None)).first()
+    assert row is not None and row.id == f0.id and row.uri == "/r.txt"  # rolled back, reachable
+    assert "/archive/r2.txt" in put_calls   # new object was written first
+    assert "/archive/r2.txt" in removed     # ...and best-effort removed after commit failure
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -664,12 +747,12 @@ def _move_replace_no_intermediate_commit(
     return existing, task, "moved"
 ```
 
-> `assert_no_pending_deleted_ancestor`、`ensure_directory_path`、`_assert_parent_directory_exists`、`MinioStorage`、`posixpath`、`TaskService`、`TaskStatus`、`SUPPORTED_PARSER_TYPES`、`MAX_FILE_SIZE`、`ALLOWED_MIME_TYPES`、`resolve_effective_mime_type` 均已在 `file_ingest.py` 定义/import；`DocumentChunk`、`ProcessingStatus`、`delete_milvus_vectors_for_file` 由本步骤新增 import。move 分支**不调用** `replace_file_content`（避免其多次 commit + 中途存储副作用造成的丢失窗口）；`file.id`/`tag` 在 move 后不变（同一文档，非新建）。
+> `assert_no_pending_deleted_ancestor`、`ensure_directory_path`、`_assert_parent_directory_exists`、`MinioStorage`、`posixpath`、`TaskService`、`TaskStatus`、`SUPPORTED_PARSER_TYPES`、`MAX_FILE_SIZE`、`ALLOWED_MIME_TYPES`、`resolve_effective_mime_type` 均已在 `file_ingest.py` 定义/import；`DocumentChunk`、`ProcessingStatus`、`delete_milvus_vectors_for_file` 由本步骤新增 import。move 分支**不调用** `replace_file_content`（避免其多次 commit + 中途存储副作用造成的丢失窗口）；`file.id`/`tag` 在 move 后不变（同一文档，非新建）。helper 内的 parser/size/mime 校验与 `upsert_file_by_tag` 入口的统一预校验重叠：wrapper 先行（保证三分支语义一致），helper 内校验作为独立调用时的防御保留，正常路径下两者结论一致——**保留即可，不要删**。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_file_ingest_upsert.py -v`
-Expected: PASS（9 passed：create + update + update-ignores-filename + move + 目标占用 409 + pending 祖先 409 + 缺父目录 400 + MinIO 写失败原文档可达 + DB 失败回滚原文档可达）。
+Expected: PASS（10 passed：create + update + update-ignores-filename + move + 目标占用 409 + pending 祖先 409 + 缺父目录 400 + MinIO 写失败原文档可达 + add_task 失败回滚 + 真实 commit 失败回滚并清新对象）。
 
 - [ ] **Step 5: 提交**
 
@@ -894,12 +977,54 @@ def test_upsert_treats_soft_deleted_tag_as_create(db, wsowner, stub_minio):
     assert action == "created"
     assert f1.id != f0.id and f1.tag == "reuse" and f1.uri == "/b.txt"
     assert db.query(File).filter(File.tag == "reuse", File.deleted_at.is_(None)).count() == 1
+
+
+def test_upsert_unsupported_mime_rejected_400(db, wsowner, stub_minio):
+    """Codex MF1 / spec §4.8: create branch must reject unsupported MIME with 400 (unified
+    pre-validation), NOT silently store the file like bare ingest_new_file does. No row,
+    no task created."""
+    w, u = wsowner
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        upsert_file_by_tag(
+            db, w, u.id, tag="t1", target_path="/a.bin",
+            file_content=b"x", content_type="application/x-unsupported",
+            parser_type="auto", create_dirs=True,
+        )
+    assert ei.value.status_code == 400
+    assert db.query(File).filter(File.tag == "t1").count() == 0  # nothing created
+    assert db.query(Task).count() == 0
+
+
+def test_upsert_create_into_pending_deleted_target_409(db, wsowner, stub_minio):
+    """Codex MF3 / spec §4.9: creating onto a uri whose row is soft-deleted (pending physical
+    cleanup) must 409 'pending deletion' — distinguishable from an active-path 'File already
+    exists'. The old soft-deleted row is untouched; no new File/Task."""
+    w, u = wsowner
+    from openrag.services.file_deletion import utcnow
+    from fastapi import HTTPException
+    dead = File(uri="/a.txt", name="a.txt", owner_id=u.id, workspace_id=w.id,
+                is_directory=False, size=1, deleted_at=utcnow(), tag=None)
+    db.add(dead); db.commit(); db.refresh(dead)
+    dead_id = dead.id
+
+    with pytest.raises(HTTPException) as ei:
+        upsert_file_by_tag(
+            db, w, u.id, tag="t1", target_path="/a.txt",
+            file_content=b"v", content_type="text/plain", parser_type="txt", create_dirs=True,
+        )
+    assert ei.value.status_code == 409
+    assert "pending deletion" in ei.value.detail.lower()
+    db.expire_all()
+    assert db.query(File).filter(File.id == dead_id).first().deleted_at is not None  # unchanged
+    assert db.query(File).filter(File.uri == "/a.txt", File.deleted_at.is_(None)).count() == 0
+    assert db.query(Task).count() == 0
 ```
 
 - [ ] **Step 2: 跑测试确认结果**
 
 Run: `& "E:\project\OpenRag\openrag\venv\Scripts\python.exe" -m pytest tests/test_file_ingest_upsert.py -v`
-Expected: 全 PASS（12 passed）。空/非法 tag 由 `_normalize_tag` + upsert 入口 400；软删 tag 因 `tag=NULL` 落入 create——**这些行为已由 Task 1–3 的实现覆盖，本任务仅加回归确认，无需改实现**。若 `test_upsert_empty_tag_rejected_400` 意外失败，核对 `upsert_file_by_tag` 入口的 `if normalized_tag is None: raise HTTPException(400, ...)`。
+Expected: 全 PASS（15 passed）。空/非法 tag 由 `_normalize_tag` + upsert 入口 400（既有行为，仅加回归）；unsupported MIME 400 与 pending-deletion target 409 由 **Task 1 的统一预校验 / create 分支 `assert_no_pending_deleted_ancestor(target_uri)` 提供**（Codex MF1/MF3）；软删 tag 因 `tag=NULL` 落入 create。若 `test_upsert_empty_tag_rejected_400` 意外失败，核对 `upsert_file_by_tag` 入口的 `if normalized_tag is None: raise HTTPException(400, ...)`。
 
 - [ ] **Step 3: 提交**
 
@@ -921,15 +1046,15 @@ Run:
 Expected: 全 PASS。
 
 必须确认以下端到端语义：
-- **合约 `target_path`**：uri 由 Form `target_path`（完整文件路径）决定，**与 multipart 文件名无关**（改上传文件名不会误触发 move）；缺 `target_path` → `422`。
+- **合约 `target_path`**：uri 由 Form `target_path`（完整文件路径）决定，**与 multipart 文件名无关**（改上传文件名不会误触发 move）；缺 `target_path` → `422`；`target_path` 无 basename（`/` 或目录）→ `400`。
 - **create**：tag 不存在 → `201`、`action="created"`，新行带 tag、落在 `target_path`、入队 `process_document`。
 - **update-in-place**：tag 存在且 `target_path` == 现有 uri → `200`、`action="updated"`，**同一行**内容替换、size/mime 刷新、重新入队；tag/uri 不变。
 - **move+replace**：tag 存在但 `target_path` != 现有 uri → `200`、`action="moved"`，**同一行（file.id/tag 不变）**搬到新 uri（name 随之改）、内容替换、旧 uri 不再有 active 行；提交成功后旧 uri 源对象/层级/向量已 best-effort 清理。
-- **move 失败语义**（spec §4.8/§6）：MinIO 写新对象失败 → DB 不变；move 事务失败 → 回滚到旧 uri；两种情况下**绝不删行/释放 tag**，原 tag 仍解析到可达的原文档。
+- **move 失败语义**（spec §4.8/§6）：① MinIO 写新对象失败 → DB 不变；② `add_task` 失败（commit 前）→ 回滚；③ **真实 `db.commit()` 失败** → 回滚到旧 uri 并 best-effort 删刚写的新对象；三种情况下**绝不删行/释放 tag**，原 tag 仍解析到可达的原文档。
 - **幂等键唯一性**：任一分支后，`(workspace, tag, deleted_at IS NULL)` 始终恰好 1 行。
-- **冲突**：目标 uri 被另一 active 文件占用 → `409`；搬入软删子树（pending 祖先，含 target_uri 自身）→ `409`；create 撞 uri → `409`（`ingest_new_file` 既有分类）。
+- **冲突区分**（spec §4.9）：目标 uri 被另一 **active** 文件占用 → `409 File already exists`；目标 uri/祖先有**软删**行（pending cleanup）→ `409 pending deletion`（create 分支用完整 `target_uri` 显式守卫，move 分支在校验段守卫）。
+- **统一预校验**（spec §4.8，Codex MF1，**三分支一致**）：空/非法 tag → `400`；超 `MAX_FILE_SIZE` → `413`；非法 `parser_type` → `400`；**不支持 MIME → `400` 且不建 `File`/不建 `Task`**（含 create 分支——补齐 `ingest_new_file` 的「照样落库、不报 400」缺口）。
 - **父目录语义**：move 到父目录不存在的路径，`create_dirs=False` → `400`，`create_dirs=True` 自动建父目录后成功。
-- **校验继承**：空/非法 tag → `400`；超 `MAX_FILE_SIZE` → `413`；非法 `parser_type`/不支持 MIME → `400`。
 - **权限**：read-only service token → `403`。
 - **软删 tag 复用**：tag 被软删释放后，upsert 走 create 分支重新铸造。
 
@@ -945,9 +1070,9 @@ Phase 3 完成。三阶段（Phase 1 tag 唯一性 / Phase 2 软删除 / Phase 3
 
 ## Self-Review（计划自查）
 
-- **Spec 覆盖**：以 `target_path` 为合约（spec §4.8/§8.5#10，Task 1/4）；三分支 create/update/move（Task 1/2/3）；专用单事务 move helper 的失败语义（spec §4.8 L151-157，Task 3）；`create_dirs=False` 父目录校验（spec §4.9，Task 3）；端点按 `action` 映射 201/200（spec §4.8，Task 4）；边界（tag 校验、软删复用）Task 5；全量回归 Task 6。✅
-- **复用而非重造（DRY/YAGNI）**：create 复用 `ingest_new_file`、update 复用 `replace_file_content`；**move 用专用 `_move_replace_no_intermediate_commit`，不串联 `replace_file_content`/`move_file`**（spec 明令，避免多次 commit 的丢失窗口）；写守卫复用 Phase 2 `assert_no_pending_deleted_ancestor`；无新列/无新迁移。✅
-- **占位符扫描**：每个实现步骤含完整代码与精确锚点；每个测试步骤含完整测试代码与可跑命令；Task 5 显式标注「多为验证既有行为、按需改实现」。无 TBD/TODO。✅
+- **Spec 覆盖**：以 `target_path` 为合约（spec §4.8/§8.5#10，Task 1/4）；**分支前统一预校验** parser/size/mime + basename 非空（spec §4.8，Codex MF1，Task 1）；create 进 ingest 前用完整 `target_uri` 调 pending-deletion 守卫（spec §4.9，Codex MF3，Task 1）；三分支 create/update/move（Task 1/2/3）；专用单事务 move helper 的失败语义含**真实 commit 失败**（spec §4.8 L151-157，Codex MF2，Task 3）；`create_dirs=False` 父目录校验（spec §4.9，Task 3）；端点按 `action` 映射 201/200（spec §4.8，Task 4）；边界（tag/MIME/pending/软删复用）Task 5；全量回归 Task 6。✅
+- **复用而非重造（DRY/YAGNI）**：create 复用 `ingest_new_file`、update 复用 `replace_file_content`；**move 用专用 `_move_replace_no_intermediate_commit`，不串联 `replace_file_content`/`move_file`**（spec 明令，避免多次 commit 的丢失窗口）；写守卫复用 Phase 2 `assert_no_pending_deleted_ancestor`；无新列/无新迁移。move helper 内的 parser/size/mime 校验与入口统一预校验**有意重叠**（wrapper 先行保一致、helper 自校验保独立调用安全，结论一致）——保留，不删。✅
+- **占位符扫描**：每个实现步骤含完整代码与精确锚点；每个测试步骤含完整测试代码与可跑命令。Task 5 中：空/非法 tag、软删 tag 复用为既有行为回归；unsupported MIME 400、pending-deletion target 409 是 **Task 1 新增逻辑（MF1/MF3）的回归**，非「按需改实现」。无 TBD/TODO。✅
 - **类型/签名一致性**：`upsert_file_by_tag(db, workspace, owner_user_id, *, tag, target_path, file_content, content_type, parser_type="auto", create_dirs=False) -> Tuple[FileModel, Optional[Task], str]` 在 Task 1 定义、Task 2/3 续写、Task 4 端点调用三处一致（**无** `parent_logical_path`/`upload_filename`）；`action ∈ {"created","updated","moved"}` 与端点 201/200 映射、响应体 `payload["action"]`、测试断言四处一致；`_move_replace_no_intermediate_commit`、`_active_tagged_file` 签名与调用一致。✅
 - **承接 Phase 1/2**：tag 查重依赖软删行 `tag=NULL`（Phase 2 保证）；`deleted_at IS NULL` 活跃判定贯穿；`replace_file_content` 仍是 `PUT by-path` 与本端点 update 分支共用。✅
 - **已知边界/精确点**：move 分支沿用 `move_file` 先例不改 `parent_id`（uri 为真相源）；move helper **先写新对象→单事务改行+删 chunk+`add_task`→单 commit→失败回滚并删新对象→成功后清旧对象/层级/向量**，绝不删行/释放 tag，故任一步失败原 tag 与原文档至少一者可达；`target_path` 始终为完整文件路径，create 分支以其 basename 作文件名。
@@ -1023,3 +1148,40 @@ spec 写的是返回 `action`，表格值为 `created` / `updated` / `moved`；�
 ### 范围判断
 
 计划触达文件范围本身是收敛的：主要是 `file_ingest.py`、`service_api.py` 和对应测试，不需要新迁移，也不需要扩到前端或检索链路。真正需要调整的是 Phase 3 的目标路径 API 合同和 move+replace 的服务层 helper 边界。修正以上 P1/P2 后，主体方案可以进入执行。
+
+---
+
+## Codex 二次审核补充（2026-06-30，来自 Codex）
+
+> **【已核实并全部采纳，2026-06-30】** 三个必补点 + 非阻断建议#1 均对照真实源码（`file_ingest.py` `ingest_new_file` L536-652、`assert_no_pending_deleted_ancestor` L383-409）核实属实，已改入正文：
+> - **MF1**（create 未继承 MIME 校验）→ `upsert_file_by_tag` 入口加**分支前统一预校验**（parser/size/mime），三分支一致；create 仍复用 `ingest_new_file`。Task 5 加「unsupported MIME → 400、不建 File/Task」回归。
+> - **MF2**（commit 失败回归不真实）→ 保留 `add_task` 失败用例，Task 3 **新增真实 `db.commit()` 失败用例**（记录型 MinIO stub 断言新对象被 best-effort 删除）。
+> - **MF3**（create 未用完整 target_uri 命中 pending deletion）→ create 分支进 `ingest_new_file` 前用**完整 `target_uri`** 调 `assert_no_pending_deleted_ancestor`；Task 5 加「软删目标 → 409 pending deletion、旧软删行不动、不建 File/Task」回归。
+> - **非阻断#1**（`target_path="/"`）→ 入口加 basename 非空校验（无 basename → 400）。**非阻断#2（并发 staging key/锁）按 Codex「现阶段可不阻断」不做**，仅留作已知风险。
+> 下方为审查原文，保留供追溯；执行以正文为准。
+
+结论：Claude Code 对上一轮 P1/P2 的修订方向正确，`target_path` 合约、`action` 返回字段、专用 move+replace helper、`create_dirs=False` 父目录校验都已经落入正文。当前不建议再推翻主方案；但执行前仍有三处会影响 spec 兑现或测试可信度的必补点。
+
+### 必须补齐
+
+1. **create 分支仍未显式继承 spec 的 MIME 校验语义。**
+   - 现状：正文 Task 6 写了「不支持 MIME -> 400」，move helper 也会用 `resolve_effective_mime_type(...)` + `ALLOWED_MIME_TYPES` 返回 400；但 create 分支直接复用 `ingest_new_file(...)`。当前真实 `ingest_new_file` 对不支持 MIME 的行为是「照样落库存储，只是不创建解析任务」，并不会返回 400。
+   - 风险：同一个 `upsert-by-tag` 端点会出现 create 分支允许 unsupported MIME、update/move 分支拒绝 unsupported MIME 的不一致；同时也不符合 spec §4.8 「先校验 tag/target_path/parser/文件大小/mime」的描述。
+   - 建议实现：在 `upsert_file_by_tag()` 计算 `target_uri` 后、进入三分支前，使用 `posixpath.basename(target_uri)` 做统一预校验：`parser_type in SUPPORTED_PARSER_TYPES`、`len(file_content) <= MAX_FILE_SIZE`、`effective_mime = resolve_effective_mime_type(content_type, basename, parser_type)` 且 `effective_mime in ALLOWED_MIME_TYPES`。这样 create/update/move 三分支语义一致；create 分支仍可复用 `ingest_new_file(...)`。
+   - 建议回归：新增「tag 不存在 + unsupported MIME」返回 400，且不创建 `File` 行、不创建 `Task`；保留超 `MAX_FILE_SIZE` 与非法 `parser_type` 的边界。
+
+2. **move 失败语义的“DB commit 失败”回归需要测真正的 commit 失败。**
+   - 现状：`test_upsert_move_db_failure_rolls_back_and_keeps_old_reachable` 通过 monkeypatch `TaskService.add_task` 抛错触发 rollback。这个用例能覆盖「任务创建失败前回滚」，但还没有证明 `db.commit()` 本身失败时也能 rollback，并 best-effort 清理刚写入的新对象。
+   - 风险：spec §4.8/§6 明确要求「提交失败 rollback，并清理刚写入的 target_uri 对象；旧 tag/旧文档仍可达」。如果只测 `add_task` 抛错，执行者可能漏掉 commit 失败路径。
+   - 建议实现：保留当前 `add_task` 失败用例，同时补一个真实 commit 失败用例：完成 seed 与 `ensure_directory_path(...)` 后，monkeypatch 当前 `db.commit` 在 move helper 内抛 `RuntimeError("commit failed")`；断言 `File` 行仍为旧 `uri`、`tag` 未释放、没有 active 目标行；若 stub MinIO 可记录调用，再断言刚写入的 `target_uri` 被 best-effort `remove_file` 清理。
+
+3. **create 分支需要用完整 `target_uri` 命中 pending deletion，而不是只依赖 `ingest_new_file` 的通用 URI 重复。**
+   - 现状：正文第 75 行说明 `assert_no_pending_deleted_ancestor` 会把 `target_uri` 自身纳入 candidates，因此软删目标 uri 已能命中 pending deletion；但 create 分支实际把 `dirname(target_uri)` / `basename(target_uri)` 交给 `ingest_new_file(...)`。当前真实 `ingest_new_file` 只对父路径调用 `assert_no_pending_deleted_ancestor(...)`，随后目标 uri 自身若已有软删行，会落到通用 `existing_file` 查重并返回 `File already exists at ...`。
+   - 风险：状态码仍是 409，但错误语义不符合 spec §4.9/§4.8 中「同 tag + 同路径立即重建返回 409 pending deletion」和「URI 查重命中软删行需标注 pending deletion」的约定；调用方无法区分 active 路径占用和旧文件正在物理删除。
+   - 建议实现：在 `upsert_file_by_tag()` 计算 `target_uri` 并完成统一预校验后，create 分支进入 `ingest_new_file(...)` 前先调用 `assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)`，或等价地显式查询同 workspace、同 uri、`deleted_at IS NOT NULL` 的行并返回 `409 pending deletion`。如果不想改变裸 `POST upload` 的既有文案，就把这层检查只放在 upsert wrapper 内。
+   - 建议回归：软删 `/a.txt`（`deleted_at != None`、`tag=None`）后，`upsert-by-tag(tag=old, target_path="/a.txt")` 返回 `409 pending deletion`；旧软删行不被改动，不创建新的 `File` 或 `Task`。
+
+### 非阻断建议
+
+- `target_path` 是完整文件路径，建议顺手拒绝 `target_path="/"` 或 basename 为空的输入并返回 400，避免把根路径当作文件目标。这个是低成本防御，不影响主方案进入执行。
+- 并发下两个请求同时争抢同一 `target_uri` 时，当前设计仍可能受既有「先写对象、后提交 DB」模式影响；这是更大的并发一致性议题，现阶段可不阻断，但如果后续要强化，需要引入 staging key 或路径级锁。
