@@ -296,3 +296,87 @@ def test_upsert_move_commit_failure_rolls_back_and_cleans_new_object(db, wsowner
     assert row is not None and row.id == f0.id and row.uri == "/r.txt"  # rolled back, reachable
     assert "/archive/r2.txt" in put_calls   # new object was written first
     assert "/archive/r2.txt" in removed     # ...and best-effort removed after commit failure
+
+
+def test_upsert_empty_tag_rejected_400(db, wsowner, stub_minio):
+    w, u = wsowner
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        upsert_file_by_tag(
+            db, w, u.id, tag="   ", target_path="/a.txt",
+            file_content=b"x", content_type="text/plain", parser_type="txt", create_dirs=True,
+        )
+    assert ei.value.status_code == 400
+
+
+def test_upsert_invalid_tag_charset_rejected_400(db, wsowner, stub_minio):
+    w, u = wsowner
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        upsert_file_by_tag(
+            db, w, u.id, tag="bad/tag", target_path="/a.txt",
+            file_content=b"x", content_type="text/plain", parser_type="txt", create_dirs=True,
+        )
+    assert ei.value.status_code == 400
+
+
+def test_upsert_treats_soft_deleted_tag_as_create(db, wsowner, stub_minio):
+    """A soft-deleted row has tag=NULL, so its old tag is free -> upsert creates anew."""
+    w, u = wsowner
+    f0, _, _ = upsert_file_by_tag(
+        db, w, u.id, tag="reuse", target_path="/a.txt",
+        file_content=b"v1", content_type="text/plain", parser_type="txt", create_dirs=True,
+    )
+    from openrag.services.file_deletion import utcnow
+    f0.deleted_at = utcnow(); f0.tag = None  # simulate Phase 2 soft delete
+    db.commit()
+
+    f1, _, action = upsert_file_by_tag(
+        db, w, u.id, tag="reuse", target_path="/b.txt",
+        file_content=b"v2", content_type="text/plain", parser_type="txt", create_dirs=True,
+    )
+    assert action == "created"
+    assert f1.id != f0.id and f1.tag == "reuse" and f1.uri == "/b.txt"
+    assert db.query(File).filter(File.tag == "reuse", File.deleted_at.is_(None)).count() == 1
+
+
+def test_upsert_unsupported_mime_rejected_400(db, wsowner, stub_minio):
+    """Codex MF1 / spec §4.8: create branch must reject unsupported MIME with 400 (unified
+    pre-validation), NOT silently store the file like bare ingest_new_file does. No row,
+    no task created."""
+    w, u = wsowner
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        upsert_file_by_tag(
+            db, w, u.id, tag="t1", target_path="/a.bin",
+            file_content=b"x", content_type="application/x-unsupported",
+            parser_type="auto", create_dirs=True,
+        )
+    assert ei.value.status_code == 400
+    assert db.query(File).filter(File.tag == "t1").count() == 0  # nothing created
+    assert db.query(Task).count() == 0
+
+
+def test_upsert_create_into_pending_deleted_target_409(db, wsowner, stub_minio):
+    """Codex MF3 / spec §4.9: creating onto a uri whose row is soft-deleted (pending physical
+    cleanup) must 409 'pending deletion' — distinguishable from an active-path 'File already
+    exists'. The old soft-deleted row is untouched; no new File/Task."""
+    w, u = wsowner
+    from openrag.services.file_deletion import utcnow
+    from fastapi import HTTPException
+    dead = File(uri="/a.txt", name="a.txt", owner_id=u.id, workspace_id=w.id,
+                is_directory=False, size=1, deleted_at=utcnow(), tag=None)
+    db.add(dead); db.commit(); db.refresh(dead)
+    dead_id = dead.id
+
+    with pytest.raises(HTTPException) as ei:
+        upsert_file_by_tag(
+            db, w, u.id, tag="t1", target_path="/a.txt",
+            file_content=b"v", content_type="text/plain", parser_type="txt", create_dirs=True,
+        )
+    assert ei.value.status_code == 409
+    assert "pending deletion" in ei.value.detail.lower()
+    db.expire_all()
+    assert db.query(File).filter(File.id == dead_id).first().deleted_at is not None  # unchanged
+    assert db.query(File).filter(File.uri == "/a.txt", File.deleted_at.is_(None)).count() == 0
+    assert db.query(Task).count() == 0
