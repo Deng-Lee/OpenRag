@@ -13,7 +13,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
-from openrag.models.file import File as FileModel
+from openrag.models.document_chunk import DocumentChunk
+from openrag.models.file import File as FileModel, ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
 from openrag.services.file_deletion import delete_milvus_vectors_for_file
@@ -776,6 +777,110 @@ def _active_tagged_file(db: Session, workspace_id: int, tag: str) -> Optional[Fi
     )
 
 
+def _move_replace_no_intermediate_commit(
+    db: Session,
+    workspace: Workspace,
+    acting_user_id: int,
+    file: FileModel,
+    target_uri: str,
+    *,
+    new_content: bytes,
+    content_type: Optional[str],
+    parser_type: str = "auto",
+) -> Optional[Task]:
+    """Same-row move+replace with NO intermediate commit (spec §4.8).
+
+    Unlike chaining move_file + replace_file_content (each commits and touches storage
+    several times), this keeps the failure window minimal: the File row is NEVER deleted
+    and the tag is NEVER released, so on any failure the original tag still resolves to a
+    reachable document. Sequence:
+      1. validate parser/size/mime up front (no writes yet);
+      2. write the NEW content to ``target_uri`` (if this fails, the DB is untouched);
+      3. in ONE DB transaction: repoint the SAME row's uri/name/size/mime_type/parser_type/
+         processing fields, delete its DocumentChunk rows, enqueue process_document via the
+         non-committing add_task, then a single commit;
+      4. on commit failure: rollback + best-effort delete the just-written new object;
+      5. on commit success: best-effort cleanup of the OLD uri's object/hierarchy/vectors.
+    """
+    if parser_type not in SUPPORTED_PARSER_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+        )
+    file_size = len(new_content)
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
+        )
+    effective_mime = resolve_effective_mime_type(
+        content_type or file.mime_type, posixpath.basename(target_uri), parser_type
+    )
+    if effective_mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type {effective_mime} is not supported for processing",
+        )
+
+    old_uri = file.uri
+    minio_storage = MinioStorage()
+    # (2) write NEW object first; if this raises, the DB is still untouched.
+    minio_storage.put_file(workspace.slug, target_uri, new_content, content_type=effective_mime)
+
+    # (3) single DB transaction: repoint the same row + clear chunks + enqueue, one commit.
+    try:
+        file.uri = target_uri
+        file.name = posixpath.basename(target_uri)
+        file.size = file_size
+        file.mime_type = effective_mime
+        file.parser_type = parser_type if parser_type != "auto" else None
+        file.processing_status = ProcessingStatus.pending
+        file.processing_error = None
+        file.l0_path = None
+        file.l1_path = None
+        file.l2_path = None
+        file.l0_vector_id = None
+        file.total_chunks = 0
+        file.total_tokens = 0
+        db.query(DocumentChunk).filter(DocumentChunk.file_id == file.id).delete(
+            synchronize_session=False
+        )
+        task = TaskService(db).add_task(
+            workspace_id=file.workspace_id,
+            user_id=acting_user_id,
+            file_id=file.id,
+            task_type="process_document",
+            queue="normal",
+            priority=5,
+            max_retries=3,
+            status=TaskStatus.PENDING,
+        )
+        db.commit()
+        db.refresh(file)
+    except Exception:
+        db.rollback()  # (4) row reverts to old uri/tag; never deleted, tag never released
+        try:
+            minio_storage.remove_file(workspace.slug, target_uri)  # best-effort: drop just-written object
+        except Exception:
+            pass
+        raise
+
+    # (5) commit succeeded -> best-effort cleanup of the OLD uri's storage + vectors.
+    try:
+        minio_storage.remove_file(workspace.slug, old_uri)
+    except Exception:
+        pass
+    try:
+        minio_storage.remove_document_hierarchy(workspace.slug, old_uri)
+    except Exception:
+        pass
+    try:
+        delete_milvus_vectors_for_file(file.id)
+    except Exception:
+        pass
+    return task
+
+
 def upsert_file_by_tag(
     db: Session,
     workspace: Workspace,
@@ -873,4 +978,36 @@ def upsert_file_by_tag(
         db.refresh(existing)
         return existing, task, "updated"
 
-    raise NotImplementedError  # move+replace branch added in Task 3
+    # existing.uri != target_uri -> same-row move + replace (no intermediate commit).
+    assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)
+    occupied = (
+        db.query(FileModel)
+        .filter(
+            FileModel.workspace_id == workspace.id,
+            FileModel.uri == target_uri,
+            FileModel.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if occupied is not None and occupied.id != existing.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Target path already occupied by another document: {target_uri}",
+        )
+    parent = posixpath.dirname(target_uri) or "/"
+    if create_dirs:
+        ensure_directory_path(db, workspace, parent)
+    else:
+        _assert_parent_directory_exists(db, workspace.id, parent)
+    task = _move_replace_no_intermediate_commit(
+        db,
+        workspace,
+        owner_user_id,
+        existing,
+        target_uri,
+        new_content=file_content,
+        content_type=content_type,
+        parser_type=parser_type,
+    )
+    db.refresh(existing)
+    return existing, task, "moved"
