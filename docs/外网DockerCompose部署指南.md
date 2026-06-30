@@ -90,12 +90,13 @@ ssh-ok
 ```powershell
 git status --short
 
+$EnvFile = "docker\.env.external-192.168.100.33"
+
 $RequiredFiles = @(
   "docker/docker-compose.prod.yml",
   "docker/Dockerfile.api",
   "docker/Dockerfile.worker",
   "docker/Dockerfile.web",
-  "docker/.env",
   "skills/deploy-openrag-server/scripts/package-openrag-release.ps1"
 )
 
@@ -103,6 +104,9 @@ foreach ($path in $RequiredFiles) {
   if (!(Test-Path $path)) {
     throw "Missing required file: $path"
   }
+}
+if (!(Test-Path $EnvFile)) {
+  throw "Missing required env file: $EnvFile"
 }
 
 $RequiredEnvKeys = @(
@@ -114,11 +118,13 @@ $RequiredEnvKeys = @(
   "OPENAI_BASE_URL",
   "EMBEDDING_MODEL",
   "EMBEDDING_DIMENSION",
-  "WEB_PORT"
+  "WEB_PORT",
+  "PREVIEW_PUBLIC_WEB_BASE_URL",
+  "PREVIEW_FRAME_ANCESTORS"
 )
 
 $envMap = @{}
-Get-Content -Encoding utf8 docker\.env |
+Get-Content -Encoding utf8 $EnvFile |
   Where-Object { $_ -match '^\s*[A-Za-z_][A-Za-z0-9_]*=' } |
   ForEach-Object {
     $parts = $_ -split '=', 2
@@ -135,7 +141,7 @@ foreach ($key in $RequiredEnvKeys) {
   }
   "{0}={1}" -f $key, $status
   if ($status -ne "SET") {
-    throw "docker/.env key is not ready: $key"
+    throw "$EnvFile key is not ready: $key"
   }
 }
 ```
@@ -147,11 +153,11 @@ foreach ($key in $RequiredEnvKeys) {
 
 ### 验证
 
-如果 `docker/.env` 不存在，先执行：
+如果外网环境文件不存在，先执行：
 
 ```powershell
-Copy-Item docker\.env.example docker\.env
-notepad docker\.env
+Copy-Item docker\.env.external-192.168.100.33.example $EnvFile
+notepad $EnvFile
 ```
 
 至少修改这些值：
@@ -166,6 +172,8 @@ OPENAI_BASE_URL=<模型网关或 OpenAI 兼容接口地址>
 EMBEDDING_MODEL=<实际 embedding 模型>
 EMBEDDING_DIMENSION=<实际 embedding 维度>
 WEB_PORT=80
+PREVIEW_PUBLIC_WEB_BASE_URL=http://192.168.100.33
+PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.32:2026 http://192.168.100.33:2026"
 ELASTICSEARCH__ENABLED=true
 ELASTICSEARCH__HOSTS=http://elasticsearch:9200
 ```
@@ -185,9 +193,9 @@ SET
 ```powershell
 docker --version
 docker compose version
-docker compose -p openrag --env-file docker\.env -f docker\docker-compose.prod.yml config --quiet
-docker compose -p openrag --env-file docker\.env -f docker\docker-compose.prod.yml config --services
-docker compose -p openrag --env-file docker\.env -f docker\docker-compose.prod.yml config --images
+docker compose -p openrag --env-file $EnvFile -f docker\docker-compose.prod.yml config --quiet
+docker compose -p openrag --env-file $EnvFile -f docker\docker-compose.prod.yml config --services
+docker compose -p openrag --env-file $EnvFile -f docker\docker-compose.prod.yml config --images
 ```
 
 ### 预期
@@ -221,7 +229,7 @@ docker.elastic.co/elasticsearch/elasticsearch:8.12.2
 
 ### 验证预期
 
-如果 `config --quiet` 报错，先修复 Compose 或 `.env`，不要继续打包。
+如果 `config --quiet` 报错，先修复 Compose 或 `$EnvFile`，不要继续打包。
 `trace-dashboard` 是可选 profile 服务，默认检查和默认部署不应包含它。
 
 ## 4. 本地打包脚本
@@ -232,7 +240,7 @@ docker.elastic.co/elasticsearch/elasticsearch:8.12.2
 
 - 每次代码变更时，重新打源码包和应用镜像包。
 - 第三方镜像包单独生成，只有首次部署、服务器缺镜像、或第三方镜像版本变更时才重新上传。
-- `.env` 不进入源码包和镜像包；配置变更只需要重新上传 `docker/.env` 到服务器的 `shared/openrag.env`。
+- `.env` 不进入源码包和镜像包；外网配置变更只需要重新上传 `$EnvFile` 到服务器的 `shared/openrag.env`。
 - `trace-dashboard` 是可选内部观测面板，不属于默认部署链路。
 
 ### 脚本内容
@@ -422,7 +430,7 @@ scp "artifacts\openrag-$Version-src.zip.sha256" "$SshTarget`:$ServerHome/artifac
 scp "artifacts\openrag-$Version-manifest.json" "$SshTarget`:$ServerHome/artifacts/"
 scp "artifacts\openrag-app-images-$Version.tar" "$SshTarget`:$ServerHome/artifacts/"
 scp "artifacts\openrag-app-images-$Version.tar.sha256" "$SshTarget`:$ServerHome/artifacts/"
-scp "docker\.env" "$SshTarget`:$ServerHome/shared/openrag.env"
+scp $EnvFile "$SshTarget`:$ServerHome/shared/openrag.env"
 ```
 
 首次部署或第三方镜像版本变更时，再额外上传：
@@ -430,6 +438,18 @@ scp "docker\.env" "$SshTarget`:$ServerHome/shared/openrag.env"
 ```powershell
 scp "artifacts\openrag-third-party-images.tar" "$SshTarget`:$ServerHome/artifacts/"
 scp "artifacts\openrag-third-party-images.tar.sha256" "$SshTarget`:$ServerHome/artifacts/"
+```
+
+如果使用发布准备脚本执行第 1 到第 7 步，外网发布时显式传入同一个环境文件：
+
+```powershell
+& ".\skills\openrag-docker-compose-release-prep\scripts\prepare-openrag-compose-release.ps1" `
+  -Version $Version `
+  -SshTarget $SshTarget `
+  -ServerHome $ServerHome `
+  -ApiPort $ApiPort `
+  -WebPort $WebPort `
+  -EnvFile $EnvFile
 ```
 
 ### 预期

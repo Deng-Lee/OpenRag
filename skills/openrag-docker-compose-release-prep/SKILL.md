@@ -25,6 +25,7 @@ description: 辅助从当前 OpenRag 项目工作区准备并上传外网 Docker
 - `ServerHome`: `/home/guozhi/Documents/OpenRag`
 - `ApiPort`: `18001`
 - `WebPort`: `80`
+- `EnvFile`: `docker\.env`
 
 ## 执行规则
 
@@ -37,7 +38,7 @@ description: 辅助从当前 OpenRag 项目工作区准备并上传外网 Docker
 - 默认重新构建应用镜像。只有用户明确要求复用本地现有镜像时，才添加 `-SkipImageBuild`。
 - 默认复用已有第三方镜像包，不自动重新构建第三方镜像。只有用户明确要求重新生成第三方镜像包时，才添加 `-ForceThirdPartyImages`。
 - 如果本地已存在 `artifacts/openrag-third-party-images.tar` 和对应 sha256 文件，默认一并上传；如果不存在，则跳过第三方镜像包上传。
-- 默认会把 `docker/.env` 上传覆盖服务器的 `shared/openrag.env`。当本次为仅代码变更、`.env` 未改时，添加 `-SkipEnvUpload` 跳过该上传，保留服务器现有运行配置，避免误覆盖生产密钥。
+- 默认会把 `docker/.env` 上传覆盖服务器的 `shared/openrag.env`。外网 192.168.100.33 发布应使用 `-EnvFile docker\.env.external-192.168.100.33`。当本次为仅代码变更、`.env` 未改时，添加 `-SkipEnvUpload` 跳过该上传，保留服务器现有运行配置，避免误覆盖生产密钥。
 
 ## 工作流
 
@@ -50,7 +51,8 @@ description: 辅助从当前 OpenRag 项目工作区准备并上传外网 Docker
   -SshTarget "guozhi@192.168.100.33" `
   -ServerHome "/home/guozhi/Documents/OpenRag" `
   -ApiPort "18001" `
-  -WebPort "80"
+  -WebPort "80" `
+  -EnvFile "docker\.env.external-192.168.100.33"
 ```
 
 3. 如果用户明确要求复用现有应用镜像，添加 `-SkipImageBuild`。
@@ -68,7 +70,7 @@ description: 辅助从当前 OpenRag 项目工作区准备并上传外网 Docker
 - `openrag-api`、`openrag-web`、`openrag-task-worker` 镜像存在。
 - API 镜像包含 `/app/alembic.ini` 和 `/app/alembic`。
 - worker 镜像包含必需 DeepDoc 离线模型文件。
-- 应用制品和 `docker/.env` 已上传到服务器；如果本地已有第三方镜像包，也已一并上传。
+- 应用制品和指定 `EnvFile` 已上传到服务器；如果本地已有第三方镜像包，也已一并上传。
 - 远端校验输出 `upload-ok`。
 
 结束时说明上传后的服务器路径：`<ServerHome>/artifacts` 和 `<ServerHome>/shared/openrag.env`。
