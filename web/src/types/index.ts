@@ -46,6 +46,7 @@ export interface File {
   processing_status?: string | null;
   simple_status?: SimpleStatus | null;
   document_type?: DocumentType;
+  tag?: string | null;
   error_message?: string | null;
 }
 

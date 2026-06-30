@@ -6,6 +6,7 @@
   [string]$ServerHome = "/home/guozhi/Documents/OpenRag",
   [string]$ApiPort = "18001",
   [string]$WebPort = "80",
+  [string]$EnvFile = "docker\.env",
 
   [switch]$SkipImageBuild,
   [switch]$ForceThirdPartyImages,
@@ -55,6 +56,7 @@ Write-Host "SshTarget=$SshTarget"
 Write-Host "ServerHome=$ServerHome"
 Write-Host "ApiPort=$ApiPort"
 Write-Host "WebPort=$WebPort"
+Write-Host "EnvFile=$EnvFile"
 
 Write-Host "[1/8] 检查本地仓库文件和环境变量"
 git status --short
@@ -64,7 +66,6 @@ $RequiredFiles = @(
   "docker/Dockerfile.api",
   "docker/Dockerfile.worker",
   "docker/Dockerfile.web",
-  "docker/.env",
   "scripts/build-openrag-compose-release.ps1",
   "skills/deploy-openrag-server/scripts/package-openrag-release.ps1"
 )
@@ -72,6 +73,7 @@ $RequiredFiles = @(
 foreach ($path in $RequiredFiles) {
   Require-File $path
 }
+Require-File $EnvFile
 
 $RequiredEnvKeys = @(
   "POSTGRES_PASSWORD",
@@ -86,7 +88,7 @@ $RequiredEnvKeys = @(
 )
 
 $envMap = @{}
-Get-Content -Encoding utf8 docker\.env |
+Get-Content -Encoding utf8 $EnvFile |
   Where-Object { $_ -match '^\s*[A-Za-z_][A-Za-z0-9_]*=' } |
   ForEach-Object {
     $parts = $_ -split '=', 2
@@ -103,7 +105,7 @@ foreach ($key in $RequiredEnvKeys) {
   }
   "{0}={1}" -f $key, $status
   if ($status -ne "SET") {
-    throw "docker/.env 配置未就绪: $key"
+    throw "$EnvFile 配置未就绪: $key"
   }
 }
 
@@ -117,9 +119,9 @@ Invoke-Native ssh @SshOptions $SshTarget "echo ssh-ok && uname -a"
 Write-Host "[3/8] 校验 Docker Compose 配置"
 Invoke-Native docker "--version"
 Invoke-Native docker "compose" "version"
-Invoke-Native docker "compose" "-p" "openrag" "--env-file" "docker\.env" "-f" "docker\docker-compose.prod.yml" "config" "--quiet"
+Invoke-Native docker "compose" "-p" "openrag" "--env-file" $EnvFile "-f" "docker\docker-compose.prod.yml" "config" "--quiet"
 
-$services = & docker compose -p openrag --env-file docker\.env -f docker\docker-compose.prod.yml config --services
+$services = & docker compose -p openrag --env-file $EnvFile -f docker\docker-compose.prod.yml config --services
 if ($LASTEXITCODE -ne 0) {
   throw "docker compose config --services 执行失败"
 }
@@ -131,7 +133,7 @@ foreach ($service in $requiredServices) {
 }
 $services
 
-$images = & docker compose -p openrag --env-file docker\.env -f docker\docker-compose.prod.yml config --images
+$images = & docker compose -p openrag --env-file $EnvFile -f docker\docker-compose.prod.yml config --images
 if ($LASTEXITCODE -ne 0) {
   throw "docker compose config --images 执行失败"
 }
@@ -225,9 +227,9 @@ if (!$NoUploadThirdPartyImages -and (Test-Path $thirdPartyTar) -and (Test-Path $
 }
 
 if (!$SkipEnvUpload) {
-  Invoke-Native scp @ScpOptions "docker\.env" "$SshTarget`:$ServerHome/shared/openrag.env"
+  Invoke-Native scp @ScpOptions $EnvFile "$SshTarget`:$ServerHome/shared/openrag.env"
 } else {
-  Write-Host "跳过 docker/.env 上传：保留服务器现有 shared/openrag.env（适用于仅代码变更、env 未改的更新）。"
+  Write-Host "跳过 $EnvFile 上传：保留服务器现有 shared/openrag.env（适用于仅代码变更、env 未改的更新）。"
 }
 
 Write-Host "[8/8] 校验远端上传结果"

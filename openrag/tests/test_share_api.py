@@ -14,6 +14,7 @@ from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.file import File
 from openrag.models.share import ShareLink
+from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.security import hash_password
 
 
@@ -88,12 +89,25 @@ def other_user(db):
 
 
 @pytest.fixture
-def test_file(db, test_user):
+def test_workspace(db, test_user):
+    """Create test workspace"""
+    workspace = Workspace(name="Test Workspace", slug="test-workspace", owner_id=test_user.id)
+    db.add(workspace)
+    db.commit()
+    db.refresh(workspace)
+    db.add(WorkspaceMember(workspace_id=workspace.id, user_id=test_user.id, role="read"))
+    db.commit()
+    return workspace
+
+
+@pytest.fixture
+def test_file(db, test_user, test_workspace):
     """Create test file"""
     file = File(
         uri="/test/file.txt",
         name="file.txt",
         owner_id=test_user.id,
+        workspace_id=test_workspace.id,
         is_directory=False,
         size=1024,
         mime_type="text/plain"

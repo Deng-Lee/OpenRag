@@ -17,7 +17,7 @@ class TaskService:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_task(
+    def add_task(
         self,
         workspace_id: int,
         user_id: int,
@@ -29,25 +29,15 @@ class TaskService:
         status: Optional[TaskStatus] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Task:
-        """Create a new task
+        """Build + add a Task to the session WITHOUT committing.
 
-        Args:
-            workspace_id: Workspace ID
-            user_id: User who submitted the task
-            file_id: Associated file ID (optional)
-            task_type: Task type
-            queue: Queue name (fast/normal/slow)
-            priority: Priority score (0-10)
-            max_retries: Maximum retry attempts
-
-        Returns:
-            Created task
+        Lets a caller include task creation in a larger single-commit transaction
+        (e.g. soft-delete: set deleted_at + tag=None + enqueue cleanup, one commit).
         """
         raw_status = status if status else TaskStatus.PENDING
         status_val = (
             raw_status.value if isinstance(raw_status, TaskStatus) else raw_status
         )
-
         task = Task(
             task_id=str(uuid4()),
             workspace_id=workspace_id,
@@ -62,11 +52,35 @@ class TaskService:
             max_retries=max_retries,
             payload=payload,
         )
-
         self.db.add(task)
+        return task
+
+    def create_task(
+        self,
+        workspace_id: int,
+        user_id: int,
+        file_id: Optional[int] = None,
+        task_type: str = "process_document",
+        queue: str = "normal",
+        priority: int = 5,
+        max_retries: int = 3,
+        status: Optional[TaskStatus] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Task:
+        """Create a new task and commit (commit-on-call contract, unchanged)."""
+        task = self.add_task(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            file_id=file_id,
+            task_type=task_type,
+            queue=queue,
+            priority=priority,
+            max_retries=max_retries,
+            status=status,
+            payload=payload,
+        )
         self.db.commit()
         self.db.refresh(task)
-
         return task
 
     def get_task(self, task_id: int) -> Optional[Task]:

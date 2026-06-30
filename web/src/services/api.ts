@@ -105,7 +105,8 @@ export const filesAPI = {
     parserType: string = 'auto',
     workspaceId: number = 1,
     path: string = '/',
-    documentType: DocumentType = 'general'
+    documentType: DocumentType = 'general',
+    tag?: string
   ): Promise<File> => {
     const formData = new FormData();
     formData.append('file', file);
@@ -113,6 +114,7 @@ export const filesAPI = {
     formData.append('workspace_id', workspaceId.toString());
     formData.append('path', path);
     formData.append('document_type', documentType);
+    if (tag && tag.trim()) formData.append('tag', tag.trim());
     const response = await api.post('/files/upload', formData);
     return response.data;
   },

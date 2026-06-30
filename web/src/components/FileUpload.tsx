@@ -5,12 +5,13 @@ import type { UploadProps } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { useTranslation } from 'react-i18next';
 import { filesAPI } from '../services/api';
+import { shouldBlockTaggedBatch } from './fileUploadGuard';
+import { classifyUploadError } from './fileUploadError';
 import type { DocumentType, File } from '../types';
 import {
   precheck,
   remoteParentDir,
   isDuplicateError,
-  isFilenameTooLongError,
   walkEntry,
   type PickedFile,
   type SkipReason,
@@ -115,6 +116,7 @@ export default function FileUpload({
   const { t } = useTranslation();
   const [parserType, setParserType] = useState<string>('auto');
   const [documentType, setDocumentType] = useState<DocumentType>('general');
+  const [tag, setTag] = useState<string>('');
   const [uploadPath, setUploadPath] = useState<string>(selectedPath);
   const [uploading, setUploading] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
@@ -151,6 +153,7 @@ export default function FileUpload({
   const uploadPathRef = useRef(uploadPath);
   const workspaceIdRef = useRef(workspaceId);
   const documentTypeRef = useRef(documentType);
+  const tagRef = useRef('');
   const uploadingRef = useRef(false); // 重入锁：同步读写，不靠 effect
   const runFolderUploadRef = useRef<(items: PickedFile[]) => Promise<void>>(async () => {});
   const dropZoneRef = useRef<HTMLDivElement>(null);
@@ -160,6 +163,7 @@ export default function FileUpload({
   uploadPathRef.current = uploadPath;
   workspaceIdRef.current = workspaceId;
   documentTypeRef.current = documentType;
+  tagRef.current = tag;
 
   const skipReasonText = (reason: SkipReason, ext?: string): string => {
     if (reason === 'unsupported') return t('files.upload.skip_unsupported', { ext: ext ? `.${ext}` : '' });
@@ -276,6 +280,16 @@ export default function FileUpload({
         .map((it) => (it as unknown as { webkitGetAsEntry?: () => unknown }).webkitGetAsEntry?.() ?? null)
         .filter(Boolean) as Array<{ isDirectory?: boolean }>;
       const hasDirectory = entries.some((en) => en?.isDirectory);
+
+      // 填写了唯一 tag 时只允许单文件：拖入目录或多个散文件一律拦截
+      const looseCount = Array.from(e.dataTransfer?.files ?? []).length;
+      if (shouldBlockTaggedBatch(tagRef.current, hasDirectory, looseCount)) {
+        e.preventDefault();
+        e.stopPropagation();
+        message.warning(t('files.upload.tag_batch_blocked'));
+        return;
+      }
+
       if (!hasDirectory) return; // 纯文件 / 旧浏览器无法识别目录 → 交给现有单文件链路
 
       e.preventDefault();
@@ -305,20 +319,27 @@ export default function FileUpload({
     customRequest: async ({ file, onSuccess, onError }) => {
       setUploading(true);
       try {
-        await filesAPI.upload(file as globalThis.File, parserType, workspaceId, uploadPath, documentType);
+        await filesAPI.upload(file as globalThis.File, parserType, workspaceId, uploadPath, documentType, tag);
         message.success('文件上传成功');
         onSuccess?.({});
         onUploadSuccess();
         setParserType('auto');
         setDocumentType('general');
+        setTag('');
         setUploadPath(selectedPath);
       } catch (error: unknown) {
         const err = error as { response?: { status?: number; data?: { detail?: string } } };
         const code = err.response?.status;
         const detailMsg = String(err.response?.data?.detail ?? '');
-        const errorMsg = isFilenameTooLongError(code, detailMsg)
-          ? t('files.upload.name_too_long')
-          : detailMsg || '文件上传失败';
+        const kind = classifyUploadError(code, detailMsg);
+        const errorMsg =
+          kind === 'tag_conflict'
+            ? t('files.upload.tag_conflict')
+            : kind === 'name_too_long'
+            ? t('files.upload.name_too_long')
+            : kind === 'backend_detail'
+            ? detailMsg
+            : '文件上传失败';
         message.error(errorMsg);
         onError?.(error as Error);
       } finally {
@@ -368,6 +389,16 @@ export default function FileUpload({
                 </Option>
               ))}
             </Select>
+          </Form.Item>
+
+          <Form.Item label={t('files.upload.tag_label')} tooltip="^[A-Za-z0-9._:-]{1,128}$">
+            <Input
+              value={tag}
+              onChange={(e) => setTag(e.target.value)}
+              disabled={uploading}
+              placeholder="report-2024"
+              allowClear
+            />
           </Form.Item>
 
           <Form.Item

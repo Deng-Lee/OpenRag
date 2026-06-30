@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import posixpath
+import re
 import uuid
 from typing import Optional, Tuple
 
@@ -12,9 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
-from openrag.models.file import File as FileModel
+from openrag.models.document_chunk import DocumentChunk
+from openrag.models.file import File as FileModel, ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
+from openrag.services.file_deletion import delete_milvus_vectors_for_file
 from openrag.services.task_service import TaskService
 from openrag.services.trace_service import TraceService
 from openrag.storage.minio_storage import MinioStorage
@@ -28,6 +31,34 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 # Counted in BYTES (not chars): non-ASCII names cost >1 byte/char in UTF-8.
 # Mirror this value in web/src/utils/folderUpload.ts (MAX_FILENAME_BYTES).
 MAX_FILENAME_BYTES = 200
+
+_TAG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _normalize_tag(tag):
+    """Trim; blank -> None; else must match the tag charset (raises 400)."""
+    tag = (tag or "").strip()
+    if not tag:
+        return None
+    if not _TAG_RE.match(tag):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid tag. Allowed: ^[A-Za-z0-9._:-]{1,128}$",
+        )
+    return tag
+
+
+def _violated_unique_constraint(exc):
+    """Return 'tag' | 'uri' | None for a unique-violation IntegrityError.
+
+    Works for PostgreSQL (constraint name in message) and SQLite (column list).
+    """
+    msg = str(getattr(exc, "orig", exc) or "")
+    if "uq_files_workspace_tag" in msg or "files.tag" in msg:
+        return "tag"
+    if "uq_files_workspace_uri" in msg or "files.uri" in msg:
+        return "uri"
+    return None
 ALLOWED_MIME_TYPES = [
     "text/plain",
     "text/markdown",
@@ -163,6 +194,13 @@ def _get_or_create_directory_row(
         .first()
     )
     if row is not None:
+        if row.deleted_at is not None:
+            # Soft-deleted directory still occupies its uri (uq_files_workspace_uri);
+            # don't reuse it and don't try to recreate (would hit IntegrityError).
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Parent path pending deletion; retry after cleanup completes",
+            )
         if not row.is_directory:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -322,6 +360,7 @@ def _assert_parent_directory_exists(db: Session, workspace_id: int, parent_logic
                 FileModel.workspace_id == workspace_id,
                 FileModel.uri == "/",
                 FileModel.is_directory.is_(True),
+                FileModel.deleted_at.is_(None),
             )
             .first()
         )
@@ -332,6 +371,7 @@ def _assert_parent_directory_exists(db: Session, workspace_id: int, parent_logic
                 FileModel.workspace_id == workspace_id,
                 FileModel.uri == parent,
                 FileModel.is_directory.is_(True),
+                FileModel.deleted_at.is_(None),
             )
             .first()
         )
@@ -339,6 +379,35 @@ def _assert_parent_directory_exists(db: Session, workspace_id: int, parent_logic
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Parent directory does not exist",
+        )
+
+
+def assert_no_pending_deleted_ancestor(db: Session, workspace_id: int, target_uri: str) -> None:
+    """409 if ``target_uri`` or any ancestor path has a soft-deleted row (pending
+    physical cleanup). Prevents writing/moving active rows into a deleting subtree
+    (Codex #2). Soft-delete frees tag but not uri, so a soft-deleted ancestor row
+    still occupies its uri until the worker cleans it.
+    """
+    candidates: list[str] = []
+    cumulative = ""
+    for part in [p for p in target_uri.split("/") if p]:
+        cumulative = f"{cumulative}/{part}"
+        candidates.append(cumulative)
+    if not candidates:
+        return
+    clash = (
+        db.query(FileModel)
+        .filter(
+            FileModel.workspace_id == workspace_id,
+            FileModel.uri.in_(candidates),
+            FileModel.deleted_at.is_not(None),
+        )
+        .first()
+    )
+    if clash is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Path is pending deletion; retry after cleanup completes",
         )
 
 
@@ -355,6 +424,7 @@ def ingest_new_file(
     document_type: str = DEFAULT_DOCUMENT_TYPE,
     require_parent_dir: bool = False,
     duplicate_status_code: int = status.HTTP_400_BAD_REQUEST,
+    tag: Optional[str] = None,
 ) -> Tuple[FileModel, Optional[Task]]:
     """
     Create a new file object under ``parent_logical_path`` / ``upload_filename``,
@@ -398,6 +468,8 @@ def ingest_new_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
             )
+
+        normalized_tag = _normalize_tag(tag)
 
         # Reject over-long file names up front (before MinIO/DB writes) so the
         # caller gets a clear 400 instead of a silent worker failure: the worker
@@ -445,10 +517,27 @@ def ingest_new_file(
                 detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
             )
 
+        if normalized_tag is not None:
+            tag_clash = (
+                db.query(FileModel)
+                .filter(
+                    FileModel.workspace_id == workspace.id,
+                    FileModel.tag == normalized_tag,
+                )
+                .first()
+            )
+            if tag_clash is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tag already in use",
+                )
+
         if require_parent_dir:
             _assert_parent_directory_exists(db, workspace.id, parent_logical_path)
 
         validated_path = validate_path(parent_logical_path)
+        # Codex #2: refuse writing into a subtree pending physical deletion.
+        assert_no_pending_deleted_ancestor(db, workspace.id, validated_path)
         if not require_parent_dir:
             # Auto-create the parent directory chain so the directory tree (web
             # lazy-load and the service-token /tree, /children endpoints) can show
@@ -529,9 +618,25 @@ def ingest_new_file(
             mime_type=ct,
             document_type=normalized_document_type,
             parser_type=parser_type if parser_type != "auto" else None,
+            tag=normalized_tag,
         )
         db.add(file_record)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            kind = _violated_unique_constraint(exc)
+            if kind == "tag":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tag already in use",
+                ) from exc
+            if kind == "uri":
+                raise HTTPException(
+                    status_code=duplicate_status_code,
+                    detail=f"File already exists at {file_uri}",
+                ) from exc
+            raise
         db.refresh(file_record)
 
         task_record: Optional[Task] = None
@@ -656,3 +761,253 @@ def replace_file_content(
         status=TaskStatus.PENDING,
     )
     return task_record
+
+
+def _active_tagged_file(db: Session, workspace_id: int, tag: str) -> Optional[FileModel]:
+    """Return the single ACTIVE (deleted_at IS NULL) non-directory row carrying ``tag``."""
+    return (
+        db.query(FileModel)
+        .filter(
+            FileModel.workspace_id == workspace_id,
+            FileModel.tag == tag,
+            FileModel.is_directory.is_(False),
+            FileModel.deleted_at.is_(None),
+        )
+        .first()
+    )
+
+
+def _move_replace_no_intermediate_commit(
+    db: Session,
+    workspace: Workspace,
+    acting_user_id: int,
+    file: FileModel,
+    target_uri: str,
+    *,
+    new_content: bytes,
+    content_type: Optional[str],
+    parser_type: str = "auto",
+) -> Optional[Task]:
+    """Same-row move+replace with NO intermediate commit (spec §4.8).
+
+    Unlike chaining move_file + replace_file_content (each commits and touches storage
+    several times), this keeps the failure window minimal: the File row is NEVER deleted
+    and the tag is NEVER released, so on any failure the original tag still resolves to a
+    reachable document. Sequence:
+      1. validate parser/size/mime up front (no writes yet);
+      2. write the NEW content to ``target_uri`` (if this fails, the DB is untouched);
+      3. in ONE DB transaction: repoint the SAME row's uri/name/size/mime_type/parser_type/
+         processing fields, delete its DocumentChunk rows, enqueue process_document via the
+         non-committing add_task, then a single commit;
+      4. on commit failure: rollback + best-effort delete the just-written new object;
+      5. on commit success: best-effort cleanup of the OLD uri's object/hierarchy/vectors.
+    """
+    if parser_type not in SUPPORTED_PARSER_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+        )
+    file_size = len(new_content)
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
+        )
+    effective_mime = resolve_effective_mime_type(
+        content_type or file.mime_type, posixpath.basename(target_uri), parser_type
+    )
+    if effective_mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type {effective_mime} is not supported for processing",
+        )
+
+    old_uri = file.uri
+    minio_storage = MinioStorage()
+    # (2) write NEW object first; if this raises, the DB is still untouched.
+    minio_storage.put_file(workspace.slug, target_uri, new_content, content_type=effective_mime)
+
+    # (3) single DB transaction: repoint the same row + clear chunks + enqueue, one commit.
+    try:
+        file.uri = target_uri
+        file.name = posixpath.basename(target_uri)
+        file.size = file_size
+        file.mime_type = effective_mime
+        file.parser_type = parser_type if parser_type != "auto" else None
+        file.processing_status = ProcessingStatus.pending
+        file.processing_error = None
+        file.l0_path = None
+        file.l1_path = None
+        file.l2_path = None
+        file.l0_vector_id = None
+        file.total_chunks = 0
+        file.total_tokens = 0
+        db.query(DocumentChunk).filter(DocumentChunk.file_id == file.id).delete(
+            synchronize_session=False
+        )
+        task = TaskService(db).add_task(
+            workspace_id=file.workspace_id,
+            user_id=acting_user_id,
+            file_id=file.id,
+            task_type="process_document",
+            queue="normal",
+            priority=5,
+            max_retries=3,
+            status=TaskStatus.PENDING,
+        )
+        db.commit()
+        db.refresh(file)
+    except Exception:
+        db.rollback()  # (4) row reverts to old uri/tag; never deleted, tag never released
+        try:
+            minio_storage.remove_file(workspace.slug, target_uri)  # best-effort: drop just-written object
+        except Exception:
+            pass
+        raise
+
+    # (5) commit succeeded -> best-effort cleanup of the OLD uri's storage + vectors.
+    try:
+        minio_storage.remove_file(workspace.slug, old_uri)
+    except Exception:
+        pass
+    try:
+        minio_storage.remove_document_hierarchy(workspace.slug, old_uri)
+    except Exception:
+        pass
+    try:
+        delete_milvus_vectors_for_file(file.id)
+    except Exception:
+        pass
+    return task
+
+
+def upsert_file_by_tag(
+    db: Session,
+    workspace: Workspace,
+    owner_user_id: int,
+    *,
+    tag: str,
+    target_path: str,
+    file_content: bytes,
+    content_type: Optional[str],
+    parser_type: str = "auto",
+    create_dirs: bool = False,
+) -> Tuple[FileModel, Optional[Task], str]:
+    """Idempotent upsert keyed by per-workspace ``tag`` (spec §4.8).
+
+    ``target_path`` is the FULL file logical path (e.g. ``/dir/name.pdf``); the uri is
+    NEVER derived from the multipart filename. Branches on the single ACTIVE row carrying
+    ``tag``:
+    - none                       -> CREATE at target_path           (action "created")
+    - exists, existing.uri == target_uri -> UPDATE content in place (action "updated")
+    - exists, existing.uri != target_uri -> same-row MOVE + replace  (action "moved")
+
+    Returns ``(file, task, action)``. Raises HTTPException(400) on an invalid/empty tag.
+    """
+    normalized_tag = _normalize_tag(tag)
+    if normalized_tag is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="upsert-by-tag requires a non-empty tag",
+        )
+
+    target_uri = validate_path(target_path)
+    basename = posixpath.basename(target_uri)
+    if not basename:
+        # target_path must point at a file, not the root / a directory (no basename).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target_path must be a full file path (file name required)",
+        )
+
+    # Unified pre-validation BEFORE branching (spec §4.8: validate parser/size/mime first)
+    # so create/update/move reject the same bad inputs. Without this, the create branch's
+    # ingest_new_file would store an unsupported-MIME file and skip the task WITHOUT a 400,
+    # diverging from the update/move branches (which 400 on unsupported MIME).
+    if parser_type not in SUPPORTED_PARSER_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+        )
+    if len(file_content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
+        )
+    effective_mime = resolve_effective_mime_type(content_type, basename, parser_type)
+    if effective_mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type {effective_mime} is not supported for processing",
+        )
+
+    existing = _active_tagged_file(db, workspace.id, normalized_tag)
+
+    if existing is None:
+        # CREATE. Check the FULL target_uri for a pending-deletion row first: ingest_new_file
+        # only guards the PARENT path, so a soft-deleted row sitting at target_uri itself
+        # would otherwise fall through to its generic "File already exists" (409). spec §4.9
+        # wants "pending deletion" semantics so callers can distinguish "occupied by an
+        # active doc" from "old doc still being physically cleaned up".
+        assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)
+        file_record, task = ingest_new_file(
+            db,
+            workspace,
+            owner_user_id,
+            parent_logical_path=posixpath.dirname(target_uri) or "/",
+            upload_filename=basename,
+            file_content=file_content,
+            content_type=content_type,
+            parser_type=parser_type,
+            require_parent_dir=not create_dirs,
+            duplicate_status_code=status.HTTP_409_CONFLICT,
+            tag=normalized_tag,
+        )
+        return file_record, task, "created"
+
+    if existing.uri == target_uri:
+        task = replace_file_content(
+            db,
+            workspace,
+            owner_user_id,
+            existing,
+            new_content=file_content,
+            content_type=content_type,
+            parser_type=parser_type,
+        )
+        db.refresh(existing)
+        return existing, task, "updated"
+
+    # existing.uri != target_uri -> same-row move + replace (no intermediate commit).
+    assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)
+    occupied = (
+        db.query(FileModel)
+        .filter(
+            FileModel.workspace_id == workspace.id,
+            FileModel.uri == target_uri,
+            FileModel.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if occupied is not None and occupied.id != existing.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Target path already occupied by another document: {target_uri}",
+        )
+    parent = posixpath.dirname(target_uri) or "/"
+    if create_dirs:
+        ensure_directory_path(db, workspace, parent)
+    else:
+        _assert_parent_directory_exists(db, workspace.id, parent)
+    task = _move_replace_no_intermediate_commit(
+        db,
+        workspace,
+        owner_user_id,
+        existing,
+        target_uri,
+        new_content=file_content,
+        content_type=content_type,
+        parser_type=parser_type,
+    )
+    db.refresh(existing)
+    return existing, task, "moved"

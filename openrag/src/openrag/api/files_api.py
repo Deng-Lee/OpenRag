@@ -138,6 +138,7 @@ class FileResponse(BaseModel):
     size: int
     mime_type: Optional[str]
     document_type: str
+    tag: Optional[str] = None
     created_at: str
     updated_at: str
     processing_status: Optional[str] = None
@@ -279,6 +280,7 @@ def _file_to_response(file: FileModel, owner_name_map: Optional[dict[int, str]] 
         size=file.size,
         mime_type=file.mime_type,
         document_type=getattr(file, "document_type", None) or DEFAULT_DOCUMENT_TYPE,
+        tag=file.tag,
         created_at=file.created_at.isoformat(),
         updated_at=file.updated_at.isoformat(),
         processing_status=ps,
@@ -356,6 +358,7 @@ async def upload_file(
         default=DEFAULT_DOCUMENT_TYPE,
         description="Document type: general, manual, laws",
     ),
+    tag: Optional[str] = Form(default=None, description="Unique tag within the workspace"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -408,6 +411,7 @@ async def upload_file(
         document_type=document_type,
         require_parent_dir=False,
         duplicate_status_code=status.HTTP_400_BAD_REQUEST,
+        tag=tag,
     )
 
     return _file_to_upload_response(
@@ -497,7 +501,10 @@ async def list_files(
     has_filters = any([filename, file_type, owner_username, simple_status, created_after, created_before])
 
     # Build SQLAlchemy query with DB-level filters
-    query = db.query(FileModel).filter(FileModel.workspace_id.in_(workspace_ids))
+    query = db.query(FileModel).filter(
+        FileModel.workspace_id.in_(workspace_ids),
+        FileModel.deleted_at.is_(None),
+    )
 
     if has_filters:
         # Exclude directories when search filters are active
@@ -580,7 +587,7 @@ async def list_files(
 def _get_readable_file_or_404(
     file_id: int, current_user: User, db: Session
 ) -> FileModel:
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
@@ -761,7 +768,7 @@ async def delete_file(
         202 + task_id（异步）或 200 + message（同步）
     """
     try:
-        file = db.query(FileModel).filter(FileModel.id == file_id).first()
+        file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
         if not file:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
@@ -785,18 +792,27 @@ async def delete_file(
                 detail=f"Workspace {file.workspace_id} not found",
             )
 
-        if background:
-            task_service = TaskService(db)
-            task_record = task_service.create_task(
-                workspace_id=file.workspace_id,
-                user_id=current_user.id,
-                file_id=file.id,
-                task_type=TaskType.DELETE_FILE.value,
-                queue="normal",
-                priority=6,
-                max_retries=3,
-                status=TaskStatus.PENDING,
+        if file.is_directory and file.uri.rstrip("/") == "":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete workspace root",
             )
+
+        if background:
+            from openrag.services.file_deletion import (
+                _release_tag_and_soft_delete,
+                soft_delete_subtree_and_enqueue,
+            )
+
+            if file.is_directory:
+                # subtree soft-delete + DELETE_PATH_PREFIX in one commit (rollback on failure)
+                task_record = soft_delete_subtree_and_enqueue(
+                    db, file.workspace_id, file.uri.rstrip("/"), user_id=current_user.id
+                )
+            else:
+                task_record = _release_tag_and_soft_delete(
+                    db, file, user_id=current_user.id
+                )
             return JSONResponse(
                 status_code=status.HTTP_202_ACCEPTED,
                 content={
@@ -862,11 +878,20 @@ async def delete_path_prefix(
             detail="Cannot delete workspace root path",
         )
 
+    from openrag.services.file_deletion import (
+        _escape_like,
+        soft_delete_subtree_and_enqueue,
+    )
+
     n = (
         db.query(FileModel)
         .filter(
             FileModel.workspace_id == body.workspace_id,
-            or_(FileModel.uri == prefix, FileModel.uri.like(f"{prefix}/%")),
+            or_(
+                FileModel.uri == prefix,
+                FileModel.uri.like(f"{_escape_like(prefix)}/%", escape="\\"),
+            ),
+            FileModel.deleted_at.is_(None),
         )
         .count()
     )
@@ -874,17 +899,9 @@ async def delete_path_prefix(
         return MessageResponse(message="No files or directories under this path")
 
     if background:
-        task_service = TaskService(db)
-        task_record = task_service.create_task(
-            workspace_id=body.workspace_id,
-            user_id=current_user.id,
-            file_id=None,
-            task_type=TaskType.DELETE_PATH_PREFIX.value,
-            queue="normal",
-            priority=6,
-            max_retries=3,
-            status=TaskStatus.PENDING,
-            payload={"path": prefix},
+        # subtree soft-delete + DELETE_PATH_PREFIX(watermark) in one commit (rollback on failure)
+        task_record = soft_delete_subtree_and_enqueue(
+            db, body.workspace_id, prefix, user_id=current_user.id
         )
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
@@ -930,7 +947,7 @@ async def move_file(
         Updated file metadata
     """
     # Get file
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
@@ -949,6 +966,9 @@ async def move_file(
         )
 
     new_path = validate_path(request.new_path)
+
+    from openrag.services.file_ingest import assert_no_pending_deleted_ancestor
+    assert_no_pending_deleted_ancestor(db, file.workspace_id, new_path)
 
     # Check if target already exists
     existing_file = (
@@ -1056,6 +1076,9 @@ async def create_directory(
     validated_parent_path = validate_path(parent_path)
     dir_path = build_file_uri(validated_parent_path, dir_name)
 
+    from openrag.services.file_ingest import assert_no_pending_deleted_ancestor
+    assert_no_pending_deleted_ancestor(db, workspace_id, dir_path)
+
     existing_dir = (
         db.query(FileModel)
         .filter(FileModel.uri == dir_path, FileModel.workspace_id == workspace_id)
@@ -1103,7 +1126,7 @@ async def reprocess_file(
 ):
     """Reprocess a file - clears existing chunks/vectors and re-triggers processing"""
     # Get file
-    file = db.query(FileModel).filter(FileModel.id == file_id).first()
+    file = db.query(FileModel).filter(FileModel.id == file_id, FileModel.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="File not found"

@@ -256,6 +256,7 @@ class RetrievalService:
             self.trace_service.fail_span(error_message=str(exc))
             raise
         self._enrich_hits(hits)
+        hits = self._filter_hits_to_active_files(hits)  # round-3 #3 backstop
         for h in hits:
             h["retrieval_mode"] = "flat"
 
@@ -353,8 +354,9 @@ class RetrievalService:
 
         file_l0_raw = _max_score_per_file(l0_hits)
         candidate_files = list(file_l0_raw.keys())
+        candidate_files = self._filter_to_active_file_ids(candidate_files)  # round-4 #2
         if not candidate_files:
-            logger.info("Contextual search: no L0 hits; fallback to flat chunk search")
+            logger.info("Contextual search: no active L0 hits; fallback to flat chunk search")
             return self._search_flat(
                 query,
                 user_id,
@@ -410,6 +412,7 @@ class RetrievalService:
             self.trace_service.fail_span(error_message=str(exc))
             raise
         self._enrich_hits(chunk_hits)
+        chunk_hits = self._filter_hits_to_active_files(chunk_hits)  # round-3 #3 backstop
 
         if restrictions:
             chunk_hits = filter_chunk_hits_by_indices(chunk_hits, restrictions)
@@ -703,18 +706,24 @@ class RetrievalService:
             if workspace_id:
                 rows = (
                     self.db.execute(
-                        select(File.id).where(File.workspace_id == workspace_id)
+                        select(File.id).where(
+                            File.workspace_id == workspace_id,
+                            File.deleted_at.is_(None),
+                        )
                     )
                     .scalars()
                     .all()
                 )
-                return list(rows) if rows else None
+                return list(rows)  # empty -> [] (no active files), NOT None
             return None
 
         if workspace_id:
             rows = (
                 self.db.execute(
-                    select(File.id).where(File.workspace_id == workspace_id)
+                    select(File.id).where(
+                        File.workspace_id == workspace_id,
+                        File.deleted_at.is_(None),
+                    )
                 )
                 .scalars()
                 .all()
@@ -732,7 +741,12 @@ class RetrievalService:
             if not ws_ids:
                 return []
             rows = (
-                self.db.execute(select(File.id).where(File.workspace_id.in_(ws_ids)))
+                self.db.execute(
+                    select(File.id).where(
+                        File.workspace_id.in_(ws_ids),
+                        File.deleted_at.is_(None),
+                    )
+                )
                 .scalars()
                 .all()
             )
@@ -742,6 +756,47 @@ class RetrievalService:
                 "Could not resolve workspace permissions; searching all files"
             )
             return None
+
+    def _filter_to_active_file_ids(self, file_ids: list[int]) -> list[int]:
+        """Keep only file_ids whose row is active (deleted_at IS NULL), order preserved.
+
+        Codex round-4 #2: contextual search derives ``candidate_files`` from L0 hits and
+        feeds them into L1 retrieval, the LLM navigation summary, chunk vector search, ES
+        score blending, and L0/L1 score normalization. A soft-deleted file in that list
+        pollutes ALL of those even if its chunks are dropped from the final result. Filter
+        the candidate ids up front so soft-deleted files never influence contextual ranking.
+        """
+        if not file_ids:
+            return []
+        active = set(
+            self.db.execute(
+                select(File.id).where(
+                    File.id.in_(file_ids),
+                    File.deleted_at.is_(None),
+                )
+            ).scalars().all()
+        )
+        return [fid for fid in file_ids if fid in active]
+
+    def _filter_hits_to_active_files(self, hits: list[dict]) -> list[dict]:
+        """Drop hits whose file is missing or soft-deleted (Codex round-3 #3).
+
+        Belt-and-suspenders for the admin/global path where _accessible_file_ids
+        returns None (no id filter): a soft-deleted file's vectors may survive until
+        the worker physically cleans them, so filter at result time too.
+        """
+        file_ids = {h.get("file_id") for h in hits if h.get("file_id") is not None}
+        if not file_ids:
+            return [h for h in hits if h.get("file_id") is not None]
+        active = set(
+            self.db.execute(
+                select(File.id).where(
+                    File.id.in_(file_ids),
+                    File.deleted_at.is_(None),
+                )
+            ).scalars().all()
+        )
+        return [h for h in hits if h.get("file_id") in active]
 
     def _embed_query(self, query: str) -> list[float]:
         model_name = (

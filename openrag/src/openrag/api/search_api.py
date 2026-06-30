@@ -586,7 +586,11 @@ async def get_chunk_context(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Chunk not found",
         )
-    f = db.query(FileModel).filter(FileModel.id == row.file_id).first()
+    f = (
+        db.query(FileModel)
+        .filter(FileModel.id == row.file_id, FileModel.deleted_at.is_(None))
+        .first()
+    )
     if not f or f.is_directory:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

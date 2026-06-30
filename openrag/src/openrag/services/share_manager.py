@@ -65,8 +65,8 @@ class ShareLinkManager:
         Raises:
             ValueError: If file does not exist
         """
-        # Validate file exists
-        stmt = select(File).where(File.id == file_id)
+        # Validate file exists (active only: cannot share a soft-deleted file)
+        stmt = select(File).where(File.id == file_id, File.deleted_at.is_(None))
         file = self.db.execute(stmt).scalar_one_or_none()
         if not file:
             raise ValueError(f"File with id {file_id} not found")
@@ -186,9 +186,12 @@ class ShareLinkManager:
         share_link.access_count += 1
         self.db.commit()
 
-        # Get and return the file
-        stmt = select(File).where(File.id == share_link.file_id)
+        # Get and return the file (Codex round-4: hide soft-deleted/removed files from
+        # public share access; also avoids a 500 when the file row is already gone).
+        stmt = select(File).where(File.id == share_link.file_id, File.deleted_at.is_(None))
         file = self.db.execute(stmt).scalar_one_or_none()
+        if file is None:
+            return None, "not_found"
 
         return file, None
 

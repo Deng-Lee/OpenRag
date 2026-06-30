@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -21,10 +22,14 @@ from openrag.config import get_preview_public_web_base_url
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as DbFile
 from openrag.models.workspace import Workspace
+from openrag.services.file_deletion import (
+    _release_tag_and_soft_delete,
+    delete_file_with_storage,
+)
 from openrag.services.file_ingest import (
-    ensure_directory_path,
     ingest_new_file,
     replace_file_content,
+    upsert_file_by_tag,
     validate_path,
 )
 from openrag.services.preview_token_service import create_preview_token, decode_preview_token
@@ -176,6 +181,7 @@ def _document_summary(f: DbFile) -> dict[str, Any]:
         "name": f.name,
         "size": f.size,
         "mime_type": f.mime_type,
+        "tag": f.tag,
         "processing_status": f.processing_status.value if f.processing_status else None,
         "updated_at": f.updated_at.isoformat() if f.updated_at else None,
     }
@@ -191,6 +197,7 @@ def _upload_response_dict(file_record: DbFile, task_id: int | None) -> dict[str,
         "is_directory": file_record.is_directory,
         "size": file_record.size,
         "mime_type": file_record.mime_type,
+        "tag": file_record.tag,
         "created_at": file_record.created_at.isoformat() if file_record.created_at else None,
         "updated_at": file_record.updated_at.isoformat() if file_record.updated_at else None,
         "task_id": task_id,
@@ -257,7 +264,11 @@ def resolve_preview_target(
 ) -> tuple[DbFile, DocumentChunk]:
     file_row = (
         db.query(DbFile)
-        .filter(DbFile.id == file_id, DbFile.workspace_id == workspace_id)
+        .filter(
+            DbFile.id == file_id,
+            DbFile.workspace_id == workspace_id,
+            DbFile.deleted_at.is_(None),
+        )
         .first()
     )
     if file_row is None:
@@ -301,16 +312,16 @@ async def service_upload_document(
         default=False,
         description="Create missing parent directories (mkdir -p) before upload",
     ),
+    tag: str | None = Form(default=None, description="Unique tag within the workspace"),
     ctx: ServiceTokenContext = Depends(get_service_token_context),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     ws = require_workspace_for_name(db, workspace_name)
     assert_token_workspace_permission(ctx, ws.id, "write")
-    # When create_dirs is set we materialise the parent path first, so the strict
-    # parent-existence check inside ingest_new_file can be safely relaxed below.
-    if create_dirs:
-        ensure_directory_path(db, ws, path)
     body = await file.read()
+    # Parent directories (when create_dirs) are materialised inside ingest_new_file
+    # via require_parent_dir=False, AFTER the tag dup-check — so a tag conflict aborts
+    # with 409 before any empty directory rows are created.
     file_record, task_record = ingest_new_file(
         db,
         ws,
@@ -322,6 +333,7 @@ async def service_upload_document(
         parser_type=parser_type,
         require_parent_dir=not create_dirs,
         duplicate_status_code=status.HTTP_409_CONFLICT,
+        tag=tag,
     )
     return _upload_response_dict(file_record, task_record.id if task_record else None)
 
@@ -340,7 +352,12 @@ async def service_replace_document(
     p = validate_path(path)
     row = (
         db.query(DbFile)
-        .filter(DbFile.workspace_id == ws.id, DbFile.uri == p, DbFile.is_directory.is_(False))
+        .filter(
+            DbFile.workspace_id == ws.id,
+            DbFile.uri == p,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
         .first()
     )
     if row is None:
@@ -357,6 +374,78 @@ async def service_replace_document(
     )
     db.refresh(row)
     return _upload_response_dict(row, task.id if task else None)
+
+
+@router.put("/workspaces/{workspace_name}/documents/upsert-by-tag")
+async def service_upsert_document_by_tag(
+    workspace_name: str,
+    tag: str = Form(..., min_length=1, description="Per-workspace unique tag (idempotency key)"),
+    target_path: str = Form(..., description="Full file logical path, e.g. /dir/name.pdf"),
+    file: UploadFile = File(...),
+    parser_type: str = Form(default="auto"),
+    create_dirs: bool = Form(
+        default=False,
+        description="Create missing parent directories (mkdir -p) before upsert",
+    ),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Idempotent-by-tag upsert: create (201) / update-in-place (200) / move+replace (200).
+
+    ``target_path`` is the FULL file path; the uri is never derived from the multipart
+    filename (spec §4.8/§8.5#10).
+    """
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    body = await file.read()
+    file_record, task_record, action = upsert_file_by_tag(
+        db,
+        ws,
+        ws.owner_id,
+        tag=tag,
+        target_path=target_path,
+        file_content=body,
+        content_type=file.content_type,
+        parser_type=parser_type,
+        create_dirs=create_dirs,
+    )
+    status_code = status.HTTP_201_CREATED if action == "created" else status.HTTP_200_OK
+    payload = _upload_response_dict(file_record, task_record.id if task_record else None)
+    payload["action"] = action
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@router.delete("/workspaces/{workspace_name}/documents/by-path")
+async def service_delete_document_by_path(
+    workspace_name: str,
+    path: str = Query(..., description="Full file logical path"),
+    background: bool = Query(True, description="true: async soft-delete (202); false: sync physical delete (200)"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    p = validate_path(path)
+    row = (
+        db.query(DbFile)
+        .filter(
+            DbFile.workspace_id == ws.id,
+            DbFile.uri == p,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    if background:
+        task = _release_tag_and_soft_delete(db, row, user_id=ws.owner_id)
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"message": "File deletion queued", "task_id": task.id, "async": True},
+        )
+    delete_file_with_storage(db, row, ws)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "File deleted", "async": False})
 
 
 @router.post("/workspaces/multi_space/search", response_model=MultiWorkspaceSearchResponse)
@@ -612,6 +701,30 @@ async def service_document_by_path(
         "created_at": f.created_at.isoformat() if f.created_at else None,
         "updated_at": f.updated_at.isoformat() if f.updated_at else None,
     }
+
+
+@router.get("/workspaces/{workspace_name}/documents/by-tag")
+async def service_document_by_tag(
+    workspace_name: str,
+    tag: str = Query(..., min_length=1, description="Exact tag within this workspace"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "read")
+    f = (
+        db.query(DbFile)
+        .filter(
+            DbFile.workspace_id == ws.id,
+            DbFile.tag == tag,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if f is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No document with this tag")
+    return _document_summary(f)
 
 
 @router.get("/workspaces/{workspace_name}/documents/search-by-name")

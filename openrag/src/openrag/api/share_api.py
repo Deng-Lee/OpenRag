@@ -78,8 +78,8 @@ async def create_share_link(
     Returns:
         Created share link
     """
-    # Get file
-    file = db.query(File).filter(File.id == request.file_id).first()
+    # Get file (hide soft-deleted: cannot share a file pending deletion)
+    file = db.query(File).filter(File.id == request.file_id, File.deleted_at.is_(None)).first()
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
