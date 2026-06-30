@@ -16,6 +16,7 @@ from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_docu
 from openrag.models.file import File as FileModel
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
+from openrag.services.file_deletion import delete_milvus_vectors_for_file
 from openrag.services.task_service import TaskService
 from openrag.services.trace_service import TraceService
 from openrag.storage.minio_storage import MinioStorage
@@ -759,3 +760,104 @@ def replace_file_content(
         status=TaskStatus.PENDING,
     )
     return task_record
+
+
+def _active_tagged_file(db: Session, workspace_id: int, tag: str) -> Optional[FileModel]:
+    """Return the single ACTIVE (deleted_at IS NULL) non-directory row carrying ``tag``."""
+    return (
+        db.query(FileModel)
+        .filter(
+            FileModel.workspace_id == workspace_id,
+            FileModel.tag == tag,
+            FileModel.is_directory.is_(False),
+            FileModel.deleted_at.is_(None),
+        )
+        .first()
+    )
+
+
+def upsert_file_by_tag(
+    db: Session,
+    workspace: Workspace,
+    owner_user_id: int,
+    *,
+    tag: str,
+    target_path: str,
+    file_content: bytes,
+    content_type: Optional[str],
+    parser_type: str = "auto",
+    create_dirs: bool = False,
+) -> Tuple[FileModel, Optional[Task], str]:
+    """Idempotent upsert keyed by per-workspace ``tag`` (spec §4.8).
+
+    ``target_path`` is the FULL file logical path (e.g. ``/dir/name.pdf``); the uri is
+    NEVER derived from the multipart filename. Branches on the single ACTIVE row carrying
+    ``tag``:
+    - none                       -> CREATE at target_path           (action "created")
+    - exists, existing.uri == target_uri -> UPDATE content in place (action "updated")
+    - exists, existing.uri != target_uri -> same-row MOVE + replace  (action "moved")
+
+    Returns ``(file, task, action)``. Raises HTTPException(400) on an invalid/empty tag.
+    """
+    normalized_tag = _normalize_tag(tag)
+    if normalized_tag is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="upsert-by-tag requires a non-empty tag",
+        )
+
+    target_uri = validate_path(target_path)
+    basename = posixpath.basename(target_uri)
+    if not basename:
+        # target_path must point at a file, not the root / a directory (no basename).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target_path must be a full file path (file name required)",
+        )
+
+    # Unified pre-validation BEFORE branching (spec §4.8: validate parser/size/mime first)
+    # so create/update/move reject the same bad inputs. Without this, the create branch's
+    # ingest_new_file would store an unsupported-MIME file and skip the task WITHOUT a 400,
+    # diverging from the update/move branches (which 400 on unsupported MIME).
+    if parser_type not in SUPPORTED_PARSER_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+        )
+    if len(file_content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
+        )
+    effective_mime = resolve_effective_mime_type(content_type, basename, parser_type)
+    if effective_mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type {effective_mime} is not supported for processing",
+        )
+
+    existing = _active_tagged_file(db, workspace.id, normalized_tag)
+
+    if existing is None:
+        # CREATE. Check the FULL target_uri for a pending-deletion row first: ingest_new_file
+        # only guards the PARENT path, so a soft-deleted row sitting at target_uri itself
+        # would otherwise fall through to its generic "File already exists" (409). spec §4.9
+        # wants "pending deletion" semantics so callers can distinguish "occupied by an
+        # active doc" from "old doc still being physically cleaned up".
+        assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)
+        file_record, task = ingest_new_file(
+            db,
+            workspace,
+            owner_user_id,
+            parent_logical_path=posixpath.dirname(target_uri) or "/",
+            upload_filename=basename,
+            file_content=file_content,
+            content_type=content_type,
+            parser_type=parser_type,
+            require_parent_dir=not create_dirs,
+            duplicate_status_code=status.HTTP_409_CONFLICT,
+            tag=normalized_tag,
+        )
+        return file_record, task, "created"
+
+    raise NotImplementedError  # update / move branches added in Task 2 / Task 3
