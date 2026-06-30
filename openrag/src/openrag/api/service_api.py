@@ -29,6 +29,7 @@ from openrag.services.file_deletion import (
 from openrag.services.file_ingest import (
     ingest_new_file,
     replace_file_content,
+    upsert_file_by_tag,
     validate_path,
 )
 from openrag.services.preview_token_service import create_preview_token, decode_preview_token
@@ -373,6 +374,45 @@ async def service_replace_document(
     )
     db.refresh(row)
     return _upload_response_dict(row, task.id if task else None)
+
+
+@router.put("/workspaces/{workspace_name}/documents/upsert-by-tag")
+async def service_upsert_document_by_tag(
+    workspace_name: str,
+    tag: str = Form(..., min_length=1, description="Per-workspace unique tag (idempotency key)"),
+    target_path: str = Form(..., description="Full file logical path, e.g. /dir/name.pdf"),
+    file: UploadFile = File(...),
+    parser_type: str = Form(default="auto"),
+    create_dirs: bool = Form(
+        default=False,
+        description="Create missing parent directories (mkdir -p) before upsert",
+    ),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Idempotent-by-tag upsert: create (201) / update-in-place (200) / move+replace (200).
+
+    ``target_path`` is the FULL file path; the uri is never derived from the multipart
+    filename (spec §4.8/§8.5#10).
+    """
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    body = await file.read()
+    file_record, task_record, action = upsert_file_by_tag(
+        db,
+        ws,
+        ws.owner_id,
+        tag=tag,
+        target_path=target_path,
+        file_content=body,
+        content_type=file.content_type,
+        parser_type=parser_type,
+        create_dirs=create_dirs,
+    )
+    status_code = status.HTTP_201_CREATED if action == "created" else status.HTTP_200_OK
+    payload = _upload_response_dict(file_record, task_record.id if task_record else None)
+    payload["action"] = action
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.delete("/workspaces/{workspace_name}/documents/by-path")
