@@ -860,4 +860,17 @@ def upsert_file_by_tag(
         )
         return file_record, task, "created"
 
-    raise NotImplementedError  # update / move branches added in Task 2 / Task 3
+    if existing.uri == target_uri:
+        task = replace_file_content(
+            db,
+            workspace,
+            owner_user_id,
+            existing,
+            new_content=file_content,
+            content_type=content_type,
+            parser_type=parser_type,
+        )
+        db.refresh(existing)
+        return existing, task, "updated"
+
+    raise NotImplementedError  # move+replace branch added in Task 3

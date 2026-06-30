@@ -64,3 +64,44 @@ def test_upsert_creates_when_tag_absent(db, wsowner, stub_minio):
     assert f.deleted_at is None
     assert task is not None  # process_document enqueued
     assert db.query(File).filter(File.tag == "report", File.deleted_at.is_(None)).count() == 1
+
+
+def test_upsert_updates_in_place_when_tag_and_path_match(db, wsowner, stub_minio):
+    w, u = wsowner
+    # seed an existing tagged file at /r.txt
+    f0, _, a0 = upsert_file_by_tag(
+        db, w, u.id, tag="report", target_path="/r.txt",
+        file_content=b"v1", content_type="text/plain", parser_type="txt", create_dirs=True,
+    )
+    assert a0 == "created"
+    original_id = f0.id
+
+    f1, task, action = upsert_file_by_tag(
+        db, w, u.id, tag="report", target_path="/r.txt",
+        file_content=b"v2-longer", content_type="text/plain", parser_type="txt",
+    )
+    assert action == "updated"
+    assert f1.id == original_id          # same row reused
+    assert f1.uri == "/r.txt"
+    assert f1.tag == "report"
+    assert f1.size == len(b"v2-longer")  # content metadata refreshed
+    assert task is not None
+    # still exactly one active row with this tag
+    assert db.query(File).filter(File.tag == "report", File.deleted_at.is_(None)).count() == 1
+
+
+def test_upsert_update_ignores_multipart_filename(db, wsowner, stub_minio):
+    """spec §4.8: same target_path is UPDATE even if the multipart filename differs;
+    uri is driven by target_path, never by the uploaded filename."""
+    w, u = wsowner
+    f0, _, _ = upsert_file_by_tag(
+        db, w, u.id, tag="report", target_path="/r.txt",
+        file_content=b"v1", content_type="text/plain", parser_type="txt", create_dirs=True,
+    )
+    # upsert_file_by_tag takes no filename param; target_path alone decides the uri.
+    f1, _, action = upsert_file_by_tag(
+        db, w, u.id, tag="report", target_path="/r.txt",
+        file_content=b"v2", content_type="text/plain", parser_type="txt",
+    )
+    assert action == "updated"
+    assert f1.id == f0.id and f1.uri == "/r.txt"
