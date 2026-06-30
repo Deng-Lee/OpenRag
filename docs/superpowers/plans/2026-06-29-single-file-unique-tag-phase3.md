@@ -430,7 +430,10 @@ def test_upsert_move_rejects_when_target_uri_occupied_by_other_file(db, wsowner,
         db, w, u.id, tag="report", target_path="/r.txt",
         file_content=b"v1", content_type="text/plain", parser_type="txt", create_dirs=True,
     )
-    # an unrelated active file already sits at /archive/r2.txt (no tag)
+    # an unrelated active file already sits at /archive/r2.txt (no tag).
+    # Do NOT create the /archive directory row here: this regression proves the
+    # conflict check happens before create_dirs/ensure_directory_path can commit
+    # any side-effect directory.
     other = File(uri="/archive/r2.txt", name="r2.txt", owner_id=u.id, workspace_id=w.id,
                  is_directory=False, size=1)
     db.add(other); db.commit()
@@ -445,6 +448,9 @@ def test_upsert_move_rejects_when_target_uri_occupied_by_other_file(db, wsowner,
     # original tag/doc still reachable at its old uri
     assert db.query(File).filter(File.uri == "/r.txt", File.tag == "report",
                                  File.deleted_at.is_(None)).count() == 1
+    # conflict path must not create /archive as a side effect
+    assert db.query(File).filter(File.uri == "/archive", File.is_directory.is_(True),
+                                 File.deleted_at.is_(None)).count() == 0
 
 
 def test_upsert_move_rejects_pending_deleted_ancestor(db, wsowner, stub_minio):
@@ -709,16 +715,11 @@ def _move_replace_no_intermediate_commit(
     return task
 ```
 
-然后把 `upsert_file_by_tag` 末尾第二个 `raise NotImplementedError` 替换为（异路径 move 分支：先全部校验，再走专用 helper）：
+然后把 `upsert_file_by_tag` 末尾第二个 `raise NotImplementedError` 替换为（异路径 move 分支：先做 pending/active 冲突检查，再按需建/验父目录，最后走专用 helper）：
 
 ```python
     # existing.uri != target_uri -> same-row move + replace (no intermediate commit).
     assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)
-    parent = posixpath.dirname(target_uri) or "/"
-    if create_dirs:
-        ensure_directory_path(db, workspace, parent)
-    else:
-        _assert_parent_directory_exists(db, workspace.id, parent)
     occupied = (
         db.query(FileModel)
         .filter(
@@ -733,6 +734,11 @@ def _move_replace_no_intermediate_commit(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Target path already occupied by another document: {target_uri}",
         )
+    parent = posixpath.dirname(target_uri) or "/"
+    if create_dirs:
+        ensure_directory_path(db, workspace, parent)
+    else:
+        _assert_parent_directory_exists(db, workspace.id, parent)
     task = _move_replace_no_intermediate_commit(
         db,
         workspace,
@@ -747,7 +753,7 @@ def _move_replace_no_intermediate_commit(
     return existing, task, "moved"
 ```
 
-> `assert_no_pending_deleted_ancestor`、`ensure_directory_path`、`_assert_parent_directory_exists`、`MinioStorage`、`posixpath`、`TaskService`、`TaskStatus`、`SUPPORTED_PARSER_TYPES`、`MAX_FILE_SIZE`、`ALLOWED_MIME_TYPES`、`resolve_effective_mime_type` 均已在 `file_ingest.py` 定义/import；`DocumentChunk`、`ProcessingStatus`、`delete_milvus_vectors_for_file` 由本步骤新增 import。move 分支**不调用** `replace_file_content`（避免其多次 commit + 中途存储副作用造成的丢失窗口）；`file.id`/`tag` 在 move 后不变（同一文档，非新建）。helper 内的 parser/size/mime 校验与 `upsert_file_by_tag` 入口的统一预校验重叠：wrapper 先行（保证三分支语义一致），helper 内校验作为独立调用时的防御保留，正常路径下两者结论一致——**保留即可，不要删**。
+> `assert_no_pending_deleted_ancestor`、`ensure_directory_path`、`_assert_parent_directory_exists`、`MinioStorage`、`posixpath`、`TaskService`、`TaskStatus`、`SUPPORTED_PARSER_TYPES`、`MAX_FILE_SIZE`、`ALLOWED_MIME_TYPES`、`resolve_effective_mime_type` 均已在 `file_ingest.py` 定义/import；`DocumentChunk`、`ProcessingStatus`、`delete_milvus_vectors_for_file` 由本步骤新增 import。move 分支**不调用** `replace_file_content`（避免其多次 commit + 中途存储副作用造成的丢失窗口）；`file.id`/`tag` 在 move 后不变（同一文档，非新建）。注意 active `target_uri` 查重必须早于 `ensure_directory_path()`，因为后者会 `commit`；冲突路径不能先创建目录再 409。helper 内的 parser/size/mime 校验与 `upsert_file_by_tag` 入口的统一预校验重叠：wrapper 先行（保证三分支语义一致），helper 内校验作为独立调用时的防御保留，正常路径下两者结论一致——**保留即可，不要删**。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -1185,3 +1191,41 @@ spec 写的是返回 `action`，表格值为 `created` / `updated` / `moved`；�
 
 - `target_path` 是完整文件路径，建议顺手拒绝 `target_path="/"` 或 basename 为空的输入并返回 400，避免把根路径当作文件目标。这个是低成本防御，不影响主方案进入执行。
 - 并发下两个请求同时争抢同一 `target_uri` 时，当前设计仍可能受既有「先写对象、后提交 DB」模式影响；这是更大的并发一致性议题，现阶段可不阻断，但如果后续要强化，需要引入 staging key 或路径级锁。
+
+---
+
+## Codex 三次审核补充（2026-06-30，来自 Codex）
+
+结论：Claude Code 已把上一轮 MF1/MF2/MF3 与 `target_path="/"` 防御纳入正文：统一 MIME 预校验、真实 `db.commit()` 失败回归、create 分支完整 `target_uri` pending-deletion 守卫都已经可执行。当前不建议继续扩大方案范围；仅剩 1 个会影响失败语义的必修顺序问题。
+
+### 必须修正
+
+1. **move 分支的 active 目标 URI 查重必须早于 `ensure_directory_path()`。**
+   - 现状：Task 3 的 move 伪代码顺序是 `assert_no_pending_deleted_ancestor(...)` → 根据 `create_dirs` 调 `ensure_directory_path(...)` / `_assert_parent_directory_exists(...)` → 再查询 `occupied`。但真实 `ensure_directory_path()` 会 `db.commit()`。
+   - 风险：当 `target_uri` 已被另一 active 行占用、且目标父目录缺失或目录行不完整时，一个本应直接 409 的失败 move 会先创建并提交父目录，再返回冲突。这与 spec §4.8「目标路径占用/父目录检查先于任何存储或 DB 改动」冲突，也让失败请求产生可见副作用。
+   - 建议实现：move 分支顺序调整为：先 `assert_no_pending_deleted_ancestor(db, workspace.id, target_uri)`；再直接查询同 workspace、同 `target_uri`、`deleted_at IS NULL` 的 active 行，若 `occupied is not None and occupied.id != existing.id` 则 409；确认目标未被 active 行占用后，再按 `create_dirs` 创建或校验父目录，最后调用 `_move_replace_no_intermediate_commit(...)`。这样所有冲突检查仍在任何存储写入前完成，且不会在冲突路径上提交新目录。
+   - 建议回归：在没有 `/archive` 目录行的情况下手工插入 active 文件 `/archive/r2.txt`，再把 tagged 文件从 `/r.txt` move 到 `/archive/r2.txt` 且 `create_dirs=True`；断言返回 409、原 tagged 行仍在 `/r.txt`，并且没有新建 active 目录 `/archive`。
+
+### 已确认无需阻断
+
+- 旧的 MF1/MF2/MF3 在正文已吸收，文档末尾保留的前两轮 Codex 审查内容可视为历史记录；本节为当前最新审核结论。
+- `target_path="/dir/"` 经 `validate_path` 规范成 `/dir` 后会被当作文件名 `dir` 处理，语义略宽但与现有路径规范化一致；不是主流程风险。
+- move 成功后的旧本地 hierarchy 残留属于清理完整性问题，active 行、chunk、向量与对象可达性不受影响；不建议作为 Phase 3 必须项继续扩范围。
+
+---
+
+## Codex 文档修正记录（2026-06-30，来自 Codex）
+
+已按上方三次审核结论直接修正 Phase 3 正文，Claude Code 后续执行以正文 Task 3 为准：
+
+1. **move 分支实现顺序已改为无副作用冲突检查优先。**
+   - 新顺序：`assert_no_pending_deleted_ancestor(target_uri)` → 查询 active `occupied` 目标行并在冲突时直接 409 → 再执行 `ensure_directory_path(...)` / `_assert_parent_directory_exists(...)` → 最后调用 `_move_replace_no_intermediate_commit(...)`。
+   - 目的：避免 `ensure_directory_path()` 在冲突请求中先 `commit` 新目录，确保 target uri 冲突返回 409 时没有目录副作用。
+
+2. **目标 URI 被 active 文件占用的回归已加强。**
+   - `test_upsert_move_rejects_when_target_uri_occupied_by_other_file` 明确不预建 `/archive` 目录，并在 409 后断言没有 active `/archive` 目录行。
+   - 这个断言会防止实现把 `ensure_directory_path()` 放在 active 目标查重之前。
+
+3. **Task 3 注释已补充约束。**
+   - 文档明确 active `target_uri` 查重必须早于 `ensure_directory_path()`，因为后者会 `commit`；冲突路径不能先创建目录再 409。
+   - 其余方案不变：MF1/MF2/MF3、`target_path="/"` 防御、专用 move helper、真实 commit 失败测试仍按正文执行。
