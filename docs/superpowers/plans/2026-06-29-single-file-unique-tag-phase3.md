@@ -1229,3 +1229,37 @@ spec 写的是返回 `action`，表格值为 `created` / `updated` / `moved`；�
 3. **Task 3 注释已补充约束。**
    - 文档明确 active `target_uri` 查重必须早于 `ensure_directory_path()`，因为后者会 `commit`；冲突路径不能先创建目录再 409。
    - 其余方案不变：MF1/MF2/MF3、`target_path="/"` 防御、专用 move helper、真实 commit 失败测试仍按正文执行。
+
+---
+
+## Codex 代码落实评审（2026-06-30，来自 Codex）
+
+评审范围：最近 6 次提交 `bfe03eb..9b3f8f3`，包含 Phase 3 文档采纳、`upsert_file_by_tag` create/update/move 实现、service `PUT /documents/upsert-by-tag` 端点，以及新增 service/service-layer 回归测试。
+
+结论：**未发现必须修复的漏洞、冲突点、多余改动，或会明显改变无关功能的预期外改动。** 这批提交整体按 Phase 3 正文落实：`target_path` 合约未退回到 multipart filename，返回字段使用 `action`，move+replace 使用专用单事务 helper，active 目标 URI 查重已早于 `ensure_directory_path()`，上一轮 MF1/MF2/MF3 均有代码与回归覆盖。
+
+重点核对：
+
+1. **API 合约符合计划。**
+   - 新端点接收 Form `tag` + `target_path`，按 `action == "created"` 返回 201，其余返回 200；响应复用 `_upload_response_dict` 并追加 `action`。
+   - 测试覆盖 create/update/move、缺 `target_path` 422、read token 403、multipart filename 不影响 URI。
+
+2. **服务层三分支语义符合计划。**
+   - create：统一预校验后复用 `ingest_new_file(..., tag=...)`，并在进入 ingest 前用完整 `target_uri` 检查 pending deletion。
+   - update：同 URI 复用 `replace_file_content()`，保持原 `file.id/tag/uri`。
+   - move：不同 URI 使用 `_move_replace_no_intermediate_commit()`，不串联 `move_file` / `replace_file_content`，保持同一行 `file.id/tag`。
+
+3. **失败语义与回归覆盖到位。**
+   - MinIO 写新对象失败、`TaskService.add_task` 失败、真实 `db.commit()` 失败均有测试，断言旧 tag/旧 URI 仍可达。
+   - active 目标 URI 冲突测试明确断言不会先创建 `/archive` 目录，覆盖了三次审核提出的顺序风险。
+   - unsupported MIME、非法 tag、软删 tag 复用、软删目标 URI pending deletion 都有边界回归。
+
+验证结果：
+
+- `git diff --check HEAD~6..HEAD` 通过。
+- `E:\project\OpenRag\openrag\venv\Scripts\python.exe -m pytest tests/test_file_ingest_upsert.py tests/test_service_api_upsert.py -v`：21 passed。
+- `E:\project\OpenRag\openrag\venv\Scripts\python.exe -m pytest tests/test_file_ingest_tag.py tests/test_service_api_tag.py tests/test_task_service_add_task.py tests/test_soft_delete_write_guard.py -v`：26 passed。
+
+非阻断观察：
+
+- `_move_replace_no_intermediate_commit()` 的异常块覆盖了 `db.commit()` 和紧随其后的 `db.refresh(file)`。正常情况下 `refresh` 不应失败；但若出现“commit 已成功、refresh 自身失败”的极低概率情况，当前 except 会执行 `rollback()` 并 best-effort 删除刚写入的 `target_uri` 对象。后续若要进一步加固，可把 `db.commit()` 失败处理与 commit 成功后的 `db.refresh(file)` 分开：只有 commit 抛错时才删除新对象，commit 返回成功后不再走删除新对象的补偿路径。该点不作为 Phase 3 阻断项。
