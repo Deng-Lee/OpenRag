@@ -19,7 +19,7 @@ function previewTokenConfig(token: string) {
 
 export function readPreviewTokenFromHash(hash = window.location.hash): string | null {
   const normalized = hash.startsWith('#') ? hash.slice(1) : hash;
-  const token = new URLSearchParams(normalized).get('token')?.trim();
+  const token = new URLSearchParams(normalized.replace(/[?#]/g, '&')).get('token')?.trim();
   return token || null;
 }
 
@@ -36,7 +36,7 @@ export function readPreviewPageFromUrl(
   const pageFromSearch = parsePositiveInteger(new URLSearchParams(search).get('page'));
   if (pageFromSearch != null) return pageFromSearch;
 
-  const normalizedHash = hash.startsWith('#') ? hash.slice(1) : hash;
+  const normalizedHash = (hash.startsWith('#') ? hash.slice(1) : hash).replace(/[?#]/g, '&');
   return parsePositiveInteger(new URLSearchParams(normalizedHash).get('page'));
 }
 
