@@ -1,5 +1,6 @@
 # Environment files with sensitive credentials
 docker/.env.docker
+docker/.env.ubuntu24-node
 docker/.env.external-*
 !docker/.env.external-*.example
 k8s/01-secret.yaml

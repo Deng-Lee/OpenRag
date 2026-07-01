@@ -57,7 +57,9 @@ flowchart LR
 | `/service-tokens` | 服务令牌管理（CRUD、绑定、吊销）——见第二部分 |
 | `/embed/v1` | iframe 文档预览内部只读 API，仅配合短期 preview token 使用 |
 
-JWT 文件上传 `POST /files/upload` 还支持 `document_type`（`general`、`manual`、`laws`），用于控制后续分块策略；`POST /files/{file_id}/reprocess` 可在重处理时更新或保留该值。服务令牌上传接口当前只暴露 `parser_type`，新文件默认按 `general` 处理。
+JWT 文件上传 `POST /files/upload` 还支持 `document_type`（`general`、`manual`、`laws`）和可选 `tag`，其中 `tag` 是工作区内唯一的单文件业务标识，重复时返回 **409**；`POST /files/{file_id}/reprocess` 可在重处理时更新或保留 `document_type`。服务令牌上传接口暴露 `parser_type` 和可选 `tag`，新文件默认按 `general` 处理。
+
+文件删除接口默认采用异步软删除：被删除文件会立即从列表、检索、预览、分享与 service-token 读取接口中隐藏，并释放 `tag`；后台任务随后清理对象存储、chunk 与向量数据。
 
 完整契约：**部署后打开** `https://<api-host>/docs` 或 `https://<domain>/api/docs`（若使用 Nginx `/api` 代理）。
 
@@ -86,7 +88,7 @@ JWT 文件上传 `POST /files/upload` 还支持 `document_type`（`general`、`m
 
 1. **获取令牌** — 系统管理员在 OpenRag Web 端「服务令牌」页面创建令牌，并授权绑定一个或多个工作区（每个工作区独立设置 `read` 或 `write` 权限）。
 2. **保存密钥** — 将完整密钥字符串（`sk-...`）存入 Secret 管理工具（环境变量、Vault、K8s Secret），禁止写入前端代码或版本库。
-3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 11 个机读接口。
+3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 14 个机读接口。
 
 ```bash
 # 示例：列根目录树
@@ -126,8 +128,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 | 操作 | 所需令牌权限 |
 |------|----------------|
-| 目录树、列子项、按前缀查询、文件元数据、语义检索、按文件名搜索、创建预览链接 | **read** 或 **write** |
-| 上传新文件、覆盖已有文件 | **write** |
+| 目录树、列子项、按前缀查询、文件元数据、按 tag 查询、语义检索、按文件名搜索、创建预览链接 | **read** 或 **write** |
+| 上传新文件、按 tag 幂等写入、覆盖已有文件、删除文件 | **write** |
 
 只读令牌调用写接口 → **403**，`detail`：`Token permission insufficient`。
 多工作区检索中，`write` 绑定同样视为具备读取权限。
@@ -138,6 +140,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 |------|------|
 | **工作区标识（URL）** | 路径中使用工作区的 **`name`**（全局唯一展示名），不是数字 `id`。含中文或空格时需 **URL 编码**。 |
 | **逻辑路径** | 文件在工作区内的路径，**必须以 `/` 开头**（如 `/`、`/docs/report.pdf`）。禁止 `..` 穿越，检测到 → **400**。 |
+| **文件 tag** | 可选的单文件业务标识，工作区内唯一；允许字符为 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:`、`-`，长度 1-128。用于外部系统按业务主键查询或幂等写入文件。 |
+| **软删除** | 默认异步删除会先设置 `deleted_at` 并清空 `tag`，使文件立即从读取接口隐藏并释放 tag；物理清理由后台任务完成。在清理完成前，原路径仍可能被视为“正在删除中”。 |
 | **处理状态** | 文件上传后自动进入解析流水线，`processing_status` 可能值为 `pending` → `parsing` → `building_hierarchy` → `embedding` → `completed`（或 `failed`）。 |
 | **基地址** | 路由前缀 `/service/v1`。若经反向代理加 `/api` 前缀，完整路径为 `/api/service/v1/...`，以实际部署为准。 |
 
@@ -164,8 +168,11 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `GET` | `/workspaces/{workspace_name}/children` | 某目录一级子项 | read |
 | `GET` | `/workspaces/{workspace_name}/entries/by-prefix` | 按前缀扁平列表 | read |
 | `GET` | `/workspaces/{workspace_name}/documents/by-path` | 按路径取文件元数据 | read |
+| `GET` | `/workspaces/{workspace_name}/documents/by-tag` | 按工作区内唯一 tag 取文件元数据 | read |
 | `POST` | `/workspaces/{workspace_name}/documents` | 上传新文件（multipart） | write |
+| `PUT` | `/workspaces/{workspace_name}/documents/upsert-by-tag` | 按 tag 幂等创建、更新或移动并替换文件 | write |
 | `PUT` | `/workspaces/{workspace_name}/documents/by-path` | 覆盖已有文件 | write |
+| `DELETE` | `/workspaces/{workspace_name}/documents/by-path` | 按路径删除文件，默认异步软删除 | write |
 | `POST` | `/workspaces/{workspace_name}/search` | 语义检索（JSON body） | read |
 | `POST` | `/workspaces/multi_space/search` | 多工作区语义检索（JSON body） | read |
 | `GET` | `/workspaces/{workspace_name}/documents/search-by-name` | 按文件名子串模糊搜索 | read |
@@ -177,8 +184,9 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 |------|----------|------|
 | 工作区发现 | `GET /workspaces` | 查询当前服务令牌可访问的工作区、权限和基础信息 |
 | 目录浏览 | `GET /workspaces/{workspace_name}/tree`、`children`、`entries/by-prefix` | 获取嵌套目录树、一级子项或按前缀展开的扁平列表 |
-| 文件元数据查询 | `GET /workspaces/{workspace_name}/documents/by-path`、`documents/search-by-name` | 按逻辑路径精确查询文件，或按文件名子串搜索 |
-| 文件写入 | `POST /workspaces/{workspace_name}/documents`、`PUT /workspaces/{workspace_name}/documents/by-path` | 上传新文件或覆盖已有文件，需要 `write` 权限 |
+| 文件元数据查询 | `GET /workspaces/{workspace_name}/documents/by-path`、`documents/by-tag`、`documents/search-by-name` | 按逻辑路径、业务 tag 精确查询文件，或按文件名子串搜索 |
+| 文件写入 | `POST /workspaces/{workspace_name}/documents`、`PUT /workspaces/{workspace_name}/documents/upsert-by-tag`、`PUT /workspaces/{workspace_name}/documents/by-path` | 上传新文件、按 tag 幂等写入或覆盖已有文件，需要 `write` 权限 |
+| 文件删除 | `DELETE /workspaces/{workspace_name}/documents/by-path` | 按逻辑路径删除文件；默认异步软删除，立即隐藏并释放 tag |
 | 单工作区语义检索 | `POST /workspaces/{workspace_name}/search` | 在一个指定工作区中检索，需要 `read` 或 `write` 权限 |
 | 多工作区语义检索 | `POST /workspaces/multi_space/search` | 在请求体指定的多个工作区中检索，可访问工作区正常执行，不可访问工作区写入 `skipped_workspaces` |
 | 文档片段 iframe 预览 | `POST /workspaces/{workspace_name}/preview-links` | 外部后端为检索命中的 chunk 换取短期 `preview_url`，外部前端只把该 URL 放入 iframe |
@@ -490,11 +498,38 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `completed` | 处理完成，可检索 |
 | `failed` | 处理失败 |
 
-文件不存在 → **404**；路径为目录 → **400**。
+文件不存在或已软删除 → **404**；路径为目录 → **400**。
 
 ---
 
-#### 2.6.5 POST `/workspaces/{workspace_name}/documents` — 上传新文件
+#### 2.6.5 GET `/workspaces/{workspace_name}/documents/by-tag` — 按 tag 查询文件元数据
+
+**Query 参数：**
+
+| 参数 | 类型 | 必填 | 约束 | 说明 |
+|------|------|------|------|------|
+| `tag` | string | **是** | min_length=1 | 工作区内精确匹配的文件 tag |
+
+**响应示例：**
+
+```json
+{
+  "id": 789,
+  "path": "/docs/report.pdf",
+  "name": "report.pdf",
+  "size": 1048576,
+  "mime_type": "application/pdf",
+  "tag": "erp-contract-20260420",
+  "processing_status": "completed",
+  "updated_at": "2026-04-20T12:00:00+00:00"
+}
+```
+
+`tag` 的唯一性限定在单个工作区内：不同工作区可以使用相同 tag。文件不存在、tag 未命中或目标文件已软删除 → **404**。
+
+---
+
+#### 2.6.6 POST `/workspaces/{workspace_name}/documents` — 上传新文件
 
 **Content-Type：** `multipart/form-data`
 
@@ -506,6 +541,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `file` | file | **是** | — | 上传文件 |
 | `parser_type` | string | 否 | `auto` | 解析器类型 |
 | `create_dirs` | bool | 否 | `false` | 为 `true` 时先自动创建 `path` 及其所有缺失父目录（`mkdir -p`）再上传；缺省 `false` 时父目录须已存在，否则 **400** |
+| `tag` | string | 否 | `null` | 工作区内唯一的单文件业务标识；允许 `A-Za-z0-9._:-`，长度 1-128；空值按未设置处理 |
 
 **`parser_type` 支持值：** `auto`、`pdf`、`docx`、`xlsx`、`pptx`、`txt`、`md`、`html`、`json`、`csv`、`epub`
 
@@ -545,6 +581,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
   "is_directory": false,
   "size": 1048576,
   "mime_type": "application/pdf",
+  "tag": "erp-contract-20260420",
   "created_at": "2026-04-20T10:00:00+00:00",
   "updated_at": "2026-04-20T10:00:00+00:00",
   "task_id": 789
@@ -553,11 +590,59 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 `task_id` 为自动创建的 `process_document` 任务 ID（MIME 不在支持列表时为 `null`）。
 
-**冲突：** 同路径已存在文件 → **409**（应改用 PUT 覆盖）。
+**冲突：** 同路径已存在文件 → **409**（应改用 PUT 覆盖）；同工作区内 `tag` 已被其它文件占用 → **409**，`detail` 为 `Tag already in use`。
 
 ---
 
-#### 2.6.6 PUT `/workspaces/{workspace_name}/documents/by-path` — 覆盖已有文件
+#### 2.6.7 PUT `/workspaces/{workspace_name}/documents/upsert-by-tag` — 按 tag 幂等写入文件
+
+该接口面向外部系统按业务主键同步单文件：`tag` 是幂等键，`target_path` 是最终文件完整逻辑路径，multipart 中的文件名不决定 OpenRag 内部路径。
+
+**Content-Type：** `multipart/form-data`
+
+**表单字段：**
+
+| 字段 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `tag` | string | **是** | — | 工作区内唯一的单文件业务标识；允许 `A-Za-z0-9._:-`，长度 1-128 |
+| `target_path` | string | **是** | — | **文件**完整逻辑路径，如 `/incoming/report.pdf`；必须包含文件名 |
+| `file` | file | **是** | — | 新文件内容 |
+| `parser_type` | string | 否 | `auto` | 解析器类型 |
+| `create_dirs` | bool | 否 | `false` | 为 `true` 时自动创建 `target_path` 的缺失父目录 |
+
+**行为：**
+
+| 场景 | HTTP | `action` | 说明 |
+|------|------|----------|------|
+| 当前工作区不存在该 `tag` | **201** | `created` | 在 `target_path` 创建新文件 |
+| 该 `tag` 已存在，且路径相同 | **200** | `updated` | 保持同一文件记录，替换内容并重新处理 |
+| 该 `tag` 已存在，但路径不同 | **200** | `moved` | 保持同一文件记录，移动到 `target_path` 并替换内容 |
+
+**响应示例：**
+
+```json
+{
+  "id": 456,
+  "path": "/archive/report.pdf",
+  "name": "report.pdf",
+  "owner_id": 5,
+  "parent_id": 12,
+  "is_directory": false,
+  "size": 1048576,
+  "mime_type": "application/pdf",
+  "tag": "erp-contract-20260420",
+  "created_at": "2026-04-20T10:00:00+00:00",
+  "updated_at": "2026-04-20T10:05:00+00:00",
+  "task_id": 790,
+  "action": "moved"
+}
+```
+
+`tag` 为空或格式非法 → **400**；缺少 `target_path` → **422**；`target_path` 已被其它活动文件占用 → **409**；目标路径或父路径正在删除中 → **409**。
+
+---
+
+#### 2.6.8 PUT `/workspaces/{workspace_name}/documents/by-path` — 覆盖已有文件
 
 **Content-Type：** `multipart/form-data`
 
@@ -584,7 +669,41 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 ---
 
-#### 2.6.7 POST `/workspaces/{workspace_name}/search` — 语义检索
+#### 2.6.9 DELETE `/workspaces/{workspace_name}/documents/by-path` — 按路径删除文件
+
+**Query 参数：**
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `path` | string | **是** | — | 要删除的**文件**完整逻辑路径 |
+| `background` | bool | 否 | `true` | `true` 为异步软删除；`false` 为同步物理删除 |
+
+**默认异步软删除（`background=true`）：**
+
+```json
+{
+  "message": "File deletion queued",
+  "task_id": 901,
+  "async": true
+}
+```
+
+响应状态码为 **202 Accepted**。文件会立即对列表、按路径查询、按 tag 查询、检索、预览和分享不可见；该文件原有 `tag` 会被清空并释放，后台任务继续清理对象存储、chunk 与向量数据。
+
+**同步物理删除（`background=false`）：**
+
+```json
+{
+  "message": "File deleted",
+  "async": false
+}
+```
+
+响应状态码为 **200 OK**。文件不存在或已软删除 → **404**；read-only 令牌调用 → **403**。
+
+---
+
+#### 2.6.10 POST `/workspaces/{workspace_name}/search` — 语义检索
 
 **Content-Type：** `application/json`
 
@@ -681,7 +800,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 ---
 
-#### 2.6.8 POST `/workspaces/{workspace_name}/preview-links` — 创建文档片段 iframe 预览链接
+#### 2.6.11 POST `/workspaces/{workspace_name}/preview-links` — 创建文档片段 iframe 预览链接
 
 该接口用于把 service token 检索命中的某个文档 chunk 换成可嵌入 iframe 的短期预览链接。`X-OpenRag-Token` 只在接入方后端使用，浏览器 iframe 只使用短期 preview token；长期 service token 不得进入浏览器、页面源码、localStorage 或前端日志。
 
@@ -764,19 +883,19 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 
 **常见错误：**
 
-| 状态码 | 常见 `detail` | 说明 |
+| 状态码 | 常见 `detail` / 消息 | 说明 |
 |--------|---------------|------|
 | **400** | `File is a directory` | `file_id` 指向目录 |
 | **400** | `chunk_index does not match chunk` | 请求中的 `chunk_index` 与真实 chunk 不一致 |
 | **401** | `Invalid or missing service token` | 缺少、错误或已吊销 `X-OpenRag-Token` |
 | **403** | `Token not authorized for this workspace` | 令牌未绑定 URL 中的工作区 |
 | **404** | `Workspace not found` | 工作区名不存在 |
-| **404** | `File not found` | 文件不存在，或文件不属于该工作区 |
+| **404** | `File not found` | 文件不存在、已软删除，或文件不属于该工作区 |
 | **404** | `Chunk not found` | chunk 不存在，或 chunk 不属于该 workspace/file |
 
 ---
 
-#### 2.6.9 POST `/workspaces/multi_space/search` — 多工作区语义检索
+#### 2.6.12 POST `/workspaces/multi_space/search` — 多工作区语义检索
 
 **Content-Type：** `application/json`
 
@@ -909,7 +1028,7 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 
 ---
 
-#### 2.6.10 GET `/workspaces/{workspace_name}/documents/search-by-name` — 按文件名模糊搜索
+#### 2.6.13 GET `/workspaces/{workspace_name}/documents/search-by-name` — 按文件名模糊搜索
 
 **Query 参数：**
 
@@ -933,6 +1052,7 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
       "name": "report.pdf",
       "size": 1048576,
       "mime_type": "application/pdf",
+      "tag": "erp-contract-20260420",
       "processing_status": "completed",
       "updated_at": "2026-04-20T14:00:00+00:00"
     }
@@ -1004,6 +1124,18 @@ curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/prev
 curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/documents" \
   -H "X-OpenRag-Token: sk-xxxxxxxx" \
   -F "path=/incoming" \
+  -F "tag=erp-contract-20260420" \
+  -F "file=@./local.pdf"
+```
+
+**按 tag 幂等写入文件：**
+
+```bash
+curl -sS -X PUT "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/upsert-by-tag" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx" \
+  -F "tag=erp-contract-20260420" \
+  -F "target_path=/archive/report.pdf" \
+  -F "create_dirs=true" \
   -F "file=@./local.pdf"
 ```
 
@@ -1022,11 +1154,25 @@ curl -sS -H "X-OpenRag-Token: sk-xxxxxxxx" \
   "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/by-path?path=%2Fdocs%2Freport.pdf"
 ```
 
+**按 tag 取文件元数据：**
+
+```bash
+curl -sS -H "X-OpenRag-Token: sk-xxxxxxxx" \
+  "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/by-tag?tag=erp-contract-20260420"
+```
+
 **按文件名模糊搜索：**
 
 ```bash
 curl -sS -H "X-OpenRag-Token: sk-xxxxxxxx" \
   "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/search-by-name?filename=report&path_prefix=%2Fdocs"
+```
+
+**按路径删除文件（默认异步软删除）：**
+
+```bash
+curl -sS -X DELETE "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/by-path?path=%2Fdocs%2Freport.pdf" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx"
 ```
 
 #### Python（requests）
@@ -1099,7 +1245,22 @@ print(iframe_html)
 # 上传文件
 r = requests.post(
     f"{WS_URL}/documents",
-    data={"path": "/incoming"},
+    data={"path": "/incoming", "tag": "erp-contract-20260420"},
+    files={"file": open("local.pdf", "rb")},
+    headers=HEADERS,
+    timeout=120,
+)
+r.raise_for_status()
+print(r.json())
+
+# 按 tag 幂等写入文件
+r = requests.put(
+    f"{WS_URL}/documents/upsert-by-tag",
+    data={
+        "tag": "erp-contract-20260420",
+        "target_path": "/archive/report.pdf",
+        "create_dirs": "true",
+    },
     files={"file": open("local.pdf", "rb")},
     headers=HEADERS,
     timeout=120,
@@ -1128,6 +1289,16 @@ r = requests.get(
 r.raise_for_status()
 print(r.json())
 
+# 按 tag 查询文件元数据
+r = requests.get(
+    f"{WS_URL}/documents/by-tag",
+    params={"tag": "erp-contract-20260420"},
+    headers=HEADERS,
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json())
+
 # 按文件名模糊搜索
 r = requests.get(
     f"{WS_URL}/documents/search-by-name",
@@ -1137,12 +1308,23 @@ r = requests.get(
 )
 r.raise_for_status()
 print(r.json())
+
+# 按路径删除文件（默认异步软删除）
+r = requests.delete(
+    f"{WS_URL}/documents/by-path",
+    params={"path": "/docs/report.pdf"},
+    headers=HEADERS,
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json())
 ```
 
 ### 2.8 HTTP 状态码速查
 
-| 状态码 | 常见 `detail` | 说明 |
+| 状态码 | 常见 `detail` / 消息 | 说明 |
 |--------|---------------|------|
+| **202** | `File deletion queued` | 文件已进入异步软删除队列 |
 | **400** | `Invalid path: path traversal detected` | 路径含 `..` |
 | **400** | `Too many nodes under path (limit 5000)` | 子树节点超出上限 |
 | **400** | `Tree too deep (limit 50)` | 树深度超出上限 |
@@ -1150,6 +1332,9 @@ print(r.json())
 | **400** | `Path is a directory, not a file` | documents/by-path 指向目录 |
 | **400** | `Parent directory does not exist` | 上传时父目录不存在 |
 | **400** | `Invalid parser_type. Supported types: ...` | parser_type 值不在支持列表 |
+| **400** | `Invalid tag. Allowed: ^[A-Za-z0-9._:-]{1,128}$` | tag 格式非法 |
+| **400** | `upsert-by-tag requires a non-empty tag` | 按 tag 幂等写入时 tag 为空 |
+| **400** | `target_path must be a full file path (file name required)` | upsert 的目标路径未包含文件名 |
 | **400** | `url_prefix and path_prefix must be the same when both provided` | 两个前缀参数值不一致 |
 | **400** | `Cannot replace directory content` | 覆盖路径指向目录 |
 | **400** | `Cannot modify bindings on a revoked token` | 修改已吊销令牌的绑定 |
@@ -1168,10 +1353,15 @@ print(r.json())
 | **404** | `Workspace not found` | 单工作区接口中，工作区名不存在 |
 | **404** | `Directory not found` | 目录路径不存在 |
 | **404** | `File not found` | 文件路径不存在 |
+| **404** | `No document with this tag` | 按 tag 查询未命中，或文件已软删除 |
 | **404** | `Chunk not found` | 创建 preview link 时 chunk 不属于该 workspace/file |
 | **409** | `File already exists at <uri>` | 上传时目标路径已有文件 |
+| **409** | `Tag already in use` | 同工作区内 tag 已被活动文件占用 |
+| **409** | `Path is pending deletion; retry after cleanup completes` | 目标路径或祖先路径仍在异步删除清理中 |
+| **409** | `Target path already occupied by another document: <uri>` | upsert 目标路径被其它活动文件占用 |
 | **409** | `Token already has a binding for this workspace` | 添加已存在的绑定 |
 | **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过 100 MB |
+| **422** | — | multipart/form-data 缺少必填字段，如 upsert 缺少 `target_path` |
 | **500** | — | 内部错误或检索执行失败 |
 
 多工作区检索是例外：请求中某个工作区不存在或无读取权限时，整体仍返回 **200**，该工作区会出现在 `skipped_workspaces`，`reason` 分别为 `not_found` 或 `permission_denied`。
@@ -1186,7 +1376,10 @@ print(r.json())
 | 多工作区检索返回 200，但某些工作区没有结果 | 工作区不存在，或当前 service token 没有该工作区 read/write 权限 | 查看 `skipped_workspaces` 中的 `reason` 和 `message`，补齐绑定或修正工作区名称 |
 | 404 `Directory not found` | `path_prefix` 或 `path` 在库中不存在 | 确认目录路径已通过上传或 Web 端创建 |
 | 409 `File already exists` | 上传路径已有同名文件 | 改用 PUT 覆盖 |
+| 409 `Tag already in use` | 同工作区已有活动文件使用该业务 tag | 如果是同一业务文件，改用 `PUT /documents/upsert-by-tag`；否则更换 tag |
+| 409 `Path is pending deletion` | 目标路径或其父路径刚被异步删除，物理清理未完成 | 等后台删除任务完成后重试，或改用其它路径 |
 | 400 `Parent directory does not exist` | 上传时父目录未创建 | 上传时带 `create_dirs=true` 自动建目录；或先通过 Web 端 / JWT `POST /files/directories` 创建目录 |
+| 404 `No document with this tag` | tag 不存在，或文件已被软删除并释放 tag | 确认工作区名和 tag；如刚删除过文件，可重新上传或 upsert |
 | 检索返回 0 结果 | 文件 `processing_status` 非 `completed` | 等待文件处理完成再检索 |
 | 文件名搜索返回 0 结果 | 文件名不匹配或 `path_prefix` 限定范围内无文件 | 尝试缩短关键词或扩大 path_prefix 范围 |
 | 创建 preview link 返回 404 `File not found` 或 `Chunk not found` | 前端传回的 `file_id`、`chunk_id` 与当前工作区或文件不匹配 | 使用 search 响应原样传递这些字段，不要按文件名或路径自行定位 chunk |

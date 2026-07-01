@@ -1,0 +1,35 @@
+# Worker document parsing
+markdown>=3.6
+jinja2>=3.1.0
+json-repair>=0.39.0
+pdfplumber>=0.10.0
+pypdf>=3.0.0
+beautifulsoup4>=4.12.0
+
+# OCR and vision (onnxruntime-based, not PaddleOCR)
+opencv-python>=4.8.0,<4.12
+Pillow>=10.0.0
+onnxruntime>=1.16.0
+shapely>=2.0.0
+pyclipper>=1.3.0
+six>=1.16.0
+
+# Machine learning
+# XGBoost <3.1 is required because 3.1+ dropped support for the legacy
+# .model binary format used by deepdoc.
+xgboost>=2.0.0,<3.1
+scikit-learn>=1.3.0
+# Keep NumPy 1.x for legacy x86_64 CPUs that do not expose x86-64-v2.
+numpy==1.26.4
+pandas>=2.0.0
+
+# Offline RAGFlow model helpers
+huggingface-hub>=0.19.0
+
+# RAGFlow common / rag.nlp transitive deps used inside parsers
+strenum>=0.4.0
+tiktoken>=0.5.0
+chardet>=5.0.0
+roman-numbers>=1.0.0
+word2number>=1.1
+cn2an>=0.5.0

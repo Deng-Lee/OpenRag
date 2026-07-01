@@ -8,7 +8,7 @@ email-validator>=2.0.0
 
 # Database (PostgreSQL only)
 sqlalchemy>=2.0.0,<3.0.0
-# SQLAlchemy postgres dialect loads psycopg dynamically — no Python-level import, but required at runtime.
+# SQLAlchemy postgres dialect loads psycopg dynamically; required at runtime.
 psycopg[binary]>=3.2.0
 # python-jose[cryptography] pulls this in; also used indirectly by jose JWT signing.
 cryptography>=42.0.0
@@ -19,18 +19,16 @@ openai>=1.0.0
 # Full-text (optional): chunk index per workspace slug
 elasticsearch>=8.12.0,<9.0.0
 
-# Vector Database — Milvus 2.4+ required (see docker/docker-compose*.yml)
+# Vector Database: Milvus 2.4+ required (see docker/docker-compose*.yml)
 pymilvus>=2.4.0,<2.7.0
 
 # FastAPI UploadFile / multipart form parsing requires this at runtime.
 python-multipart>=0.0.6
 
-# Document Processing
+# API preview helpers
 python-docx>=1.1.0
 openpyxl>=3.1.0
-markdown>=3.6
-jinja2>=3.1.0
-json-repair>=0.39.0
+python-pptx>=0.6.0
 
 # Authentication & Security
 python-jose[cryptography]>=3.3.0
@@ -42,38 +40,4 @@ httpx>=0.26.0
 # Utilities
 python-dotenv>=1.0.0
 pyyaml>=6.0
-
-# RAGFlow Parser Dependencies
-pdfplumber>=0.10.0
-pypdf>=3.0.0
-
-python-pptx>=0.6.0
-beautifulsoup4>=4.12.0
-
-# OCR and Vision (onnxruntime-based, not PaddleOCR)
-opencv-python>=4.8.0
-Pillow>=10.0.0
-onnxruntime>=1.16.0
-shapely>=2.0.0
-pyclipper>=1.3.0
-six>=1.16.0
-
-# Machine Learning
-# XGBoost <3.1 required — 3.1+ dropped support for legacy .model binary format used by deepdoc
-xgboost>=2.0.0,<3.1
-scikit-learn>=1.3.0
-numpy>=1.24.0
-# Excel/CSV parsing
-pandas>=2.0.0
-
-# HuggingFace
-huggingface-hub>=0.19.0
 minio>=7.2.0
-
-# RAGFlow common / rag.nlp transitive deps used inside src/
-strenum>=0.4.0
-tiktoken>=0.5.0
-chardet>=5.0.0
-roman-numbers>=1.0.0
-word2number>=1.1
-cn2an>=0.5.0

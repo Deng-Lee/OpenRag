@@ -19,8 +19,8 @@ RUN proxy="${BUILD_PROXY}" \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-COPY openrag/requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+COPY openrag/requirements.txt openrag/requirements-worker.txt ./
+RUN pip install --no-cache-dir --user -r requirements.txt -r requirements-worker.txt
 
 FROM python:3.11-slim
 
