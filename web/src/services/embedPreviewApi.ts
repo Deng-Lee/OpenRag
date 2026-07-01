@@ -23,6 +23,23 @@ export function readPreviewTokenFromHash(hash = window.location.hash): string | 
   return token || null;
 }
 
+function parsePositiveInteger(value: string | null): number | null {
+  if (!value) return null;
+  const page = Number(value);
+  return Number.isInteger(page) && page > 0 ? page : null;
+}
+
+export function readPreviewPageFromUrl(
+  search = window.location.search,
+  hash = window.location.hash
+): number | null {
+  const pageFromSearch = parsePositiveInteger(new URLSearchParams(search).get('page'));
+  if (pageFromSearch != null) return pageFromSearch;
+
+  const normalizedHash = hash.startsWith('#') ? hash.slice(1) : hash;
+  return parsePositiveInteger(new URLSearchParams(normalizedHash).get('page'));
+}
+
 export const embedPreviewAPI = {
   getContext: async (token: string): Promise<EmbedDocumentPreviewResponse> => {
     const response = await embedPreviewClient.get('/embed/v1/document-preview', previewTokenConfig(token));

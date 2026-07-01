@@ -34,6 +34,7 @@ export interface DocumentSourcePreviewProps {
   chunk: SourcePreviewChunk | null;
   workspaceId?: number;
   embedded?: boolean;
+  initialPage?: number;
   active?: boolean;
   onBlobReady?: (blob: Blob | null) => void;
   fetchers?: DocumentSourcePreviewFetchers;
@@ -383,6 +384,7 @@ export function DocumentSourcePreview({
   chunk,
   workspaceId,
   embedded = false,
+  initialPage,
   active = true,
   onBlobReady,
   fetchers,
@@ -632,15 +634,18 @@ export function DocumentSourcePreview({
 
   const highlightPdfPage: number =
     chunk != null && (chunk.page ?? 0) > 0 ? (chunk.page as number) : 1;
+  const initialPdfPage =
+    initialPage != null && Number.isInteger(initialPage) && initialPage > 0 ? initialPage : null;
+  const scrollPdfPage = initialPdfPage ?? highlightPdfPage;
 
   const scrollPdfToTarget = useCallback(() => {
     if (!active || kind !== 'pdf' || !numPages) return;
     const sp = scrollRef.current;
     if (!sp) return;
-    const pid = Math.min(Math.max(1, highlightPdfPage), numPages);
+    const pid = Math.min(Math.max(1, scrollPdfPage), numPages);
     const el = findPdfPage(sp, pid);
     scrollElementIntoScrollParent(sp, el, 'auto');
-  }, [active, kind, numPages, highlightPdfPage]);
+  }, [active, kind, numPages, scrollPdfPage]);
 
   useLayoutEffect(() => {
     if (!active || kind !== 'pdf' || !numPages) return;
@@ -655,7 +660,7 @@ export function DocumentSourcePreview({
       clearTimeout(t3);
       clearTimeout(t4);
     };
-  }, [active, kind, numPages, highlightPdfPage, pdfScale, scrollPdfToTarget]);
+  }, [active, kind, numPages, scrollPdfPage, pdfScale, scrollPdfToTarget]);
 
   const title = file && !file.is_directory ? file.name || file.uri?.split('/').pop() || '' : '';
 
@@ -692,7 +697,7 @@ export function DocumentSourcePreview({
                 }}
                 onLoadSuccess={(info) => {
                   setNumPages(info.numPages);
-                  const pid = Math.min(Math.max(1, highlightPdfPage), info.numPages || 1);
+                  const pid = Math.min(Math.max(1, scrollPdfPage), info.numPages || 1);
                   const retry = () => {
                     const sp = scrollRef.current;
                     const el = sp ? findPdfPage(sp, pid) : null;

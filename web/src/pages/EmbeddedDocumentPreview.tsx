@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Alert, Spin, Typography } from 'antd';
 import { DocumentSourcePreview, type DocumentSourcePreviewFetchers } from '../components/document-source-preview';
-import { embedPreviewAPI, readPreviewTokenFromHash } from '../services/embedPreviewApi';
+import { embedPreviewAPI, readPreviewPageFromUrl, readPreviewTokenFromHash } from '../services/embedPreviewApi';
 import type {
   DocumentChunkItem,
   EmbedDocumentPreviewResponse,
@@ -57,6 +57,7 @@ function formatExpiresAt(value: string): string {
 
 export default function EmbeddedDocumentPreview() {
   const token = useMemo(() => readPreviewTokenFromHash(window.location.hash), []);
+  const initialPage = useMemo(() => readPreviewPageFromUrl(window.location.search, window.location.hash), []);
   const [context, setContext] = useState<EmbedDocumentPreviewResponse | null>(null);
   const [loading, setLoading] = useState(Boolean(token));
   const [error, setError] = useState<string | null>(token ? null : '预览链接缺少 token。');
@@ -118,6 +119,7 @@ export default function EmbeddedDocumentPreview() {
                   file={file}
                   chunk={chunk as DocumentChunkItem}
                   embedded
+                  initialPage={initialPage ?? undefined}
                   fetchers={fetchers}
                   previewMessages={EMBED_PREVIEW_MESSAGES}
                 />
