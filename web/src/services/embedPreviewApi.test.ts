@@ -27,9 +27,19 @@ describe('embedPreviewAPI', () => {
     const { readPreviewTokenFromHash } = await import('./embedPreviewApi');
 
     expect(readPreviewTokenFromHash('#token=abc')).toBe('abc');
+    expect(readPreviewTokenFromHash('#token=abc&page=1')).toBe('abc');
     expect(readPreviewTokenFromHash('#foo=1&token=a%20b')).toBe('a b');
     expect(readPreviewTokenFromHash('#foo=1')).toBeNull();
     expect(readPreviewTokenFromHash('')).toBeNull();
+  });
+
+  it('reads preview page from query or hash parameters', async () => {
+    const { readPreviewPageFromUrl } = await import('./embedPreviewApi');
+
+    expect(readPreviewPageFromUrl('?page=2', '#token=abc')).toBe(2);
+    expect(readPreviewPageFromUrl('', '#token=abc&page=3')).toBe(3);
+    expect(readPreviewPageFromUrl('?page=0', '#token=abc')).toBeNull();
+    expect(readPreviewPageFromUrl('', '#token=abc&page=bad')).toBeNull();
   });
 
   it('uses a separate axios client with the same base URL shape', async () => {

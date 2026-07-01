@@ -5,6 +5,7 @@ import EmbeddedDocumentPreview from './EmbeddedDocumentPreview';
 
 const embedApiMock = vi.hoisted(() => ({
   readPreviewTokenFromHash: vi.fn(),
+  readPreviewPageFromUrl: vi.fn(),
   embedPreviewAPI: {
     getContext: vi.fn(),
     fetchContentBlob: vi.fn(),
@@ -26,6 +27,7 @@ const previewMock = vi.hoisted(() => ({
       fetchPreview: () => Promise<{ format: 'html' | 'text'; content: string }>;
       fetchChunkSource: () => Promise<{ format: 'text'; content: string }>;
     };
+    initialPage?: number;
   }>,
 }));
 
@@ -44,6 +46,7 @@ vi.mock('../components/document-source-preview', () => ({
       fetchPreview: () => Promise<{ format: 'html' | 'text'; content: string }>;
       fetchChunkSource: () => Promise<{ format: 'text'; content: string }>;
     };
+    initialPage?: number;
   }) => {
     previewMock.calls.push(props);
     useEffect(() => {
@@ -95,6 +98,7 @@ describe('EmbeddedDocumentPreview', () => {
     localStorage.setItem('token', 'must-stay');
     window.history.replaceState(null, '', '/embed/document-preview#token=abc');
     embedApiMock.readPreviewTokenFromHash.mockReturnValue('abc');
+    embedApiMock.readPreviewPageFromUrl.mockReturnValue(null);
     embedApiMock.embedPreviewAPI.getContext.mockResolvedValue(contextResponse());
     embedApiMock.embedPreviewAPI.fetchContentBlob.mockResolvedValue(new Blob(['hello']));
     embedApiMock.embedPreviewAPI.fetchPreview.mockResolvedValue({ format: 'text', content: 'hello' });
@@ -105,6 +109,7 @@ describe('EmbeddedDocumentPreview', () => {
     render(<EmbeddedDocumentPreview />);
 
     expect(embedApiMock.readPreviewTokenFromHash).toHaveBeenCalledWith('#token=abc');
+    expect(embedApiMock.readPreviewPageFromUrl).toHaveBeenCalledWith('', '#token=abc');
     await screen.findByTestId('embedded-document-preview-child');
 
     expect(embedApiMock.embedPreviewAPI.getContext).toHaveBeenCalledWith('abc');
@@ -122,6 +127,23 @@ describe('EmbeddedDocumentPreview', () => {
           unsupported: '该文件类型暂不支持内联预览。',
           loadFailed: '无法加载文档预览。',
         },
+        initialPage: undefined,
+      })
+    );
+  });
+
+  it('passes preview page parameters to the preview component', async () => {
+    window.history.replaceState(null, '', '/embed/document-preview#token=abc&page=3');
+    embedApiMock.readPreviewTokenFromHash.mockReturnValueOnce('abc');
+    embedApiMock.readPreviewPageFromUrl.mockReturnValueOnce(3);
+
+    render(<EmbeddedDocumentPreview />);
+
+    await screen.findByTestId('embedded-document-preview-child');
+    expect(embedApiMock.readPreviewPageFromUrl).toHaveBeenCalledWith('', '#token=abc&page=3');
+    expect(previewMock.calls[0]).toEqual(
+      expect.objectContaining({
+        initialPage: 3,
       })
     );
   });

@@ -24,10 +24,23 @@ vi.mock('../../services/api', () => ({
 }));
 
 vi.mock('react-pdf', () => ({
-  Document: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  Document: ({
+    children,
+    onLoadSuccess,
+  }: {
+    children: ReactNode;
+    onLoadSuccess?: (info: { numPages: number }) => void;
+  }) => {
+    useEffect(() => {
+      onLoadSuccess?.({ numPages: 5 });
+    }, [onLoadSuccess]);
+    return <div>{children}</div>;
+  },
   Page: ({
+    pageNumber,
     onRenderSuccess,
   }: {
+    pageNumber?: number;
     onRenderSuccess?: (page: { getViewport: (p: { scale: number }) => { width: number; height: number } }) => void;
   }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -42,7 +55,7 @@ vi.mock('react-pdf', () => ({
       });
     }, [onRenderSuccess]);
 
-    return <canvas ref={canvasRef} />;
+    return <canvas ref={canvasRef} data-page-number={pageNumber} />;
   },
 }));
 
@@ -64,6 +77,22 @@ function textFile() {
     created_at: '2026-06-01T00:00:00Z',
     updated_at: '2026-06-01T00:00:00Z',
   };
+}
+
+function pdfFile() {
+  return {
+    ...textFile(),
+    name: 'report.pdf',
+    uri: '/docs/report.pdf',
+    mime_type: 'application/pdf',
+  };
+}
+
+function pdfBlob(): Blob {
+  const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]);
+  return {
+    arrayBuffer: () => Promise.resolve(bytes.buffer),
+  } as Blob;
 }
 
 function officeFile(name: string, mimeType: string) {
@@ -91,6 +120,8 @@ function textChunk(sourceCharStart: number, sourceCharEnd: number, text = 'beta'
 
 beforeEach(() => {
   vi.clearAllMocks();
+  URL.createObjectURL = vi.fn(() => 'blob:openrag-test') as unknown as typeof URL.createObjectURL;
+  URL.revokeObjectURL = vi.fn() as unknown as typeof URL.revokeObjectURL;
   filesApiMock.fetchWorkspaceContentBlob.mockResolvedValue(textBlob('alpha beta gamma'));
   filesApiMock.fetchContentBlob.mockResolvedValue(textBlob('alpha beta gamma'));
   filesApiMock.fetchWorkspacePreview.mockResolvedValue({ format: 'text', content: 'alpha beta gamma' });
@@ -141,6 +172,53 @@ describe('document-source-preview PDF positions', () => {
     await waitFor(() => {
       expect(container.querySelectorAll('.chunk-pdf-highlight')).toHaveLength(2);
     });
+  });
+
+  it('scrolls PDF previews to the explicit initial page when provided', async () => {
+    filesApiMock.fetchContentBlob.mockResolvedValueOnce(pdfBlob());
+    const scrollTo = vi.fn();
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.scrollTo = scrollTo as unknown as HTMLElement['scrollTo'];
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      const page = Number(this.getAttribute('data-pdf-page'));
+      const top = Number.isFinite(page) && page > 0 ? page * 100 : 0;
+      return {
+        x: 0,
+        y: top,
+        top,
+        left: 0,
+        bottom: top + 80,
+        right: 100,
+        width: 100,
+        height: 80,
+        toJSON: () => ({}),
+      } as DOMRect;
+    };
+
+    try {
+      render(
+        <DocumentSourcePreview
+          file={pdfFile()}
+          chunk={{
+            ...textChunk(0, 5),
+            page: 1,
+          }}
+          initialPage={4}
+        />
+      );
+
+      await waitFor(() => {
+        expect(
+          scrollTo.mock.calls.some(
+            ([arg]) => typeof arg === 'object' && arg?.top === 376 && arg?.behavior === 'auto'
+          )
+        ).toBe(true);
+      });
+    } finally {
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+      HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect;
+    }
   });
 });
 
