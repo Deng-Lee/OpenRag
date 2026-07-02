@@ -422,14 +422,33 @@ docker push ${HARBOR}/${HARBOR_PROJECT}/web:${TAG}
 
 推送完成后，所有 K8s YAML 里的 `image:` 应改为上述 **`${HARBOR}/${HARBOR_PROJECT}/...:${TAG}`** 形式。
 
-### 6.8 可选：containerd 节点直接导入 tar
+### 6.8 可选：无 Harbor 时按节点 runtime 直接导入 tar
 
-若内网节点 **无 Docker**、仅用 containerd，可在**每个节点**或制品机执行（路径与 tar 名按实际修改）：
+若内网暂时没有 Harbor / Registry，可将镜像包复制到**每个可能调度 OpenRag Pod 的节点**，再按该节点的实际 K8s runtime 导入。先确认 runtime：
+
+```bash
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.addresses[?(@.type=="InternalIP")].address}{"\t"}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}'
+```
+
+> 2026-07-02 内网部署记录：`node1` / `node2` / `node3`（`172.16.31.51` / `172.16.31.52` / `172.16.31.53`）确认均为 `docker://28.5.2`。因此这三个节点必须使用 `docker load`；仅执行 `ctr -n k8s.io images import ...` 会把镜像导入 containerd，但 kubelet 使用 Docker runtime 时仍会 `ImagePullBackOff`。
+
+Docker runtime 节点执行：
+
+```bash
+cd /root/lisiqi/docker_images/${TAG}
+sha256sum -c openrag-business-${TAG}.tar.sha256
+docker load -i openrag-business-${TAG}.tar
+docker images | grep -E 'openrag/(api|task-worker|web).*'"${TAG}"
+```
+
+若内网节点 **无 Docker**、仅用 containerd，才使用：
 
 ```bash
 sudo ctr -n k8s.io images import openrag-offline-${TAG}-images.tar
-# 导入后仍建议在 Harbor 中维护单一真源，由 kubelet 拉取，便于版本管理
+ctr -n k8s.io images ls | grep -E 'openrag/(api|task-worker|web).*'"${TAG}"
 ```
+
+无 Harbor 且使用节点本地镜像时，业务 YAML 中应使用节点已导入的镜像名，并设置 `imagePullPolicy: IfNotPresent`。长期仍建议在 Harbor 中维护单一真源，由 kubelet 从内网仓库拉取，便于版本管理。
 
 ### 6.9 可选：skopeo 直连同步（无 docker load 场景）
 
@@ -560,11 +579,92 @@ curl -sS http://127.0.0.1:8000/health
 
 ### 6.14 离线检查清单（在 第 8 节 基础上增加）
 
-- [ ] 所有工作负载镜像均为 **内网 Registry** 地址，且节点可拉取  
+- [ ] 所有工作负载镜像均为 **内网 Registry** 地址，且节点可拉取；若无 Harbor，则每个可调度节点均已按实际 runtime 导入本地镜像，并设置 `imagePullPolicy: IfNotPresent`  
 - [ ] 已配置 `imagePullSecrets`（若需要）  
 - [ ] 无公网 URL 残留在 Deployment、Ingress、环境变量（API 外呼除外且已走内网代理）  
 - [ ] Embedding / 解析链路所依赖的 **模型 HTTP 端点** 在内网可达  
 - [ ] 大镜像节点磁盘空间充足；必要时对 ES / Milvus 单独规划存储类与容量
+
+### 6.15 2026-07-02 内网业务更新踩坑记录
+
+本次目标只是更新 `openrag-api`、`openrag-task-worker`、`openrag-web` 三个业务镜像，第三方镜像不变。实际部署中踩到的坑如下，后续内网更新前必须逐项确认。
+
+1. **先区分“业务更新”和“全量基础设施更新”**  
+   业务更新不要直接执行 `kubectl apply -k .`。全量 apply 会重新应用 PostgreSQL、Milvus、Milvus etcd、Elasticsearch 等基础组件清单；即使第三方镜像 tag 没变，Deployment template、ConfigMap、Secret、PVC 名称或挂载变化也可能触发 Pod 重建，导致原本稳定运行的中间件暴露新配置问题。
+
+2. **业务更新只 apply 业务相关清单**  
+   本次无 Harbor、基础组件复用时，推荐只执行：
+
+   ```bash
+   kubectl apply -f 02-configmap-nginx.yaml \
+     -f 13-configmap-openrag-llm.yaml \
+     -f 14-configmap-openrag-web-runtime.yaml \
+     -f 15-configmap-openrag-service-conf.yaml \
+     -f 09-api.yaml \
+     -f 10-task-worker.yaml \
+     -f 11-web.yaml \
+     -f 12-ingress.yaml
+   ```
+
+   不要在业务发布阶段 apply `03-postgres.yaml`、`05-milvus-etcd.yaml`、`07-milvus-config.yaml`、`07-milvus.yaml`、`08-elasticsearch.yaml`，除非本次明确就是要变更这些基础组件。
+
+3. **无 Harbor 时必须按节点 runtime 导入镜像**  
+   2026-07-02 内网环境确认 `node1`、`node2`、`node3` 的 K8s runtime 均为 Docker，必须在每个可调度节点执行 `docker load`。只执行 `ctr -n k8s.io images import` 会导入到 containerd，但 kubelet 使用 Docker runtime 时仍可能 `ImagePullBackOff`。
+
+4. **渲染清单中的占位符必须在 apply 前处理**  
+   内网 profile 会保留 `CHANGE_ME_INTERNAL_MINIO_ACCESS_KEY`、`CHANGE_ME_INTERNAL_MINIO_SECRET_KEY` 等占位，`01-secret.example.yaml` 也可能包含示例值。部署前检查除示例 Secret 外的实际清单：
+
+   ```bash
+   find . -maxdepth 1 -name '*.yaml' ! -name '01-secret.example.yaml' -print0 |
+     xargs -0 grep -nE ':[[:space:]]*"?((CHANGE_ME|YOUR_)[^"]*)"?'
+   ```
+
+   预期无输出。若集群已有 `openrag-secrets`，不要用带占位符的 `01-secret.yaml` 覆盖它；只从现有 Secret 读取需要的 MinIO/PostgreSQL/JWT 等值并写入对应 ConfigMap 或 Deployment。处理密码时不要在日志、文档或终端记录真实值。
+
+5. **Alembic 要独立执行并验证**  
+   本次包含 Alembic 字段新增，应在业务 Pod 滚动前用与 API 相同 tag 的镜像执行一次 `python -m alembic upgrade head`，并确认 Job `condition met`。完成后可查 `alembic_version`，不要把数据库结构变更寄希望于业务容器启动时“顺手完成”。
+
+6. **看到 API init 等 Milvus 时，不要先排 API**  
+   `openrag-api` 的 initContainer 会等待 Milvus。如果日志反复出现 `waiting milvus`，根因通常在 `milvus` Pod、`milvus` Service/Endpoints、Milvus etcd 或 MinIO 配置，不是 API 镜像本身。先检查：
+
+   ```bash
+   kubectl -n openrag get pod -l app=milvus -o wide
+   kubectl -n openrag get endpoints milvus milvus-etcd
+   kubectl -n openrag logs deploy/milvus --previous --tail=300
+   ```
+
+7. **回滚 Deployment 时要指定稳定 revision**  
+   `kubectl rollout undo deployment/milvus` 默认只回到上一个 revision；如果排障过程中已经产生多个坏 revision，默认 undo 可能只是在坏版本之间来回切。先查看 ReplicaSet 与 revision，再回到明确稳定的版本：
+
+   ```bash
+   kubectl -n openrag get rs -l app=milvus \
+     -o custom-columns=RS:.metadata.name,REV:.metadata.annotations.deployment\\.kubernetes\\.io/revision,DESIRED:.spec.replicas,READY:.status.readyReplicas,AGE:.metadata.creationTimestamp
+
+   kubectl -n openrag rollout history deployment/milvus --revision=<REV>
+   kubectl -n openrag rollout undo deployment/milvus --to-revision=<STABLE_REV>
+   ```
+
+   注意：Deployment revision 不包含 ConfigMap、Secret、PVC 内容。若故障来自这些资源，回滚 Deployment 不会自动恢复它们。
+
+8. **验收用 GET，不要用 HEAD 误判健康接口**  
+   `/api/health` 只允许 `GET` 时，`curl -I` 会发 HEAD 请求并返回 `405 Method Not Allowed`，这不代表 API 不通。入口健康检查应使用：
+
+   ```bash
+   curl -i -H "Host: openrag.guozhijishu.com" http://172.16.31.51/api/health
+   ```
+
+9. **发布完成后做最小闭环验证**  
+   业务 rollout 成功后，确认镜像 tag、Pod、Endpoints 与入口：
+
+   ```bash
+   kubectl -n openrag get deploy openrag-api openrag-task-worker openrag-web \
+     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].image}{"\n"}{end}'
+   kubectl -n openrag get pod -l app=openrag-api -o wide
+   kubectl -n openrag get pod -l app=openrag-task-worker -o wide
+   kubectl -n openrag get pod -l app=openrag-web -o wide
+   kubectl -n openrag get endpoints api web milvus postgres elasticsearch
+   curl -i -H "Host: openrag.guozhijishu.com" http://172.16.31.51/api/health
+   ```
 
 ## 7. 水平扩展建议
 
