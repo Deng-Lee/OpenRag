@@ -138,6 +138,7 @@ class RetrievalService:
         retrieval_strategy: str = "auto",
         use_l1_llm_navigation: bool = False,
         vector_similarity_weight: float = 1.0,
+        scope_file_ids: Optional[set[int]] = None,
     ) -> list[dict]:
         """Search for relevant chunks.
 
@@ -178,6 +179,7 @@ class RetrievalService:
                     workspace_id,
                     flat_top_k,
                     vector_similarity_weight=vector_similarity_weight,
+                    scope_file_ids=scope_file_ids,
                 )
             )
             hits = _annotate_l1_llm_meta(hits, l1_llm_applied, l1_llm_skip_reason)
@@ -193,6 +195,7 @@ class RetrievalService:
                     workspace_id,
                     flat_top_k,
                     vector_similarity_weight=vector_similarity_weight,
+                    scope_file_ids=scope_file_ids,
                 )
             )
             hits = _annotate_l1_llm_meta(hits, l1_llm_applied, l1_llm_skip_reason)
@@ -216,6 +219,7 @@ class RetrievalService:
                 chunk_fetch_multiplier=m,
                 use_l1_llm_navigation=use_l1_llm_navigation,
                 vector_similarity_weight=vector_similarity_weight,
+                scope_file_ids=scope_file_ids,
             )
         )
         # _search_contextual sets _l1_llm_applied / _l1_llm_skip_reason on first hit
@@ -229,11 +233,12 @@ class RetrievalService:
         top_k: int,
         *,
         vector_similarity_weight: float = 1.0,
+        scope_file_ids: Optional[set[int]] = None,
     ) -> list[dict]:
-        query_vec = self._embed_query(query)
-        accessible_file_ids = self._accessible_file_ids(user_id, workspace_id)
+        accessible_file_ids = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
         if accessible_file_ids is not None and len(accessible_file_ids) == 0:
             return []
+        query_vec = self._embed_query(query)
 
         self.trace_service.start_span(
             "retrieval.chunk_search",
@@ -333,14 +338,18 @@ class RetrievalService:
         chunk_fetch_multiplier: int,
         use_l1_llm_navigation: bool = False,
         vector_similarity_weight: float = 1.0,
+        scope_file_ids: Optional[set[int]] = None,
     ) -> list[dict]:
-        query_vec = self._embed_query(query)
-        accessible = self._accessible_file_ids(user_id, workspace_id)
+        accessible = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
         if accessible is not None and len(accessible) == 0:
             return []
+        query_vec = self._embed_query(query)
 
+        # Always hand the effective file ids to the layer store so a large scope
+        # (>512) uses its oversample+post-filter path instead of an unfiltered
+        # full-workspace L0 top-N that could squeeze out in-scope candidates.
         use_expr_filter = accessible is not None and len(accessible) <= 512
-        l0_file_filter = accessible if use_expr_filter else None
+        l0_file_filter = accessible if accessible is not None else None
         l0_cap = max(l0_top_n * 4, 80)
 
         l0_hits = self.layer_store.search_layers(
@@ -363,6 +372,7 @@ class RetrievalService:
                 workspace_id,
                 top_k,
                 vector_similarity_weight=vector_similarity_weight,
+                scope_file_ids=scope_file_ids,
             )
 
         l1_hits = self.layer_store.search_layers(
@@ -797,6 +807,21 @@ class RetrievalService:
             ).scalars().all()
         )
         return [h for h in hits if h.get("file_id") in active]
+
+    def _effective_file_ids(
+        self,
+        user_id: int,
+        workspace_id: Optional[int],
+        scope_file_ids: Optional[set[int]] = None,
+    ) -> Optional[list[int]]:
+        """Return accessible ids intersected with the requested scope."""
+        accessible = self._accessible_file_ids(user_id, workspace_id)
+        if scope_file_ids is None:
+            return accessible
+        if accessible is None:
+            return list(scope_file_ids)
+        scope = set(scope_file_ids)
+        return [fid for fid in accessible if fid in scope]
 
     def _embed_query(self, query: str) -> list[float]:
         model_name = (
