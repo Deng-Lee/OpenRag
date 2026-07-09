@@ -20,6 +20,9 @@ openai>=1.0.0
 elasticsearch>=8.12.0,<9.0.0
 
 # Vector Database: Milvus 2.4+ required (see docker/docker-compose*.yml)
+# Keep API wheels compatible with older x86_64 hosts; newer NumPy wheels may
+# require x86_64-v2 and make pymilvus unavailable at search time.
+numpy==1.26.4
 pymilvus>=2.4.0,<2.7.0
 
 # FastAPI UploadFile / multipart form parsing requires this at runtime.
