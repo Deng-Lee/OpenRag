@@ -232,6 +232,7 @@ def test_document_processor_passes_document_type_to_chunk_engine(tmp_path, monke
         source = tmp_path / "source.txt"
         source.write_text("processor text", encoding="utf-8")
         chunk_engine = RecordingChunkEngine()
+        progress_values = []
         monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "600")
         monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "80")
 
@@ -253,10 +254,12 @@ def test_document_processor_passes_document_type_to_chunk_engine(tmp_path, monke
             user_id=user.id,
             parser_type="auto",
             document_type="manual",
+            progress_callback=progress_values.append,
         )
 
         assert chunk_engine.document_type == "manual"
         assert result["document_type"] == "manual"
+        assert progress_values == [5, 20, 35, 50, 65, 80, 90]
     finally:
         db.close()
         Base.metadata.drop_all(bind=engine)

@@ -253,6 +253,8 @@ class DocumentProcessor:
         # Step 1: Parse（策略仅在 ParserRegistry / Factory；此处只编排）
         file_record.processing_status = ProcessingStatus.parsing
         self.db.commit()
+        if progress_callback:
+            progress_callback(5)
         parser = self.parser_registry.get_parser(file_path, parser_type)
         print(
             "  [PIPELINE] Step 1 — "

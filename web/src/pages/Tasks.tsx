@@ -1,4 +1,4 @@
-import { Layout, Menu, Button, Dropdown, Space, Typography, Table, Tag, Card, Statistic, Row, Col, message, Tooltip, Badge, Modal, Switch } from 'antd';
+import { Layout, Menu, Button, Dropdown, Space, Typography, Table, Tag, Card, Statistic, Row, Col, message, Tooltip, Progress, Modal, Switch } from 'antd';
 import { SettingOutlined, LogoutOutlined, DownOutlined, TeamOutlined, PlusOutlined, ReloadOutlined, PauseCircleOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useState, useEffect } from 'react';
@@ -246,15 +246,18 @@ export default function Tasks() {
       title: '进度',
       dataIndex: 'progress',
       key: 'progress',
-      width: 100,
-      render: (progress: number, record: Task) => (
-        <Tooltip title={`${progress}%`}>
-          <Badge
-            status={record.status === 'started' ? 'processing' : 'default'}
-            text={`${progress}%`}
-          />
-        </Tooltip>
-      ),
+      width: 160,
+      render: (progress: number, record: Task) => {
+        const progressStatus =
+          record.status === 'started'
+            ? 'active'
+            : record.status === 'success'
+              ? 'success'
+              : record.status === 'failure'
+                ? 'exception'
+                : 'normal';
+        return <Progress percent={progress} status={progressStatus} size="small" />;
+      },
     },
     {
       title: '文件ID',
