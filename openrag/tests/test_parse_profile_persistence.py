@@ -78,6 +78,32 @@ def test_parse_span_profile_extracts_clean_subset():
     }
 
 
+def test_parse_span_profile_passes_through_paddleocr_extensions():
+    from openrag.processors.document_processor import _parse_span_profile
+
+    class _P:
+        last_parse_profile = {
+            "page_count": 3,
+            "total_ms": 100,
+            "block_count": 8,
+            "n_tables": 2,
+            "poll_count": 4,
+            "status": "ok",
+            "stages": [{"stage": "paddleocr.submit", "duration_ms": 10}],
+        }
+
+    out = _parse_span_profile(_P())
+    assert out == {
+        "total_ms": 100,
+        "page_count": 3,
+        "n_tables": 2,
+        "status": "ok",
+        "stages": [{"stage": "paddleocr.submit", "duration_ms": 10}],
+        "block_count": 8,
+        "poll_count": 4,
+    }
+
+
 def test_parse_span_profile_none_for_non_pdf_parser():
     from openrag.processors.document_processor import _parse_span_profile
 

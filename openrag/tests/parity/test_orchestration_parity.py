@@ -17,6 +17,11 @@ def test_resolve_chunk_method_pdf_and_ppt():
     assert resolve_chunk_method("x.docx", "auto") == "manual"
 
 
+def test_resolve_chunk_method_pdf_parsers_use_pdf_manual():
+    assert resolve_chunk_method("x.pdf", "pdf") == "pdf_manual"
+    assert resolve_chunk_method("x.pdf", "deepdoc") == "pdf_manual"
+
+
 def test_chunk_size_overlap_from_env_defaults():
     for k in ("OPENRAG_CHUNK_SIZE", "OPENRAG_CHUNK_OVERLAP"):
         os.environ.pop(k, None)

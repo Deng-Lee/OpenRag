@@ -114,6 +114,11 @@ spec:
                 configMapKeyRef:
                   name: openrag-llm-config
                   key: OPENAI_BASE_URL
+            - name: PADDLEOCR_SERVER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: PADDLEOCR_SERVER_URL
             - name: EMBEDDING_MODEL
               valueFrom:
                 configMapKeyRef:

@@ -258,6 +258,26 @@ class TestFileUpload:
         assert db.query(File).count() == 0
         assert db.query(Task).count() == 0
 
+    def test_upload_pdf_parser_rejects_spoofed_pdf_content_type(
+        self, client, db, test_user, test_workspace, monkeypatch
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+        monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", FakeMinioStorage)
+
+        files = {"file": ("notes.txt", io.BytesIO(b"not pdf"), "application/pdf")}
+        data = {
+            "path": "/uploads",
+            "workspace_id": str(test_workspace.id),
+            "parser_type": "pdf",
+        }
+
+        response = client.post("/files/upload", files=files, data=data)
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "PaddleOCR" in response.json()["detail"]
+        assert db.query(File).filter(File.is_directory.is_(False)).count() == 0
+        assert db.query(Task).count() == 0
+
 
 class TestFileList:
     """Test file listing endpoint"""
@@ -482,6 +502,17 @@ class TestFileGet:
         assert body["simple_status"] == "failed"
         assert body["error_message"] == "boom"
 
+    def test_get_file_includes_parser_type(self, client, db, test_user, test_file):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+        test_file.parser_type = "pdf"
+        db.add(test_file)
+        db.commit()
+
+        response = client.get(f"/files/{test_file.id}")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["parser_type"] == "pdf"
+
 
 class TestFileReprocessDocumentType:
     """Test document_type behavior on reprocess."""
@@ -532,6 +563,54 @@ class TestFileReprocessDocumentType:
         assert result["document_type"] == "laws"
         db.refresh(test_file)
         assert test_file.document_type == "laws"
+
+    def test_reprocess_explicit_auto_pdf_persists_pdf_default(
+        self, client, db, test_user, test_file, monkeypatch
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+        test_file.name = "report.pdf"
+        test_file.uri = "/test/report.pdf"
+        test_file.mime_type = "application/pdf"
+        test_file.parser_type = "deepdoc"
+        db.add(test_file)
+        db.commit()
+        monkeypatch.setattr(
+            "openrag.api.files_api.cleanup_file_processing_data",
+            lambda file, workspace_slug, db: None,
+        )
+
+        response = client.post(
+            f"/files/{test_file.id}/reprocess", json={"parser_type": "auto"}
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        db.refresh(test_file)
+        assert test_file.parser_type == "pdf"
+
+    def test_reprocess_without_parser_type_preserves_explicit_deepdoc(
+        self, client, db, test_user, test_file, monkeypatch
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+        test_file.name = "report.pdf"
+        test_file.uri = "/test/report.pdf"
+        test_file.mime_type = "application/pdf"
+        test_file.parser_type = "deepdoc"
+        db.add(test_file)
+        db.commit()
+        monkeypatch.setattr(
+            "openrag.api.files_api.cleanup_file_processing_data",
+            lambda file, workspace_slug, db: None,
+        )
+
+        response = client.post(f"/files/{test_file.id}/reprocess", json={})
+
+        assert response.status_code == status.HTTP_200_OK
+        db.refresh(test_file)
+        assert test_file.parser_type == "deepdoc"
 
 
 class TestFileDelete:

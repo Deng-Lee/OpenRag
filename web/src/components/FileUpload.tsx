@@ -28,8 +28,9 @@ const { Dragger } = Upload;
 const { Option } = Select;
 
 const PARSER_TYPES = [
-  { value: 'auto', label: '自动检测 (Auto)' },
-  { value: 'pdf', label: 'PDF 文档' },
+  { value: 'auto', label: '自动检测（PDF 默认使用 PaddleOCR）' },
+  { value: 'pdf', label: 'PDF（PaddleOCR 解析）' },
+  { value: 'deepdoc', label: 'PDF（DeepDoc 解析）' },
   { value: 'docx', label: 'Word 文档 (.docx)' },
   { value: 'xlsx', label: 'Excel 表格 (.xlsx)' },
   { value: 'pptx', label: 'PowerPoint (.pptx)' },
@@ -152,6 +153,7 @@ export default function FileUpload({
   // —— 文件夹拖拽上传：在现有上传区 drop 时自动识别目录并接管（不动 input、不加 directory:true）——
   const uploadPathRef = useRef(uploadPath);
   const workspaceIdRef = useRef(workspaceId);
+  const parserTypeRef = useRef(parserType);
   const documentTypeRef = useRef(documentType);
   const tagRef = useRef('');
   const uploadingRef = useRef(false); // 重入锁：同步读写，不靠 effect
@@ -162,6 +164,7 @@ export default function FileUpload({
   // 渲染期同步赋值——事件触发时一定拿到最新闭包/值
   uploadPathRef.current = uploadPath;
   workspaceIdRef.current = workspaceId;
+  parserTypeRef.current = parserType;
   documentTypeRef.current = documentType;
   tagRef.current = tag;
 
@@ -219,6 +222,14 @@ export default function FileUpload({
         showFolderSummary({ uploaded: 0, skipped: results.length, failed: 0 }, results);
         return;
       }
+      const folderParserType = parserTypeRef.current;
+      if (folderParserType === 'pdf') {
+        const nonPdf = accepted.find((it) => !it.relativePath.toLowerCase().endsWith('.pdf'));
+        if (nonPdf) {
+          message.error(t('files.upload.pdf_paddleocr_only'));
+          return;
+        }
+      }
 
       const total = accepted.length;
       let done = 0;
@@ -232,7 +243,7 @@ export default function FileUpload({
           const it = accepted[cursor++];
           const path = remoteParentDir(uploadPathRef.current, it.relativePath);
           try {
-            await filesAPI.upload(it.file, 'auto', workspaceIdRef.current, path, documentTypeRef.current);
+            await filesAPI.upload(it.file, folderParserType, workspaceIdRef.current, path, documentTypeRef.current);
             results.push({ rel: it.relativePath, status: 'uploaded' });
           } catch (error: unknown) {
             const err = error as { response?: { status?: number; data?: { detail?: string } } };

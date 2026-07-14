@@ -232,6 +232,7 @@
       "no_workspace": "请先选择工作区",
       "empty_folder": "空文件夹不支持上传",
       "no_uploadable": "没有可上传的文件（已全部过滤）",
+      "pdf_paddleocr_only": "PaddleOCR 文件夹上传仅支持 PDF 文件",
       "skip_junk": "隐藏/系统文件，已跳过",
       "skip_unsupported": "不支持的类型{{ext}}，已跳过",
       "skip_too_large": "超过 100MB，已跳过",
@@ -253,8 +254,9 @@
       "pdf_error": "PDF 渲染失败"
     },
     "parser_types": {
-      "auto": "自动检测",
-      "pdf": "PDF 解析器",
+      "auto": "自动检测（PDF 默认使用 PaddleOCR）",
+      "pdf": "PDF（PaddleOCR 解析）",
+      "deepdoc": "PDF（DeepDoc 解析）",
       "docx": "Word 文档解析器",
       "xlsx": "Excel 解析器",
       "pptx": "PowerPoint 解析器",

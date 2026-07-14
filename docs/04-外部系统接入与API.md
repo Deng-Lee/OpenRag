@@ -57,7 +57,27 @@ flowchart LR
 | `/service-tokens` | 服务令牌管理（CRUD、绑定、吊销）——见第二部分 |
 | `/embed/v1` | iframe 文档预览内部只读 API，仅配合短期 preview token 使用 |
 
-JWT 文件上传 `POST /files/upload` 还支持 `document_type`（`general`、`manual`、`laws`）和可选 `tag`，其中 `tag` 是工作区内唯一的单文件业务标识，重复时返回 **409**；`POST /files/{file_id}/reprocess` 可在重处理时更新或保留 `document_type`。服务令牌上传接口暴露 `parser_type` 和可选 `tag`，新文件默认按 `general` 处理。
+JWT 文件上传 `POST /files/upload` 还支持 `document_type`（`general`、`manual`、`laws`）和可选 `tag`，其中 `tag` 是工作区内唯一的单文件业务标识，重复时返回 **409**；`POST /files/{file_id}/reprocess` 可在重处理时更新或保留 `document_type`，也可通过请求体显式指定 `parser_type`。服务令牌上传接口暴露 `parser_type` 和可选 `tag`，新文件默认按 `general` 处理。
+
+PDF 的默认解析器已改为 PaddleOCR：`auto` 上传 PDF 时会持久化为 `parser_type=pdf`，显式 `pdf` 也使用 PaddleOCR；如需原 DeepDoc PDF 解析器，请显式传入 `parser_type=deepdoc`。`pdf` 与 `deepdoc` 都仅支持 PDF，并使用 `pdf_manual` 分块；PaddleOCR 解析失败不会自动降级到 DeepDoc。旧公开值 `paddleocr` 已移除。PaddleOCR v1 的点击回源使用 block 级 `bbox`，暂不提供行级 `line_positions`；内外网 PaddleOCR 服务地址由 worker 环境变量 `PADDLEOCR_SERVER_URL` 控制。
+
+JWT 上传时选择 PaddleOCR 的 multipart 示例：
+
+```bash
+curl -H "Authorization: Bearer <JWT>" \
+  -F "workspace_id=<id>" \
+  -F "file=@sample.pdf" \
+  -F "parser_type=pdf" \
+  http://<openrag-api>/files/upload
+```
+
+JWT 重处理时选择 PaddleOCR 的请求体示例：
+
+```json
+{
+  "parser_type": "pdf"
+}
+```
 
 文件删除接口默认采用异步软删除：被删除文件会立即从列表、检索、预览、分享与 service-token 读取接口中隐藏，并释放 `tag`；后台任务随后清理对象存储、chunk 与向量数据。
 
@@ -543,7 +563,9 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `create_dirs` | bool | 否 | `false` | 为 `true` 时先自动创建 `path` 及其所有缺失父目录（`mkdir -p`）再上传；缺省 `false` 时父目录须已存在，否则 **400** |
 | `tag` | string | 否 | `null` | 工作区内唯一的单文件业务标识；允许 `A-Za-z0-9._:-`，长度 1-128；空值按未设置处理 |
 
-**`parser_type` 支持值：** `auto`、`pdf`、`docx`、`xlsx`、`pptx`、`txt`、`md`、`html`、`json`、`csv`、`epub`
+**`parser_type` 支持值：** `auto`、`pdf`、`deepdoc`、`docx`、`xlsx`、`pptx`、`txt`、`md`、`html`、`json`、`csv`、`epub`
+
+`auto + PDF` 与显式 `pdf` 使用 PaddleOCR；显式 `deepdoc` 使用原 DeepDoc。两种 PDF 解析器都使用 `pdf_manual`，PaddleOCR 失败不会自动降级 DeepDoc。旧公开值 `paddleocr` 不再接受。PaddleOCR v1 点击回源使用 block 级 `bbox`，暂不做行级 `line_positions`；worker 通过 `PADDLEOCR_SERVER_URL` 选择内网或外网 PaddleOCR 服务地址。
 
 该 service-token 上传接口不接收 `document_type`；新文件会按默认 `general` 文档类型进入后续分块流水线。如需在上传时指定 `manual` 或 `laws`，使用 JWT `POST /files/upload`。
 
@@ -610,6 +632,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `parser_type` | string | 否 | `auto` | 解析器类型 |
 | `create_dirs` | bool | 否 | `false` | 为 `true` 时自动创建 `target_path` 的缺失父目录 |
 
+`auto + PDF` 与 `parser_type=pdf` 使用 PaddleOCR；`parser_type=deepdoc` 使用 DeepDoc。两者仅适用于 PDF，PaddleOCR 失败不会自动降级。
+
 **行为：**
 
 | 场景 | HTTP | `action` | 说明 |
@@ -658,6 +682,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 |------|------|------|------|------|
 | `file` | file | **是** | — | 新文件内容 |
 | `parser_type` | string | 否 | `auto` | 重新处理的解析器类型 |
+
+`auto + PDF` 与 `parser_type=pdf` 使用 PaddleOCR；`parser_type=deepdoc` 使用 DeepDoc。两者仅适用于 PDF，PaddleOCR 失败不会自动降级。
 
 **行为：** 覆盖 MinIO 存储，清除原有 chunks/向量，重新创建 `process_document` 任务；不会通过请求参数修改原文件的 `document_type`。
 
@@ -1143,6 +1169,16 @@ curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/docu
   -F "path=/incoming" \
   -F "tag=erp-contract-20260420" \
   -F "file=@./local.pdf"
+```
+
+**上传 PDF 并使用 PaddleOCR：**
+
+```bash
+curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/documents" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx" \
+  -F "path=/incoming" \
+  -F "parser_type=pdf" \
+  -F "file=@./sample.pdf"
 ```
 
 **按 tag 幂等写入文件：**

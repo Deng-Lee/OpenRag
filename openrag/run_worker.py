@@ -22,7 +22,7 @@ except ImportError as e:
         "若项目已配置 venv，请先激活 openrag\\\\venv 再运行: python run_worker.py"
     ) from e
 
-from openrag.worker import run_worker_loop
+from openrag.worker import TaskWorker
 
 if __name__ == "__main__":
     import argparse
@@ -42,9 +42,13 @@ if __name__ == "__main__":
     print(f"Poll interval: {args.poll_interval}s")
     print("-" * 50)
 
-    run_worker_loop(
+    worker = TaskWorker(
         api_base_url=args.api_url,
         worker_id=args.worker_id,
         batch_size=args.batch_size,
         poll_interval=args.poll_interval
     )
+    try:
+        worker.start()
+    except KeyboardInterrupt:
+        worker.stop()
