@@ -113,6 +113,18 @@ describe('API Client', () => {
     expect(result).toBe(data);
   });
 
+  it('uploads files with deepdoc parser type in FormData', async () => {
+    const data = { id: 1, name: 'ocr.pdf' };
+    mocks.mockAxiosInstance.post.mockResolvedValueOnce({ data });
+
+    const { filesAPI } = await import('./api');
+    const file = new File(['hello'], 'ocr.pdf', { type: 'application/pdf' });
+    await filesAPI.upload(file, 'deepdoc', 7, '/docs', 'general');
+
+    const [, formData] = mocks.mockAxiosInstance.post.mock.calls[0];
+    expect(formData.get('parser_type')).toBe('deepdoc');
+  });
+
   it('reprocesses files with document type in request body', async () => {
     const data = { id: 1, name: 'laws.pdf' };
     mocks.mockAxiosInstance.post.mockResolvedValueOnce({ data });
@@ -125,6 +137,19 @@ describe('API Client', () => {
       { parser_type: 'pdf', document_type: 'laws' }
     );
     expect(result).toBe(data);
+  });
+
+  it('reprocesses files with deepdoc parser type in request body', async () => {
+    const data = { id: 1, name: 'ocr.pdf' };
+    mocks.mockAxiosInstance.post.mockResolvedValueOnce({ data });
+
+    const { filesAPI } = await import('./api');
+    await filesAPI.reprocess(1, 'deepdoc', 'general');
+
+    expect(mocks.mockAxiosInstance.post).toHaveBeenCalledWith(
+      '/files/1/reprocess',
+      { parser_type: 'deepdoc', document_type: 'general' }
+    );
   });
 
   it('fetches workspace file chunk source', async () => {

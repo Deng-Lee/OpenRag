@@ -13,8 +13,9 @@ class ParserFactory:
 
     def __init__(self):
         self._parsers: Dict[str, DocumentParser] = {}
+        self._typed_parsers: Dict[str, DocumentParser] = {}
         self._parser_classes = {
-            '.pdf': 'openrag.parsers.adapters.pdf_adapter.PDFParserAdapter',
+            '.pdf': 'openrag.parsers.adapters.paddleocr_pdf_adapter.PaddleOCRPDFParserAdapter',
             '.docx': 'openrag.parsers.adapters.docx_adapter.DocxParserAdapter',
             '.doc': 'openrag.parsers.adapters.docx_adapter.DocxParserAdapter',
             '.xlsx': 'openrag.parsers.adapters.excel_adapter.ExcelParserAdapter',
@@ -34,6 +35,9 @@ class ParserFactory:
             '.jsonl': 'openrag.parsers.adapters.json_adapter.JsonParserAdapter',
             '.ldjson': 'openrag.parsers.adapters.json_adapter.JsonParserAdapter',
             '.epub': 'openrag.parsers.adapters.epub_adapter.EpubParserAdapter',
+        }
+        self._parser_type_classes = {
+            'deepdoc': 'openrag.parsers.adapters.pdf_adapter.PDFParserAdapter',
         }
         # 解析器类型映射（用于用户指定类型）
         self._parser_type_map = {
@@ -126,6 +130,15 @@ class ParserFactory:
         """
         if parser_type == 'auto':
             raise ValueError("请使用 get_parser() 方法进行自动检测")
+
+        if parser_type in self._parser_type_classes:
+            if parser_type not in self._typed_parsers:
+                class_path = self._parser_type_classes[parser_type]
+                module_path, class_name = class_path.rsplit('.', 1)
+                module = importlib.import_module(module_path)
+                parser_class = getattr(module, class_name)
+                self._typed_parsers[parser_type] = parser_class()
+            return self._typed_parsers[parser_type]
 
         if parser_type not in self._parser_type_map:
             raise ValueError(f"不支持的解析器类型: {parser_type}")

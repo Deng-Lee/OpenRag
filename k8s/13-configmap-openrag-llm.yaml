@@ -7,6 +7,7 @@ metadata:
   namespace: openrag
 data:
   OPENAI_BASE_URL: "http://litellm.dev.guozhijishu.com/v1"
+  PADDLEOCR_SERVER_URL: ""
   EMBEDDING_MODEL: "Qwen3-Embedding-4B"
   EMBEDDING_DIMENSION: "2560"
   L1_NAV_MODEL: "DeepSeek-V4-Flash"

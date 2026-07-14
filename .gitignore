@@ -75,3 +75,7 @@ openrag-offline-*.tar
 
 # Local commit-history summary (not tracked)
 worktime.md
+
+# Local PaddleOCR diagnostics / chunk exports
+diagnostics/
+file_*_chunks*.txt

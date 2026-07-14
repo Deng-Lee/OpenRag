@@ -36,6 +36,7 @@ from openrag.services.file_ingest import (
     resolve_effective_mime_type,
     validate_path,
 )
+from openrag.parsers.selection import resolve_pdf_default_parser_type
 from openrag.services.task_service import TaskService
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
@@ -137,6 +138,7 @@ class FileResponse(BaseModel):
     is_directory: bool
     size: int
     mime_type: Optional[str]
+    parser_type: Optional[str] = None
     document_type: str
     tag: Optional[str] = None
     created_at: str
@@ -279,6 +281,7 @@ def _file_to_response(file: FileModel, owner_name_map: Optional[dict[int, str]] 
         is_directory=file.is_directory,
         size=file.size,
         mime_type=file.mime_type,
+        parser_type=file.parser_type,
         document_type=getattr(file, "document_type", None) or DEFAULT_DOCUMENT_TYPE,
         tag=file.tag,
         created_at=file.created_at.isoformat(),
@@ -1159,20 +1162,26 @@ async def reprocess_file(
             detail=f"Workspace {file.workspace_id} not found",
         )
 
+    # Determine parser type to use (before cleanup)
+    parser_type = (
+        request.parser_type if request.parser_type is not None else file.parser_type
+    ) or "auto"
+    if parser_type not in SUPPORTED_PARSER_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
+        )
+    parser_type = resolve_pdf_default_parser_type(file.name or "", parser_type)
+
     # Validate MIME type
     effective_mime = resolve_effective_mime_type(
-        file.mime_type, file.name or "", file.parser_type
+        file.mime_type, file.name or "", parser_type
     )
-    if not is_processing_supported(file.mime_type, file.name or "", file.parser_type):
+    if not is_processing_supported(file.mime_type, file.name or "", parser_type):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File type {effective_mime} is not supported for processing"
         )
-
-    # Determine parser type to use (before cleanup)
-    parser_type = request.parser_type if request.parser_type else file.parser_type
-    if not parser_type:
-        parser_type = "auto"
 
     if request.document_type is not None:
         try:
