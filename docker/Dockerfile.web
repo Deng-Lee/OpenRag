@@ -36,6 +36,7 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 # Copy nginx configuration template
 COPY docker/nginx/nginx.conf /etc/nginx/templates/nginx.conf.template
 
+ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx
 ENV PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32:2026 http://172.16.31.61:2026 http://172.16.31.156:2026"
 
 # Expose port
