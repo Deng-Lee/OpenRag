@@ -17,6 +17,7 @@ from openrag.models.file import File as FileModel
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.retrieval.reranker import Reranker
 from openrag.retrieval.retrieval_service import (
+    PermissionScopeResolutionError,
     RetrievalService,
     l0_l1_retrieval_enabled,
 )
@@ -245,7 +246,22 @@ def assert_search_workspace_read(db: Session, user_id: int, workspace_id: Option
     allowed via check_user_permission. JWT endpoints only — not the service-token path."""
     if workspace_id is None:
         return
-    if not WorkspaceService(db).check_user_permission(workspace_id, user_id, "read"):
+    try:
+        allowed = WorkspaceService(db).check_user_permission(
+            workspace_id, user_id, "read"
+        )
+    except Exception as exc:
+        logger.exception(
+            "workspace_read_resolution_failed user_id=%s workspace_id=%s "
+            "exception_type=%s",
+            user_id,
+            workspace_id,
+            type(exc).__name__,
+        )
+        raise PermissionScopeResolutionError(
+            "Workspace read permission could not be resolved"
+        ) from exc
+    if not allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Read permission required",
@@ -259,41 +275,83 @@ def _execute_search(
     *,
     endpoint: str,
     rerank_hierarchical_boost: Optional[float],
+    workspace_access_prevalidated: bool = False,
 ) -> SearchResponse:
     start = time.time()
-    scope_file_ids = None
-    if request.paths is not None:
-        if request.workspace_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="workspace_id is required when paths is set",
-            )
-        scope_file_ids = resolve_scope_file_ids(db, request.workspace_id, request.paths)
-    # Empty scope (paths=[], non-existent path, empty dir) can never match anything.
-    # Short-circuit before initializing trace/embedding/Milvus/layer/fulltext stores.
-    if scope_file_ids is not None and len(scope_file_ids) == 0:
-        return SearchResponse(
-            results=[],
-            total=0,
-            query_time_ms=(time.time() - start) * 1000,
-            l1_llm_applied=None,
-            l1_llm_skip_reason=None,
-        )
     trace_service, started_trace_run = _prepare_retrieval_trace(
         db=db,
         user_id=user_id,
         request=request,
         endpoint=endpoint,
     )
-    svc = RetrievalService(
-        db=db,
-        embedding_engine=_get_embedding_engine(),
-        vector_store=_get_vector_store(),
-        layer_store=_get_layer_store(),
-        fulltext_store=_get_fulltext_store(),
-    )
 
     try:
+        if workspace_access_prevalidated and request.workspace_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Invalid prevalidated workspace scope",
+            )
+        if not workspace_access_prevalidated:
+            assert_search_workspace_read(db, user_id, request.workspace_id)
+
+        scope_file_ids = None
+        if request.paths is not None:
+            if request.workspace_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="workspace_id is required when paths is set",
+                )
+            try:
+                scope_file_ids = resolve_scope_file_ids(
+                    db,
+                    request.workspace_id,
+                    request.paths,
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "path_scope_resolution_failed user_id=%s workspace_id=%s "
+                    "endpoint=%s exception_type=%s",
+                    user_id,
+                    request.workspace_id,
+                    endpoint,
+                    type(exc).__name__,
+                )
+                raise PermissionScopeResolutionError(
+                    "Search path scope could not be resolved"
+                ) from exc
+
+        # Resolve authorization once before initializing retrieval dependencies.
+        svc = RetrievalService(
+            db=db,
+            embedding_engine=None,
+            vector_store=None,
+            layer_store=None,
+            fulltext_store=None,
+        )
+        resolved_file_scope = svc.resolve_file_scope(
+            user_id,
+            request.workspace_id,
+            scope_file_ids,
+        )
+
+        if resolved_file_scope.file_ids == ():
+            if started_trace_run:
+                trace_service.finish_run()
+            return SearchResponse(
+                results=[],
+                total=0,
+                query_time_ms=(time.time() - start) * 1000,
+                l1_llm_applied=None,
+                l1_llm_skip_reason=None,
+            )
+
+        svc.embedding_engine = _get_embedding_engine()
+        svc.vector_store = _get_vector_store()
+        svc.layer_store = _get_layer_store()
+        svc.fulltext_store = _get_fulltext_store()
+
         hierarchy_enabled = l0_l1_retrieval_enabled()
         use_contextual_retrieval = request.use_contextual_retrieval and hierarchy_enabled
         use_l1_llm_navigation = request.use_l1_llm_navigation and hierarchy_enabled
@@ -318,7 +376,7 @@ def _execute_search(
                 retrieval_strategy=request.retrieval_strategy,
                 use_l1_llm_navigation=use_l1_llm_navigation,
                 vector_similarity_weight=request.vector_similarity_weight,
-                scope_file_ids=scope_file_ids,
+                resolved_file_scope=resolved_file_scope,
             )
         else:
             fetch_k = request.top_k * 3 if request.use_rerank else request.top_k
@@ -331,7 +389,7 @@ def _execute_search(
                 retrieval_strategy=request.retrieval_strategy,
                 use_l1_llm_navigation=False,
                 vector_similarity_weight=request.vector_similarity_weight,
-                scope_file_ids=scope_file_ids,
+                resolved_file_scope=resolved_file_scope,
             )
 
             pre_rerank_results = list(results)
@@ -421,6 +479,37 @@ def _execute_search(
             l1_llm_applied=l1_llm_applied,
             l1_llm_skip_reason=l1_llm_skip_reason,
         )
+    except PermissionScopeResolutionError as exc:
+        if started_trace_run:
+            trace_service.fail_run(
+                error_stage="authorization.scope_resolution",
+                error_message="permission_scope_resolution_failed",
+            )
+        cause = exc.__cause__ or exc
+        logger.error(
+            "search_authorization_unavailable endpoint=%s user_id=%s workspace_id=%s "
+            "exception_type=%s",
+            endpoint,
+            user_id,
+            request.workspace_id,
+            type(cause).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Search authorization temporarily unavailable",
+        ) from exc
+    except HTTPException as exc:
+        if started_trace_run:
+            is_denied = exc.status_code == status.HTTP_403_FORBIDDEN
+            trace_service.fail_run(
+                error_stage=(
+                    "authorization.workspace_read" if is_denied else "retrieval"
+                ),
+                error_message=(
+                    "workspace_read_denied" if is_denied else f"http_{exc.status_code}"
+                ),
+            )
+        raise
     except Exception as exc:
         if started_trace_run:
             trace_service.fail_run(error_stage="retrieval", error_message=str(exc))
@@ -435,7 +524,6 @@ async def semantic_search(
     db: Session = Depends(get_db),
 ):
     """Semantic search with permission filtering and optional reranking."""
-    assert_search_workspace_read(db, user_id, request.workspace_id)
     try:
         return _execute_search(
             db,
@@ -458,7 +546,6 @@ async def hierarchical_search(
     db: Session = Depends(get_db),
 ):
     """Hierarchical search (title/heading aware) with permission filtering."""
-    assert_search_workspace_read(db, user_id, request.workspace_id)
     try:
         return _execute_search(
             db,

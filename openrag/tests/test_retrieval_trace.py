@@ -110,6 +110,7 @@ def test_semantic_search_records_retrieval_trace_spans_and_top50_snapshots(
         request=request,
         endpoint="semantic",
         rerank_hierarchical_boost=None,
+        workspace_access_prevalidated=True,
     )
 
     assert response.total == 2
@@ -240,6 +241,7 @@ def test_elasticsearch_failure_records_skip_reason_without_breaking_search(
         request=request,
         endpoint="semantic",
         rerank_hierarchical_boost=None,
+        workspace_access_prevalidated=True,
     )
 
     assert response.total == 2

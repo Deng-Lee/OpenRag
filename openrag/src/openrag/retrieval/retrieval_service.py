@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import select
@@ -35,6 +36,24 @@ _LIGHT_CHUNK_MULT = 2
 
 _L1_LLM_META_APPLIED = "_l1_llm_applied"
 _L1_LLM_META_SKIP_REASON = "_l1_llm_skip_reason"
+
+
+class PermissionScopeResolutionError(RuntimeError):
+    """Raised when the search authorization scope cannot be resolved safely."""
+
+
+@dataclass(frozen=True)
+class ResolvedFileScope:
+    """Immutable, already-authorized file scope for one search request."""
+
+    file_ids: Optional[tuple[int, ...]]
+
+    @classmethod
+    def from_file_ids(cls, file_ids: Optional[list[int]]) -> "ResolvedFileScope":
+        return cls(None if file_ids is None else tuple(file_ids))
+
+    def as_list(self) -> Optional[list[int]]:
+        return None if self.file_ids is None else list(self.file_ids)
 
 
 def l0_l1_retrieval_enabled() -> bool:
@@ -139,6 +158,7 @@ class RetrievalService:
         use_l1_llm_navigation: bool = False,
         vector_similarity_weight: float = 1.0,
         scope_file_ids: Optional[set[int]] = None,
+        resolved_file_scope: Optional[ResolvedFileScope] = None,
     ) -> list[dict]:
         """Search for relevant chunks.
 
@@ -152,6 +172,13 @@ class RetrievalService:
         if not l0_l1_retrieval_enabled():
             use_contextual = False
             use_l1_llm_navigation = False
+
+        if resolved_file_scope is None:
+            resolved_file_scope = self.resolve_file_scope(
+                user_id,
+                workspace_id,
+                scope_file_ids,
+            )
 
         setting = normalize_strategy(retrieval_strategy)
         strat = infer_retrieval_strategy(query) if setting == "auto" else setting
@@ -179,7 +206,7 @@ class RetrievalService:
                     workspace_id,
                     flat_top_k,
                     vector_similarity_weight=vector_similarity_weight,
-                    scope_file_ids=scope_file_ids,
+                    resolved_file_scope=resolved_file_scope,
                 )
             )
             hits = _annotate_l1_llm_meta(hits, l1_llm_applied, l1_llm_skip_reason)
@@ -195,7 +222,7 @@ class RetrievalService:
                     workspace_id,
                     flat_top_k,
                     vector_similarity_weight=vector_similarity_weight,
-                    scope_file_ids=scope_file_ids,
+                    resolved_file_scope=resolved_file_scope,
                 )
             )
             hits = _annotate_l1_llm_meta(hits, l1_llm_applied, l1_llm_skip_reason)
@@ -219,7 +246,7 @@ class RetrievalService:
                 chunk_fetch_multiplier=m,
                 use_l1_llm_navigation=use_l1_llm_navigation,
                 vector_similarity_weight=vector_similarity_weight,
-                scope_file_ids=scope_file_ids,
+                resolved_file_scope=resolved_file_scope,
             )
         )
         # _search_contextual sets _l1_llm_applied / _l1_llm_skip_reason on first hit
@@ -233,9 +260,9 @@ class RetrievalService:
         top_k: int,
         *,
         vector_similarity_weight: float = 1.0,
-        scope_file_ids: Optional[set[int]] = None,
+        resolved_file_scope: ResolvedFileScope,
     ) -> list[dict]:
-        accessible_file_ids = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
+        accessible_file_ids = resolved_file_scope.as_list()
         if accessible_file_ids is not None and len(accessible_file_ids) == 0:
             return []
         query_vec = self._embed_query(query)
@@ -254,6 +281,13 @@ class RetrievalService:
                 query_embedding=query_vec,
                 top_k=top_k,
                 file_ids=accessible_file_ids,
+            )
+            hits = self._filter_hits_to_authorized_files(
+                hits,
+                accessible_file_ids,
+                stage="l2",
+                user_id=user_id,
+                workspace_id=workspace_id,
             )
             self._record_chunk_search_snapshots(hits)
             self.trace_service.finish_span(output_summary={"hit_count": len(hits)})
@@ -336,11 +370,11 @@ class RetrievalService:
         l0_top_n: int,
         l1_top_n: int,
         chunk_fetch_multiplier: int,
+        resolved_file_scope: ResolvedFileScope,
         use_l1_llm_navigation: bool = False,
         vector_similarity_weight: float = 1.0,
-        scope_file_ids: Optional[set[int]] = None,
     ) -> list[dict]:
-        accessible = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
+        accessible = resolved_file_scope.as_list()
         if accessible is not None and len(accessible) == 0:
             return []
         query_vec = self._embed_query(query)
@@ -348,16 +382,19 @@ class RetrievalService:
         # Always hand the effective file ids to the layer store so a large scope
         # (>512) uses its oversample+post-filter path instead of an unfiltered
         # full-workspace L0 top-N that could squeeze out in-scope candidates.
-        use_expr_filter = accessible is not None and len(accessible) <= 512
         l0_file_filter = accessible if accessible is not None else None
         l0_cap = max(l0_top_n * 4, 80)
 
         l0_hits = self.layer_store.search_layers(
             query_vec, "l0", top_k=l0_cap, file_ids=l0_file_filter
         )
-        if accessible is not None and not use_expr_filter:
-            acc_set = set(accessible)
-            l0_hits = [h for h in l0_hits if h.get("file_id") in acc_set]
+        l0_hits = self._filter_hits_to_authorized_files(
+            l0_hits,
+            accessible,
+            stage="l0",
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
         l0_hits.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
         l0_hits = l0_hits[:l0_top_n]
 
@@ -372,7 +409,7 @@ class RetrievalService:
                 workspace_id,
                 top_k,
                 vector_similarity_weight=vector_similarity_weight,
-                scope_file_ids=scope_file_ids,
+                resolved_file_scope=resolved_file_scope,
             )
 
         l1_hits = self.layer_store.search_layers(
@@ -380,6 +417,13 @@ class RetrievalService:
             "l1",
             top_k=max(l1_top_n, len(candidate_files) * 3),
             file_ids=candidate_files,
+        )
+        l1_hits = self._filter_hits_to_authorized_files(
+            l1_hits,
+            candidate_files,
+            stage="l1",
+            user_id=user_id,
+            workspace_id=workspace_id,
         )
         file_l1_raw = _max_score_per_file(l1_hits)
 
@@ -415,6 +459,13 @@ class RetrievalService:
                 query_embedding=query_vec,
                 top_k=fetch_k,
                 file_ids=candidate_files,
+            )
+            chunk_hits = self._filter_hits_to_authorized_files(
+                chunk_hits,
+                candidate_files,
+                stage="l2",
+                user_id=user_id,
+                workspace_id=workspace_id,
             )
             self._record_chunk_search_snapshots(chunk_hits)
             self.trace_service.finish_span(output_summary={"hit_count": len(chunk_hits)})
@@ -708,12 +759,17 @@ class RetrievalService:
     def _accessible_file_ids(
         self, user_id: int, workspace_id: Optional[int] = None
     ) -> Optional[list[int]]:
-        """Return list of file IDs the user can access, or None for 'all'."""
-        from openrag.models.user import User
+        """Return accessible file IDs; None is reserved for verified admin-global access."""
+        try:
+            from openrag.models.user import User
 
-        user = self.db.query(User).filter(User.id == user_id).first()
-        if user and getattr(user, "is_admin", False):
-            if workspace_id:
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if user is None:
+                return []
+
+            if getattr(user, "is_admin", False):
+                if workspace_id is None:
+                    return None
                 rows = (
                     self.db.execute(
                         select(File.id).where(
@@ -725,22 +781,20 @@ class RetrievalService:
                     .all()
                 )
                 return list(rows)  # empty -> [] (no active files), NOT None
-            return None
 
-        if workspace_id:
-            rows = (
-                self.db.execute(
-                    select(File.id).where(
-                        File.workspace_id == workspace_id,
-                        File.deleted_at.is_(None),
+            if workspace_id is not None:
+                rows = (
+                    self.db.execute(
+                        select(File.id).where(
+                            File.workspace_id == workspace_id,
+                            File.deleted_at.is_(None),
+                        )
                     )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
-            return list(rows)
+                return list(rows)
 
-        try:
             from openrag.services.workspace_service import WorkspaceService
 
             ws_service = WorkspaceService(self.db)
@@ -761,11 +815,56 @@ class RetrievalService:
                 .all()
             )
             return list(rows)
-        except Exception:
-            logger.warning(
-                "Could not resolve workspace permissions; searching all files"
+        except Exception as exc:
+            logger.exception(
+                "permission_scope_resolution_failed user_id=%s workspace_id=%s "
+                "exception_type=%s",
+                user_id,
+                workspace_id,
+                type(exc).__name__,
             )
-            return None
+            raise PermissionScopeResolutionError(
+                "Search permission scope could not be resolved"
+            ) from exc
+
+    def _filter_hits_to_authorized_files(
+        self,
+        hits: list[dict],
+        allowed_file_ids: Optional[list[int]],
+        *,
+        stage: str,
+        user_id: int,
+        workspace_id: Optional[int],
+    ) -> list[dict]:
+        """Drop malformed or out-of-scope hits before tracing or DB enrichment."""
+        if allowed_file_ids is None:
+            return hits
+
+        allowed = {int(file_id) for file_id in allowed_file_ids}
+        kept: list[dict] = []
+        dropped = 0
+        for hit in hits:
+            try:
+                file_id = int(hit.get("file_id"))
+            except (TypeError, ValueError):
+                dropped += 1
+                continue
+            if file_id not in allowed:
+                dropped += 1
+                continue
+            hit["file_id"] = file_id
+            kept.append(hit)
+
+        if dropped:
+            logger.warning(
+                "unauthorized_retrieval_hits_dropped stage=%s user_id=%s "
+                "workspace_id=%s dropped=%d",
+                stage,
+                user_id,
+                workspace_id,
+                dropped,
+            )
+        return kept
 
     def _filter_to_active_file_ids(self, file_ids: list[int]) -> list[int]:
         """Keep only file_ids whose row is active (deleted_at IS NULL), order preserved.
@@ -822,6 +921,17 @@ class RetrievalService:
             return list(scope_file_ids)
         scope = set(scope_file_ids)
         return [fid for fid in accessible if fid in scope]
+
+    def resolve_file_scope(
+        self,
+        user_id: int,
+        workspace_id: Optional[int],
+        scope_file_ids: Optional[set[int]] = None,
+    ) -> ResolvedFileScope:
+        """Resolve the effective authorization scope exactly once for a request."""
+        return ResolvedFileScope.from_file_ids(
+            self._effective_file_ids(user_id, workspace_id, scope_file_ids)
+        )
 
     def _embed_query(self, query: str) -> list[float]:
         model_name = (

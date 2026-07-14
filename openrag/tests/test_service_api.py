@@ -405,6 +405,31 @@ def test_service_search_path_prefix_filter(
     mock_search.assert_called_once()
     assert mock_search.call_args[0][2].workspace_id == workspace.id
     assert mock_search.call_args[0][2].paths == ["/docs"]   # path_prefix -> paths
+    assert mock_search.call_args.kwargs["workspace_access_prevalidated"] is True
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_search_preserves_authorization_503(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    mock_search.side_effect = HTTPException(
+        status_code=503,
+        detail="Search authorization temporarily unavailable",
+    )
+
+    response = client.post(
+        f"/service/v1/workspaces/{workspace.name}/search",
+        json={"query": "hello"},
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Search authorization temporarily unavailable"
+    }
 
 
 def test_service_multi_workspace_search_requires_token(

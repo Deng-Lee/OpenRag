@@ -513,6 +513,7 @@ async def service_multi_workspace_semantic_search(
                 search_req,
                 endpoint="service_multi_workspace",
                 rerank_hierarchical_boost=None,
+                workspace_access_prevalidated=True,
             )
             workspace_count += 1
             query_time_ms += resp.query_time_ms
@@ -581,6 +582,7 @@ async def service_semantic_search(
             search_req,
             endpoint="service_semantic",
             rerank_hierarchical_boost=None,
+            workspace_access_prevalidated=True,
         )
         return resp
     except HTTPException:
