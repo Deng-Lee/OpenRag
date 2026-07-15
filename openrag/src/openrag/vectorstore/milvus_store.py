@@ -6,7 +6,9 @@ Environment variables:
 """
 
 import logging
+import math
 import os
+from numbers import Real
 from typing import Optional
 
 from pymilvus import (
@@ -20,6 +22,11 @@ from pymilvus import (
 )
 
 logger = logging.getLogger(__name__)
+
+from .errors import (
+    VectorSchemaMismatchError,
+    VectorWriteIncompleteError,
+)
 
 _COLLECTION = "openrag_chunks"
 _TEXT_MAX_LEN = 65535
@@ -104,12 +111,11 @@ class MilvusStore:
                 if field.dtype == DataType.FLOAT_VECTOR:
                     existing_dim = field.params.get("dim")
                     break
-            if existing_dim and existing_dim != self.dimension:
-                logger.warning(
-                    "Collection '%s' has dim=%d but need dim=%d; dropping and recreating",
-                    self.collection_name, existing_dim, self.dimension,
+            if existing_dim is None or int(existing_dim) != self.dimension:
+                raise VectorSchemaMismatchError(
+                    f"Collection {self.collection_name!r} dimension {existing_dim} "
+                    f"does not match configured dimension {self.dimension}"
                 )
-                existing.drop()
             else:
                 self._collection = existing
                 self._collection.load()
@@ -155,8 +161,7 @@ class MilvusStore:
         Returns:
             Number of inserted vectors.
         """
-        if not chunk_embeddings:
-            return 0
+        self._validate_chunk_embeddings(chunk_embeddings)
 
         chunk_ids = []
         file_ids = []
@@ -167,13 +172,6 @@ class MilvusStore:
         block_types = []
 
         for chunk, emb in chunk_embeddings:
-            if not isinstance(emb, list) or len(emb) != self.dimension:
-                logger.warning(
-                    "Skipping chunk with invalid embedding (type=%s, len=%s)",
-                    type(emb).__name__,
-                    len(emb) if isinstance(emb, list) else "N/A",
-                )
-                continue
             chunk_ids.append(str(getattr(chunk, "chunk_id", ""))[:64])
             file_ids.append(file_id)
             text = getattr(chunk, "text", str(chunk))
@@ -183,13 +181,10 @@ class MilvusStore:
             levels.append(getattr(chunk, "level", 0))
             block_types.append(str(getattr(chunk, "block_type", "text"))[:32])
 
-        if not chunk_ids:
-            logger.warning("No valid embeddings to insert for file_id=%d", file_id)
-            return 0
-
         data = [chunk_ids, file_ids, texts, embeddings, pages, levels, block_types]
         try:
-            self._collection.insert(data)
+            mutation_result = self._collection.insert(data)
+            self._assert_insert_count(len(chunk_ids), mutation_result)
             # Don't call flush() per insert — Milvus auto-flushes periodically.
             # Explicit flush blocks and can hang for hours on large datasets.
             logger.info("Inserted %d vectors for file_id=%d", len(chunk_ids), file_id)
@@ -197,6 +192,59 @@ class MilvusStore:
             logger.error("Milvus insert failed for file_id=%d: %s", file_id, exc)
             raise
         return len(chunk_ids)
+
+    def _validate_chunk_embeddings(self, chunk_embeddings: list[tuple]) -> None:
+        if not chunk_embeddings:
+            raise VectorWriteIncompleteError("Chunk vector batch must not be empty")
+        chunk_ids: list[str] = []
+        for pair in chunk_embeddings:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise VectorWriteIncompleteError("Chunk vector batch is malformed")
+            chunk, embedding = pair
+            chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+            if not chunk_id:
+                raise VectorWriteIncompleteError("Every chunk vector must have a chunk ID")
+            chunk_ids.append(chunk_id[:64])
+            if not isinstance(embedding, (list, tuple)) or len(embedding) != self.dimension:
+                raise VectorWriteIncompleteError("Chunk vector dimension is invalid")
+            values = []
+            for value in embedding:
+                if isinstance(value, bool) or not isinstance(value, Real):
+                    raise VectorWriteIncompleteError("Chunk vector contains invalid values")
+                number = float(value)
+                if not math.isfinite(number):
+                    raise VectorWriteIncompleteError("Chunk vector contains invalid values")
+                values.append(number)
+            if math.sqrt(sum(value * value for value in values)) <= 1e-12:
+                raise VectorWriteIncompleteError("Chunk vector must not be zero")
+        if len(set(chunk_ids)) != len(chunk_ids):
+            raise VectorWriteIncompleteError("Chunk vector IDs must be unique")
+
+    @staticmethod
+    def _assert_insert_count(expected: int, mutation_result) -> None:
+        actual = getattr(mutation_result, "insert_count", None)
+        if actual != expected:
+            raise VectorWriteIncompleteError(
+                f"Milvus inserted {actual!r} chunk vectors; expected {expected}",
+                retryable=True,
+            )
+
+    def probe(self) -> None:
+        if not utility.has_collection(self.collection_name):
+            raise RuntimeError("Milvus chunk collection is unavailable")
+        self._collection.load()
+        for field in self._collection.schema.fields:
+            if field.dtype == DataType.FLOAT_VECTOR:
+                existing_dim = field.params.get("dim")
+                if existing_dim is None or int(existing_dim) != self.dimension:
+                    raise VectorSchemaMismatchError(
+                        f"Collection {self.collection_name!r} dimension {existing_dim} "
+                        f"does not match configured dimension {self.dimension}"
+                    )
+                return
+        raise VectorSchemaMismatchError(
+            f"Collection {self.collection_name!r} has no float vector field"
+        )
 
     # ------------------------------------------------------------------
     # Search

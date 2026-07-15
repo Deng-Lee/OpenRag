@@ -26,6 +26,7 @@ setup(
         "aiofiles>=23.2.1",
         "python-docx>=1.1.0",
         "openpyxl>=3.1.2",
+        "Pillow>=10.0.0",
         "markdown>=3.6",
         "python-jose[cryptography]>=3.3.0",
         "passlib[bcrypt]>=1.7.4",
@@ -35,6 +36,10 @@ setup(
         "loguru>=0.7.2",
         "tenacity>=8.2.3",
         "pyyaml>=6.0",
+        "chardet>=5.2.0,<6.0.0",
+        "cn2an==0.5.22",
+        "roman-numbers==1.0.2",
+        "word2number==1.1",
     ],
     extras_require={
         "dev": [

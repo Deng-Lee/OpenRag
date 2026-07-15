@@ -203,6 +203,19 @@ async def health_check() -> Dict[str, Any]:
         # Don't expose error details in production
         # health_status["error"] = str(e)
 
+    # Report dependency readiness without making liveness depend on the provider.
+    try:
+        from openrag.api import search_api
+
+        embedding_engine = search_api._embedding_engine
+        health_status["embedding"] = (
+            embedding_engine.health_snapshot()
+            if embedding_engine is not None
+            else {"ready": False, "status": "not_initialized"}
+        )
+    except Exception:
+        health_status["embedding"] = {"ready": False, "status": "unknown"}
+
     return health_status
 
 

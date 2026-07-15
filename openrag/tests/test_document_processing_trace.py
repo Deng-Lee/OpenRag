@@ -111,7 +111,7 @@ class FakeChunkEngine:
                 },
             ),
             Chunk(text="tiny", chunk_id="chunk-2", page=2, block_type="text"),
-            Chunk(text="", chunk_id="chunk-3", page=2, block_type="text"),
+            Chunk(text="small", chunk_id="chunk-3", page=2, block_type="text"),
         ]
 
 
@@ -282,7 +282,7 @@ def test_document_processor_uses_canonical_source_for_text_like_parsers(tmp_path
             chunk_engine=chunk_engine,
             embedding_engine=FakeEmbeddingEngine(),
             minio_storage=processing_minio,
-            vector_store=None,
+            vector_store=FakeVectorStore(),
             layer_store=None,
             chunk_fulltext_store=None,
         )
@@ -398,9 +398,6 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         monkeypatch.setattr(task_worker, "ChunkEngine", FakeChunkEngine)
         monkeypatch.setattr(task_worker, "EmbeddingEngine", FakeEmbeddingEngine)
         monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
-        monkeypatch.setattr(task_worker, "_create_vector_store", lambda: FakeVectorStore())
-        monkeypatch.setattr(task_worker, "_create_layer_store", lambda: None)
-        monkeypatch.setattr(task_worker, "_create_es_chunk_store", lambda: FakeEsStore())
         monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "600")
         monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "80")
         monkeypatch.setenv("OPENRAG_MIN_CHUNK_TOKENS", "2")
@@ -415,7 +412,16 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             sampling_reason="unit-test",
         )
 
-        result = task_worker.TaskWorker()._process_document(
+        worker = task_worker.TaskWorker()
+        worker.parser_registry = FakeParserRegistry()
+        worker.chunk_engine = FakeChunkEngine()
+        worker.embedding_engine = FakeEmbeddingEngine()
+        worker.hierarchy_storage = object()
+        worker.vector_store = FakeVectorStore()
+        worker.layer_store = None
+        worker.chunk_fulltext_store = FakeEsStore()
+        worker.require_layer_vectors = False
+        result = worker._process_document(
             {
                 "file_id": file_id,
                 "workspace_id": workspace_id,
@@ -457,7 +463,7 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
 
             assert stages["chunk.build"].output_summary["chunk_count"] == 3
             assert stages["chunk.build"].output_summary["short_chunk_count"] == 2
-            assert stages["chunk.build"].output_summary["empty_chunk_count"] == 1
+            assert stages["chunk.build"].output_summary["empty_chunk_count"] == 0
             assert stages["embedding.chunks"].output_summary == {
                 "embedding_model": "fake-embedding",
                 "dimension": 3,
@@ -567,7 +573,7 @@ def test_process_document_persists_pdf_stage_profile_on_failure(tmp_path):
             chunk_engine=FakeChunkEngine(),
             embedding_engine=FakeEmbeddingEngine(),
             minio_storage=FakeProcessingMinio(),
-            vector_store=None,
+            vector_store=FakeVectorStore(),
             layer_store=None,
             chunk_fulltext_store=None,
         )
@@ -609,7 +615,7 @@ def test_process_document_persists_pdf_stage_profile_on_success(tmp_path):
             chunk_engine=FakeChunkEngine(),
             embedding_engine=FakeEmbeddingEngine(),
             minio_storage=FakeProcessingMinio(),
-            vector_store=None,
+            vector_store=FakeVectorStore(),
             layer_store=None,
             chunk_fulltext_store=None,
         )

@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from sqlalchemy import BigInteger, ForeignKey, Index, Integer, JSON, String, Text, TIMESTAMP
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, JSON, String, Text, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from openrag.models.base import Base, TimestampMixin
@@ -164,6 +164,15 @@ class Task(Base, TimestampMixin):
         nullable=True,
         comment="Error message if failed"
     )
+    error_code: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, comment="Stable task error code"
+    )
+    error_retryable: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP, nullable=True, comment="Earliest time a retry task may be assigned"
+    )
     payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(
         JSON,
         nullable=True,
@@ -197,6 +206,13 @@ class Task(Base, TimestampMixin):
         Index("idx_task_worker", "worker_id", "status"),
         # Index for timeout detection
         Index("idx_task_heartbeat", "status", "heartbeat_at"),
+        Index(
+            "idx_task_ready_retry",
+            "status",
+            "next_retry_at",
+            "priority",
+            "created_at",
+        ),
     )
 
     def __repr__(self) -> str:
@@ -226,5 +242,8 @@ class Task(Base, TimestampMixin):
             "worker_id": self.worker_id,
             "result": self.result,
             "error": self.error,
+            "error_code": self.error_code,
+            "error_retryable": self.error_retryable,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
             "payload": self.payload,
         }

@@ -1,7 +1,9 @@
 """Milvus collection for document L0 (abstract) / L1 (overview) embeddings."""
 
 import logging
+import math
 import os
+from numbers import Real
 from typing import Optional
 
 from pymilvus import (
@@ -17,6 +19,10 @@ from pymilvus import (
 from openrag.vectorstore.milvus_store import (
     non_vector_output_field_names,
     truncate_to_bytes,
+)
+from .errors import (
+    VectorSchemaMismatchError,
+    VectorWriteIncompleteError,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,14 +70,11 @@ class MilvusLayerStore:
                 if field.dtype == DataType.FLOAT_VECTOR:
                     existing_dim = field.params.get("dim")
                     break
-            if existing_dim and existing_dim != self.dimension:
-                logger.warning(
-                    "Dropping layer collection '%s' (dim %s != %s)",
-                    self.collection_name,
-                    existing_dim,
-                    self.dimension,
+            if existing_dim is None or int(existing_dim) != self.dimension:
+                raise VectorSchemaMismatchError(
+                    f"Collection {self.collection_name!r} dimension {existing_dim} "
+                    f"does not match configured dimension {self.dimension}"
                 )
-                existing.drop()
             else:
                 self._collection = existing
                 self._collection.load()
@@ -116,44 +119,84 @@ class MilvusLayerStore:
     def upsert_file_layers(
         self,
         file_id: int,
-        l0_text: Optional[str],
-        l1_text: Optional[str],
-        embed_text: callable,
+        layer_embeddings: list[tuple[str, str, list[float]]],
     ) -> int:
-        """Replace L0/L1 rows for a file. embed_text: str -> list[float]. Returns rows written."""
-        self.delete_by_file_id(file_id)
-        rows = 0
+        """Replace a file's already-generated and validated L0/L1 vectors."""
+        self._validate_layer_embeddings(layer_embeddings)
         layer_ids: list[str] = []
         file_ids: list[int] = []
         layers: list[str] = []
         texts: list[str] = []
         embeddings: list[list[float]] = []
 
-        for layer, text in (("l0", l0_text or ""), ("l1", l1_text or "")):
-            t = (text or "").strip()
-            if not t:
-                continue
-            emb = embed_text(t)
-            if not isinstance(emb, list) or len(emb) != self.dimension:
-                logger.warning(
-                    "Skip layer %s for file_id=%s: bad embedding len=%s",
-                    layer,
-                    file_id,
-                    len(emb) if isinstance(emb, list) else None,
-                )
-                continue
+        for layer, text, emb in layer_embeddings:
+            t = text.strip()
             layer_ids.append(_layer_row_id(file_id, layer))
             file_ids.append(file_id)
             layers.append(layer)
             texts.append(truncate_to_bytes(t, _TEXT_MAX_LEN))
-            embeddings.append(emb)
-            rows += 1
+            embeddings.append(list(emb))
 
-        if rows:
-            data = [layer_ids, file_ids, layers, texts, embeddings]
-            self._collection.insert(data)
-            logger.info("Inserted %d layer rows for file_id=%s", rows, file_id)
-        return rows
+        self.delete_by_file_id(file_id)
+        data = [layer_ids, file_ids, layers, texts, embeddings]
+        mutation_result = self._collection.insert(data)
+        self._assert_insert_count(len(layer_ids), mutation_result)
+        logger.info("Inserted %d layer rows for file_id=%s", len(layer_ids), file_id)
+        return len(layer_ids)
+
+    def _validate_layer_embeddings(
+        self, layer_embeddings: list[tuple[str, str, list[float]]]
+    ) -> None:
+        if not layer_embeddings:
+            raise VectorWriteIncompleteError("Layer vector batch must not be empty")
+        seen_layers: set[str] = set()
+        for item in layer_embeddings:
+            if not isinstance(item, tuple) or len(item) != 3:
+                raise VectorWriteIncompleteError("Layer vector batch is malformed")
+            layer, text, embedding = item
+            if layer not in {"l0", "l1"} or layer in seen_layers:
+                raise VectorWriteIncompleteError("Layer vector names must be unique l0/l1 values")
+            seen_layers.add(layer)
+            if not isinstance(text, str) or not text.strip():
+                raise VectorWriteIncompleteError("Layer vector text must not be blank")
+            if not isinstance(embedding, (list, tuple)) or len(embedding) != self.dimension:
+                raise VectorWriteIncompleteError("Layer vector dimension is invalid")
+            values = []
+            for value in embedding:
+                if isinstance(value, bool) or not isinstance(value, Real):
+                    raise VectorWriteIncompleteError("Layer vector contains invalid values")
+                number = float(value)
+                if not math.isfinite(number):
+                    raise VectorWriteIncompleteError("Layer vector contains invalid values")
+                values.append(number)
+            if math.sqrt(sum(value * value for value in values)) <= 1e-12:
+                raise VectorWriteIncompleteError("Layer vector must not be zero")
+
+    @staticmethod
+    def _assert_insert_count(expected: int, mutation_result) -> None:
+        actual = getattr(mutation_result, "insert_count", None)
+        if actual != expected:
+            raise VectorWriteIncompleteError(
+                f"Milvus inserted {actual!r} layer vectors; expected {expected}",
+                retryable=True,
+            )
+
+    def probe(self) -> None:
+        if not utility.has_collection(self.collection_name):
+            raise RuntimeError("Milvus layer collection is unavailable")
+        self._collection.load()
+        for field in self._collection.schema.fields:
+            if field.dtype == DataType.FLOAT_VECTOR:
+                existing_dim = field.params.get("dim")
+                if existing_dim is None or int(existing_dim) != self.dimension:
+                    raise VectorSchemaMismatchError(
+                        f"Collection {self.collection_name!r} dimension {existing_dim} "
+                        f"does not match configured dimension {self.dimension}"
+                    )
+                return
+        raise VectorSchemaMismatchError(
+            f"Collection {self.collection_name!r} has no float vector field"
+        )
 
     def search_layers(
         self,

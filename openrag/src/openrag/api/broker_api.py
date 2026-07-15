@@ -32,6 +32,9 @@ class TaskResponse(BaseModel):
     completed_at: str
     result: Optional[dict] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    error_retryable: bool = False
+    next_retry_at: Optional[str] = None
     payload: Optional[dict] = None
 
     class Config:

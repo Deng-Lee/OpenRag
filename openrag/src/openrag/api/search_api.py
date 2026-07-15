@@ -7,7 +7,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from openrag.database import get_db
@@ -15,6 +15,12 @@ from openrag.models import TraceRun
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel
 from openrag.embedding.embedding_engine import EmbeddingEngine
+from openrag.embedding.errors import (
+    EmbeddingConfigurationError,
+    EmbeddingError,
+    EmbeddingInputError,
+    EmbeddingResponseError,
+)
 from openrag.retrieval.reranker import Reranker
 from openrag.retrieval.retrieval_service import (
     PermissionScopeResolutionError,
@@ -35,7 +41,6 @@ router = APIRouter(prefix="/search", tags=["search"])
 _embedding_engine: Optional[EmbeddingEngine] = None
 _vector_store = None
 _layer_store_instance = None
-_layer_store_init_failed: bool = False
 _fulltext_store = None
 _fulltext_store_attempted: bool = False
 
@@ -56,7 +61,13 @@ def _get_vector_store():
             _vector_store = MilvusStore(dimension=_get_embedding_engine().dimension)
         except Exception as exc:
             logger.error("Cannot connect to Milvus: %s", exc)
-            raise HTTPException(status_code=503, detail="Vector database unavailable")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "vector_database_unavailable",
+                    "message": "Vector database is temporarily unavailable",
+                },
+            )
     return _vector_store
 
 
@@ -65,9 +76,7 @@ def _get_layer_store():
     if not l0_l1_retrieval_enabled():
         return None
 
-    global _layer_store_instance, _layer_store_init_failed
-    if _layer_store_init_failed:
-        return None
+    global _layer_store_instance
     if _layer_store_instance is not None:
         return _layer_store_instance
     try:
@@ -79,7 +88,6 @@ def _get_layer_store():
         return _layer_store_instance
     except Exception as exc:
         logger.warning("Layer store unavailable: %s", exc)
-        _layer_store_init_failed = True
         return None
 
 
@@ -137,6 +145,14 @@ class SearchRequest(BaseModel):
         None,
         description="限定检索范围到这些逻辑路径（文件夹递归 / 单文件）；需配合 workspace_id。空数组=空范围",
     )
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        query = value.strip()
+        if not query:
+            raise ValueError("Search query must not be blank")
+        return query
 
 
 class SearchResult(BaseModel):
@@ -268,6 +284,29 @@ def assert_search_workspace_read(db: Session, user_id: int, workspace_id: Option
         )
 
 
+def _embedding_error_to_http_exception(exc: EmbeddingError) -> HTTPException:
+    if isinstance(exc, EmbeddingInputError):
+        status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+        code = "embedding_input_invalid"
+        message = "Search query is invalid"
+    elif isinstance(exc, EmbeddingResponseError):
+        status_code = status.HTTP_502_BAD_GATEWAY
+        code = "embedding_response_invalid"
+        message = "Embedding service returned an invalid response"
+    elif isinstance(exc, EmbeddingConfigurationError):
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        code = "embedding_configuration_error"
+        message = "Semantic search is not configured"
+    else:
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        code = "embedding_service_unavailable"
+        message = "Semantic search is temporarily unavailable"
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
 def _execute_search(
     db: Session,
     user_id: int,
@@ -347,18 +386,29 @@ def _execute_search(
                 l1_llm_skip_reason=None,
             )
 
+        hierarchy_enabled = l0_l1_retrieval_enabled()
+        is_hierarchical = endpoint == "hierarchical"
+        needs_layer_store = request.use_contextual_retrieval or is_hierarchical
         svc.embedding_engine = _get_embedding_engine()
         svc.vector_store = _get_vector_store()
-        svc.layer_store = _get_layer_store()
+        svc.layer_store = _get_layer_store() if needs_layer_store else None
         svc.fulltext_store = _get_fulltext_store()
 
-        hierarchy_enabled = l0_l1_retrieval_enabled()
         use_contextual_retrieval = request.use_contextual_retrieval and hierarchy_enabled
         use_l1_llm_navigation = request.use_l1_llm_navigation and hierarchy_enabled
-        is_hierarchical = endpoint == "hierarchical"
         force_contextual = (
             hierarchy_enabled and is_hierarchical and not request.use_contextual_retrieval
         )
+        if needs_layer_store and (
+            not hierarchy_enabled or svc.layer_store is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "hierarchical_index_unavailable",
+                    "message": "Hierarchical search index is temporarily unavailable",
+                },
+            )
         effective_hierarchical_boost = (
             rerank_hierarchical_boost if hierarchy_enabled else None
         )
@@ -534,9 +584,22 @@ async def semantic_search(
         )
     except HTTPException:
         raise
+    except EmbeddingError as exc:
+        raise _embedding_error_to_http_exception(exc) from exc
     except Exception as exc:
         logger.exception("Search failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if type(exc).__module__.startswith("pymilvus"):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "vector_database_unavailable",
+                    "message": "Vector database is temporarily unavailable",
+                },
+            ) from exc
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "search_failed", "message": "Search request failed"},
+        ) from exc
 
 
 @router.post("/hierarchical", response_model=SearchResponse)
@@ -556,9 +619,22 @@ async def hierarchical_search(
         )
     except HTTPException:
         raise
+    except EmbeddingError as exc:
+        raise _embedding_error_to_http_exception(exc) from exc
     except Exception as exc:
         logger.exception("Search failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if type(exc).__module__.startswith("pymilvus"):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "vector_database_unavailable",
+                    "message": "Vector database is temporarily unavailable",
+                },
+            ) from exc
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "search_failed", "message": "Search request failed"},
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

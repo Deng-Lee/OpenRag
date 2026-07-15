@@ -44,6 +44,9 @@ class TaskResponse(BaseModel):
     completed_at: Optional[str]
     result: Optional[Dict[str, Any]]
     error: Optional[str]
+    error_code: Optional[str]
+    error_retryable: bool
+    next_retry_at: Optional[str]
 
 
 class TaskStatsResponse(BaseModel):
@@ -81,6 +84,9 @@ def task_to_response(task: Task) -> Dict[str, Any]:
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
         "result": task.result,
         "error": task.error,
+        "error_code": task.error_code,
+        "error_retryable": task.error_retryable,
+        "next_retry_at": task.next_retry_at.isoformat() if task.next_retry_at else None,
     }
 
 

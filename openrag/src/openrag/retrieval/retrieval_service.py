@@ -959,8 +959,12 @@ class RetrievalService:
             return query_vec
         except Exception as exc:
             self.trace_service.fail_span(
-                error_message=str(exc),
-                metrics={"embedding_model": str(model_name), "success": False},
+                error_message=getattr(exc, "code", "embedding_request_failed"),
+                metrics={
+                    "embedding_model": str(model_name),
+                    "success": False,
+                    "error_code": getattr(exc, "code", "EMBEDDING_REQUEST_FAILED"),
+                },
             )
             raise
 

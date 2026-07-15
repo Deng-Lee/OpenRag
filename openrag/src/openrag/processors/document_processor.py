@@ -1,6 +1,7 @@
 """Document processor orchestrating the complete processing pipeline."""
 
 import logging
+import math
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -28,6 +29,7 @@ from openrag.services.canonical_chunk_source import (
 from openrag.services.parse_artifact_service import ParseArtifactService
 from openrag.services.trace_service import TraceService
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
+from ..vectorstore.errors import VectorWriteIncompleteError
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +209,16 @@ class DocumentProcessor:
         l0_max_tokens: int = 100,
         l1_max_tokens: int = 2000,
         l1_section_preview_tokens: int = 200,
+        require_layer_vectors: bool = False,
     ):
+        if vector_store is None:
+            raise VectorWriteIncompleteError(
+                "Milvus chunk vector store is required for document processing"
+            )
+        if require_layer_vectors and layer_store is None:
+            raise VectorWriteIncompleteError(
+                "Milvus layer vector store is required when L0/L1 retrieval is enabled"
+            )
         self.db = db
         self.parser_registry = parser_registry
         self.chunk_engine = chunk_engine
@@ -216,12 +227,74 @@ class DocumentProcessor:
         self.minio_storage = minio_storage
         self.vector_store = vector_store
         self.layer_store = layer_store
+        self.require_layer_vectors = require_layer_vectors
         self.chunk_fulltext_store = chunk_fulltext_store
         self.hierarchy_builder = DocumentHierarchyBuilder(
             l0_max_tokens=l0_max_tokens,
             l1_max_tokens=l1_max_tokens,
             l1_section_preview_tokens=l1_section_preview_tokens,
         )
+
+    @staticmethod
+    def _validate_chunks(chunks: list) -> None:
+        if not chunks:
+            raise VectorWriteIncompleteError("Document processing produced no chunks")
+        chunk_ids: list[str] = []
+        for chunk in chunks:
+            chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+            text = getattr(chunk, "text", None)
+            if not chunk_id:
+                raise VectorWriteIncompleteError("Every document chunk must have a chunk ID")
+            if not isinstance(text, str) or not text.strip():
+                raise VectorWriteIncompleteError("Every document chunk must contain text")
+            chunk_ids.append(chunk_id[:64])
+        if len(set(chunk_ids)) != len(chunk_ids):
+            raise VectorWriteIncompleteError("Document chunk IDs must be unique")
+
+    def _build_layer_embeddings(self, hierarchy_result) -> list[tuple[str, str, list[float]]]:
+        if not self.require_layer_vectors:
+            return []
+        layer_texts = [
+            (layer, text.strip())
+            for layer, text in (("l0", hierarchy_result.l0), ("l1", hierarchy_result.l1))
+            if isinstance(text, str) and text.strip()
+        ]
+        if not layer_texts:
+            raise VectorWriteIncompleteError("L0/L1 retrieval requires non-empty layer text")
+        vectors = self.embedding_engine.embed_batch([text for _, text in layer_texts])
+        if len(vectors) != len(layer_texts):
+            raise VectorWriteIncompleteError(
+                "Layer embedding count does not match non-empty layer count"
+            )
+        return [
+            (layer, text, vector)
+            for (layer, text), vector in zip(layer_texts, vectors)
+        ]
+
+    @staticmethod
+    def _assert_processing_complete(
+        *,
+        chunk_count: int,
+        chunk_embedding_count: int,
+        milvus_chunk_insert_count: int,
+        document_chunk_metadata_count: int,
+        expected_layer_count: int,
+        milvus_layer_insert_count: int,
+    ) -> None:
+        counts = {
+            "chunk_count": chunk_count,
+            "chunk_embedding_count": chunk_embedding_count,
+            "milvus_chunk_insert_count": milvus_chunk_insert_count,
+            "document_chunk_metadata_count": document_chunk_metadata_count,
+        }
+        if chunk_count <= 0 or any(value != chunk_count for value in counts.values()):
+            raise VectorWriteIncompleteError(
+                "Document chunk, embedding, Milvus and metadata counts must match"
+            )
+        if milvus_layer_insert_count != expected_layer_count:
+            raise VectorWriteIncompleteError(
+                "Layer embedding and Milvus insert counts must match"
+            )
 
     def process_document(
         self,
@@ -490,6 +563,7 @@ class DocumentProcessor:
             progress_callback(50)
 
         # Step 4: Generate embeddings
+        self._validate_chunks(chunks)
         file_record.processing_status = ProcessingStatus.embedding
         self.db.commit()
         embedding_span = _safe_start_span(
@@ -503,6 +577,11 @@ class DocumentProcessor:
         )
         try:
             chunk_embeddings = self.embedding_engine.embed_chunks(chunks)
+            if len(chunk_embeddings) != len(chunks):
+                raise VectorWriteIncompleteError(
+                    "Chunk embedding count does not match chunk count"
+                )
+            layer_embeddings = self._build_layer_embeddings(hierarchy_result)
         except Exception as exc:
             _safe_fail_span(
                 trace_service,
@@ -523,7 +602,9 @@ class DocumentProcessor:
                 or self.embedding_engine.__class__.__name__,
                 "dimension": getattr(self.embedding_engine, "dimension", None),
                 "batch_size": len(chunks),
-                "batch_count": 1 if chunks else 0,
+                "batch_count": math.ceil(
+                    len(chunks) / max(1, getattr(self.embedding_engine, "batch_size", len(chunks)))
+                ),
                 "chunk_count": len(chunks),
                 "success_count": len(chunk_embeddings),
                 "failure_count": max(0, len(chunks) - len(chunk_embeddings)),
@@ -533,7 +614,7 @@ class DocumentProcessor:
         if progress_callback:
             progress_callback(65)
 
-        # Step 5: Store vectors in Milvus (if available)
+        # Step 5: Store vectors in Milvus
         vectors_stored = 0
         vector_span = _safe_start_span(
             trace_service,
@@ -547,21 +628,22 @@ class DocumentProcessor:
                 ),
             },
         )
-        if self.vector_store is not None:
-            try:
-                self.vector_store.delete_by_file_id(file_id)
-                vectors_stored = self.vector_store.insert_chunks(file_id, chunk_embeddings)
-            except Exception as exc:
-                _safe_fail_span(
-                    trace_service,
-                    vector_span,
-                    str(exc),
-                    metrics={"insert_count": vectors_stored},
+        try:
+            self.vector_store.delete_by_file_id(file_id)
+            vectors_stored = self.vector_store.insert_chunks(file_id, chunk_embeddings)
+            if vectors_stored != len(chunk_embeddings):
+                raise VectorWriteIncompleteError(
+                    "Milvus chunk insert count does not match embedding count"
                 )
-                raise
-            print(f"  [PIPELINE] Step 5 — Stored {vectors_stored} vectors in Milvus")
-        else:
-            print("  [PIPELINE] Step 5 — SKIPPED (no vector_store)")
+        except Exception as exc:
+            _safe_fail_span(
+                trace_service,
+                vector_span,
+                str(exc),
+                metrics={"insert_count": vectors_stored},
+            )
+            raise
+        print(f"  [PIPELINE] Step 5 — Stored {vectors_stored} vectors in Milvus")
         _safe_finish_span(
             trace_service,
             vector_span,
@@ -572,9 +654,7 @@ class DocumentProcessor:
                     if self.vector_store is not None
                     else None
                 ),
-                "failure_reason": (
-                    None if self.vector_store is not None else "vector_store_unavailable"
-                ),
+                "failure_reason": None,
             },
         )
 
@@ -674,17 +754,14 @@ class DocumentProcessor:
         )
 
         # Step 5b: L0/L1 向量写入 Milvus（与 openrag_layers 集合对齐）
-        if self.layer_store is not None:
-            try:
-                n_layers = self.layer_store.upsert_file_layers(
-                    file_id,
-                    hierarchy_result.l0,
-                    hierarchy_result.l1,
-                    self.embedding_engine.embed_text,
+        n_layers = 0
+        if self.require_layer_vectors:
+            n_layers = self.layer_store.upsert_file_layers(file_id, layer_embeddings)
+            if n_layers != len(layer_embeddings):
+                raise VectorWriteIncompleteError(
+                    "Milvus layer insert count does not match embedding count"
                 )
-                print(f"  [PIPELINE] Step 5b — Stored {n_layers} L0/L1 layer vectors")
-            except Exception as exc:
-                logger.warning("Layer vector upsert failed: %s", exc)
+            print(f"  [PIPELINE] Step 5b — Stored {n_layers} L0/L1 layer vectors")
         if progress_callback:
             progress_callback(80)
 
@@ -765,8 +842,9 @@ class DocumentProcessor:
         for i, chunk in enumerate(chunks):
             cid = str(getattr(chunk, "chunk_id", "") or "")[:64]
             if not cid:
-                logger.warning("Skipping chunk without chunk_id at index %s", i)
-                continue
+                raise VectorWriteIncompleteError(
+                    f"Document chunk at index {i} has no chunk ID"
+                )
             key = chunk_object_key(file_record.uri, i)
             if self.minio_storage and bucket:
                 obj_url = self.minio_storage.path_style_http_url(bucket, key)
@@ -823,6 +901,21 @@ class DocumentProcessor:
                 )
             )
             document_chunks_written += 1
+
+        self.db.flush()
+        document_chunk_metadata_count = (
+            self.db.query(DocumentChunk)
+            .filter(DocumentChunk.file_id == file_id)
+            .count()
+        )
+        self._assert_processing_complete(
+            chunk_count=len(chunks),
+            chunk_embedding_count=len(chunk_embeddings),
+            milvus_chunk_insert_count=vectors_stored,
+            document_chunk_metadata_count=document_chunk_metadata_count,
+            expected_layer_count=len(layer_embeddings),
+            milvus_layer_insert_count=n_layers,
+        )
 
         # Step 7: Update file metadata
         file_record.processing_error = None

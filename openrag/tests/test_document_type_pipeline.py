@@ -96,6 +96,14 @@ class FakeDownloadMinio:
         Path(file_path).write_text("worker text", encoding="utf-8")
 
 
+class FakeVectorStore:
+    def delete_by_file_id(self, file_id):
+        pass
+
+    def insert_chunks(self, file_id, chunk_embeddings):
+        return len(chunk_embeddings)
+
+
 class CapturingProcessor:
     document_type = None
 
@@ -242,7 +250,7 @@ def test_document_processor_passes_document_type_to_chunk_engine(tmp_path, monke
             embedding_engine=FakeEmbeddingEngine(),
             hierarchy_storage=FakeHierarchyStorage(),
             minio_storage=None,
-            vector_store=None,
+            vector_store=FakeVectorStore(),
             layer_store=None,
             chunk_fulltext_store=None,
         )
@@ -278,12 +286,18 @@ def test_worker_reads_file_document_type_and_returns_it(monkeypatch):
         monkeypatch.setattr(task_worker, "ChunkEngine", lambda: object())
         monkeypatch.setattr(task_worker, "EmbeddingEngine", lambda: object())
         monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
-        monkeypatch.setattr(task_worker, "_create_vector_store", lambda: None)
-        monkeypatch.setattr(task_worker, "_create_layer_store", lambda: None)
-        monkeypatch.setattr(task_worker, "_create_es_chunk_store", lambda: None)
         monkeypatch.setattr(task_worker, "DocumentProcessor", CapturingProcessor)
 
-        result = task_worker.TaskWorker()._process_document(
+        worker = task_worker.TaskWorker()
+        worker.parser_registry = object()
+        worker.chunk_engine = object()
+        worker.embedding_engine = object()
+        worker.hierarchy_storage = object()
+        worker.vector_store = object()
+        worker.layer_store = None
+        worker.chunk_fulltext_store = None
+        worker.require_layer_vectors = False
+        result = worker._process_document(
             {
                 "file_id": file_id,
                 "workspace_id": workspace_id,

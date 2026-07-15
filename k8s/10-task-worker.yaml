@@ -108,7 +108,7 @@ spec:
                 secretKeyRef:
                   name: openrag-secrets
                   key: OPENAI_API_KEY
-                  optional: true
+                  optional: false
             - name: OPENAI_BASE_URL
               valueFrom:
                 configMapKeyRef:
@@ -124,6 +124,26 @@ spec:
                 configMapKeyRef:
                   name: openrag-llm-config
                   key: EMBEDDING_DIMENSION
+            - name: EMBEDDING_BATCH_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: EMBEDDING_BATCH_SIZE
+            - name: EMBEDDING_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: EMBEDDING_TIMEOUT_SECONDS
+            - name: EMBEDDING_MAX_ATTEMPTS
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: EMBEDDING_MAX_ATTEMPTS
+            - name: EMBEDDING_PROBE_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: openrag-llm-config
+                  key: EMBEDDING_PROBE_INTERVAL_SECONDS
             - name: L1_NAV_MODEL
               valueFrom:
                 configMapKeyRef:

@@ -1,6 +1,6 @@
 """Task management service"""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -150,7 +150,9 @@ class TaskService:
         status: TaskStatus,
         progress: Optional[int] = None,
         result: Optional[Dict[str, Any]] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_retryable: Optional[bool] = None,
     ) -> Optional[Task]:
         """Update task status
 
@@ -184,10 +186,45 @@ class TaskService:
 
         if error is not None:
             task.error = error
+        if error_code is not None:
+            task.error_code = error_code
+        if error_retryable is not None:
+            task.error_retryable = error_retryable
+        if status == TaskStatus.SUCCESS:
+            task.error = None
+            task.error_code = None
+            task.error_retryable = False
+            task.next_retry_at = None
 
         self.db.commit()
         self.db.refresh(task)
 
+        return task
+
+    def schedule_task_retry(
+        self,
+        task_id: int,
+        *,
+        error: str,
+        error_code: str,
+        delay_seconds: int,
+    ) -> Optional[Task]:
+        task = self.get_task(task_id)
+        if not task or task.retry_count >= task.max_retries:
+            return None
+        task.status = TaskStatus.RETRY.value
+        task.retry_count += 1
+        task.progress = 0
+        task.error = error
+        task.error_code = error_code
+        task.error_retryable = True
+        task.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        task.worker_id = None
+        task.assigned_at = None
+        task.heartbeat_at = None
+        task.completed_at = None
+        self.db.commit()
+        self.db.refresh(task)
         return task
 
     def update_task_progress(self, task_id: int, progress: int) -> Optional[Task]:
@@ -262,6 +299,9 @@ class TaskService:
         task.progress = 0
         task.completed_at = None
         task.error = None
+        task.error_code = None
+        task.error_retryable = False
+        task.next_retry_at = None
 
         self.db.commit()
         self.db.refresh(task)

@@ -9,7 +9,7 @@ This module provides a pure embedded task broker that:
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from sqlalchemy import func, update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.orm import Session
 import threading
 import time
@@ -134,7 +134,7 @@ class TaskBroker:
             Task.workspace_id,
             func.count(Task.id).label('pending_count')
         ).filter(
-            Task.status == TaskStatus.PENDING.value
+            self._ready_task_filter()
         ).group_by(Task.workspace_id).all()
 
         if not workspace_stats:
@@ -245,7 +245,7 @@ class TaskBroker:
             # Must query and update in the same transaction for locking to work
             tasks = self.db.query(Task).filter(
                 Task.workspace_id == workspace_id,
-                Task.status == TaskStatus.PENDING.value
+                self._ready_task_filter()
             ).with_for_update(
                 skip_locked=True
             ).limit(quota).all()
@@ -277,3 +277,12 @@ class TaskBroker:
                 }
                 for ws_id, weight in self._dynamic_weights.items()
             }
+    @staticmethod
+    def _ready_task_filter():
+        return or_(
+            Task.status == TaskStatus.PENDING.value,
+            and_(
+                Task.status == TaskStatus.RETRY.value,
+                Task.next_retry_at <= func.now(),
+            ),
+        )

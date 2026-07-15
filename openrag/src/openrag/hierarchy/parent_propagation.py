@@ -1,7 +1,7 @@
 """A2: 子文档解析完成后，自底向上聚合父目录 L0/L1 并写入存储与 Milvus layers。"""
 
 import logging
-from typing import Callable, Optional
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ def propagate_parent_directory_hierarchies(
     bucket: str,
     minio: Optional[MinioStorage],
     layer_store,
-    embed_text: Callable[[str], list[float]],
+    embedding_engine,
     leaf_file_id: int,
     hstorage: Optional[HierarchyStorage] = None,
 ) -> int:
@@ -90,6 +90,22 @@ def propagate_parent_directory_hierarchies(
 
         dir_path = parent.uri or parent.name
         dh = mgr.aggregate_directory(dir_path, children_l0s, children_names)
+        layer_embeddings = []
+        if layer_store is not None:
+            layer_texts = [
+                (layer, text.strip())
+                for layer, text in (("l0", dh.l0), ("l1", dh.l1))
+                if isinstance(text, str) and text.strip()
+            ]
+            layer_vectors = embedding_engine.embed_batch(
+                [text for _, text in layer_texts]
+            )
+            if len(layer_vectors) != len(layer_texts):
+                raise RuntimeError("Parent directory layer embedding count mismatch")
+            layer_embeddings = [
+                (layer, text, vector)
+                for (layer, text), vector in zip(layer_texts, layer_vectors)
+            ]
 
         try:
             if minio and bucket:
@@ -115,9 +131,7 @@ def propagate_parent_directory_hierarchies(
 
             if layer_store is not None:
                 try:
-                    layer_store.upsert_file_layers(
-                        parent.id, dh.l0, dh.l1, embed_text
-                    )
+                    layer_store.upsert_file_layers(parent.id, layer_embeddings)
                 except Exception as exc:
                     logger.warning(
                         "Milvus L0/L1 for directory file_id=%s failed: %s",

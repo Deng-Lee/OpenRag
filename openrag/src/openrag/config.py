@@ -7,7 +7,7 @@ from typing import Optional
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -110,10 +110,21 @@ class PostgresConfig(BaseSettings):
 class EmbeddingConfig(BaseSettings):
     """Embedding 配置"""
 
-    model: str = "Qwen3-Embedding-4B"
-    provider: str = "openai"
-    api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
-    dimension: int = 2560
+    provider: str = Field(default="openai", validation_alias="EMBEDDING_PROVIDER")
+    model: str = Field(default="", validation_alias="EMBEDDING_MODEL")
+    api_key: Optional[SecretStr] = Field(default=None, validation_alias="OPENAI_API_KEY")
+    base_url: Optional[str] = Field(default=None, validation_alias="OPENAI_BASE_URL")
+    dimension: int = Field(default=0, validation_alias="EMBEDDING_DIMENSION")
+    batch_size: int = Field(default=8, validation_alias="EMBEDDING_BATCH_SIZE")
+    request_timeout_seconds: int = Field(
+        default=60, validation_alias="EMBEDDING_TIMEOUT_SECONDS"
+    )
+    max_attempts: int = Field(default=3, validation_alias="EMBEDDING_MAX_ATTEMPTS")
+    probe_interval_seconds: int = Field(
+        default=30, validation_alias="EMBEDDING_PROBE_INTERVAL_SECONDS"
+    )
+
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 
 
 class SecurityConfig(BaseSettings):

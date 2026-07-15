@@ -399,7 +399,10 @@ class TestErrorHandling:
             assert response.status_code == 500
             data = response.json()
             assert "detail" in data
-            assert data["detail"] == "AGFS client not initialized"
+            assert data["detail"] == {
+                "code": "search_failed",
+                "message": "Search request failed",
+            }
 
     def test_invalid_top_k(self, client, override_dependencies):
         """Test with invalid top_k parameter"""

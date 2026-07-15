@@ -48,6 +48,7 @@ def test_retrieval_service_disables_l0_l1_when_flag_false(monkeypatch):
     )
     service._accessible_file_ids = lambda user_id, workspace_id=None: None
     service._enrich_hits = lambda hits: None
+    service._filter_hits_to_active_files = lambda hits: hits
 
     results = service.search(
         "query",

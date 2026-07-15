@@ -17,13 +17,17 @@ import tempfile
 import requests
 import multiprocessing
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from openrag.processors.document_processor import DocumentProcessor
 from openrag.parsers.parser_registry import ParserRegistry
 from openrag.chunking.chunk_engine import ChunkEngine
 from openrag.chunking.document_type import normalize_document_type
 from openrag.embedding.embedding_engine import EmbeddingEngine
+from openrag.embedding.errors import (
+    EmbeddingConfigurationError,
+    EmbeddingProviderError,
+)
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
 from openrag.storage.minio_storage import MinioStorage
 from openrag.database import SessionLocal, get_engine
@@ -39,27 +43,20 @@ _logging.basicConfig(
 _logger = _logging.getLogger(__name__)
 
 
-def _create_vector_store():
-    """Create MilvusStore if Milvus is reachable; return None otherwise."""
-    try:
-        from openrag.vectorstore.milvus_store import MilvusStore
-        from openrag.embedding.embedding_engine import EmbeddingEngine as _EE
-        dim = _EE().dimension
-        return MilvusStore(dimension=dim)
-    except Exception as exc:
-        _logger.warning("Milvus unavailable, vectors will NOT be stored: %s", exc)
-        return None
+def _create_vector_store(embedding_engine: EmbeddingEngine):
+    """Create the required chunk vector store with the configured dimension."""
+    from openrag.vectorstore.milvus_store import MilvusStore
+
+    return MilvusStore(dimension=embedding_engine.dimension)
 
 
-def _create_layer_store():
-    """Create MilvusLayerStore for L0/L1 embeddings; return None if unreachable."""
-    try:
-        from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
-        from openrag.embedding.embedding_engine import EmbeddingEngine as _EE
-        return MilvusLayerStore(dimension=_EE().dimension)
-    except Exception as exc:
-        _logger.warning("Milvus layer store unavailable (L0/L1 vectors skipped): %s", exc)
+def _create_layer_store(embedding_engine: EmbeddingEngine, required: bool):
+    """Create the layer vector store only when L0/L1 retrieval is enabled."""
+    if not required:
         return None
+    from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
+
+    return MilvusLayerStore(dimension=embedding_engine.dimension)
 
 
 def _create_es_chunk_store():
@@ -96,8 +93,24 @@ class TaskWorker:
         self.batch_size = batch_size
         self.poll_interval = poll_interval
         self.running = False
+        self.embedding_engine = None
+        self.vector_store = None
+        self.layer_store = None
+        self.parser_registry = None
+        self.chunk_engine = None
+        self.hierarchy_storage = None
+        self.chunk_fulltext_store = None
+        self.require_layer_vectors = False
+        self.dependencies_ready = False
+        self.next_dependency_probe_at = 0.0
 
     _MAX_PROCESSING_ERROR_LEN = 4096
+
+    @staticmethod
+    def _sanitize_processing_error(exc: BaseException) -> str:
+        code = getattr(exc, "code", "PROCESSING_FAILED")
+        message = getattr(exc, "public_message", "Document processing failed")
+        return f"{code}: {message}"
 
     def _mark_file_failed(self, file_id: int, error: str) -> None:
         """Persist failed processing status and error text for a file (separate session)."""
@@ -115,13 +128,91 @@ class TaskWorker:
         finally:
             db.close()
 
+    def _mark_file_pending_for_retry(self, file_id: int, error: str) -> None:
+        from openrag.models.file import File, ProcessingStatus
+
+        db = SessionLocal()
+        try:
+            row = db.query(File).filter(File.id == file_id).first()
+            if not row or row.is_directory:
+                return
+            row.processing_status = ProcessingStatus.pending
+            row.processing_error = error[: self._MAX_PROCESSING_ERROR_LEN]
+            db.commit()
+        finally:
+            db.close()
+
+    def _initialize_processing_dependencies(self) -> None:
+        from openrag.retrieval.retrieval_service import l0_l1_retrieval_enabled
+
+        self.embedding_engine = EmbeddingEngine()
+        self.parser_registry = ParserRegistry()
+        self.chunk_engine = ChunkEngine()
+        self.hierarchy_storage = HierarchyStorage()
+        self.chunk_fulltext_store = _create_es_chunk_store()
+        self.require_layer_vectors = l0_l1_retrieval_enabled()
+        self._preflight_processing_dependencies()
+
+    def _preflight_processing_dependencies(self) -> bool:
+        if self.embedding_engine is None:
+            raise EmbeddingConfigurationError(
+                "EMBEDDING_CONFIG_INVALID", "Embedding dependency is not initialized"
+            )
+        try:
+            self.embedding_engine.probe()
+            if self.vector_store is None:
+                self.vector_store = _create_vector_store(self.embedding_engine)
+            self.vector_store.probe()
+            if self.require_layer_vectors and self.layer_store is None:
+                self.layer_store = _create_layer_store(
+                    self.embedding_engine, self.require_layer_vectors
+                )
+            if self.require_layer_vectors:
+                self.layer_store.probe()
+        except EmbeddingConfigurationError:
+            raise
+        except Exception as exc:
+            self.dependencies_ready = False
+            self.next_dependency_probe_at = (
+                time.monotonic() + self.embedding_engine.config.probe_interval_seconds
+            )
+            _logger.warning(
+                "embedding_probe_failure worker_id=%s error_code=%s",
+                self.worker_id,
+                getattr(exc, "code", "PROCESSING_DEPENDENCY_UNAVAILABLE"),
+            )
+            return False
+        self.dependencies_ready = True
+        self.next_dependency_probe_at = 0.0
+        return True
+
+    def _ensure_processing_dependencies_ready(self) -> bool:
+        if self.dependencies_ready:
+            return True
+        if time.monotonic() < self.next_dependency_probe_at:
+            return False
+        return self._preflight_processing_dependencies()
+
+    def _invalidate_embedding_readiness(self) -> None:
+        self.dependencies_ready = False
+        interval = (
+            self.embedding_engine.config.probe_interval_seconds
+            if self.embedding_engine is not None
+            else 30
+        )
+        self.next_dependency_probe_at = time.monotonic() + interval
+
     def start(self):
         """Start the worker loop — pulls one task at a time, executes it, then polls again."""
         self.running = True
+        self._initialize_processing_dependencies()
         print(f"Worker {self.worker_id} started")
 
         while self.running:
             try:
+                if not self._ensure_processing_dependencies_ready():
+                    time.sleep(self.poll_interval)
+                    continue
                 # Pull a single task from broker
                 task = self._pull_one_task()
 
@@ -212,21 +303,7 @@ class TaskWorker:
             print(f"Task {task_id} completed successfully")
 
         except Exception as e:
-            task_type = task.get("task_type") or "process_document"
-            file_id = task.get("file_id")
-            if task_type == "process_document" and file_id is not None:
-                try:
-                    self._mark_file_failed(int(file_id), str(e))
-                except Exception as mark_exc:
-                    _logger.warning(
-                        "Failed to mark file %s as failed: %s", file_id, mark_exc
-                    )
-            self._update_task_status(
-                task_id,
-                "failure",
-                error=str(e)
-            )
-            print(f"Task {task_id} failed: {e}")
+            self._handle_task_failure(task, e)
 
         finally:
             # Stop heartbeat
@@ -335,26 +412,18 @@ class TaskWorker:
                         pass
                 raise
 
-            # Initialize processing components
-            parser_registry = ParserRegistry()
-            chunk_engine = ChunkEngine()
-            embedding_engine = EmbeddingEngine()
-            hierarchy_storage = HierarchyStorage()
-            vector_store = _create_vector_store()
-            layer_store = _create_layer_store()
-            es_chunk_store = _create_es_chunk_store()
-
             # Create processor
             processor = DocumentProcessor(
                 db=db,
-                parser_registry=parser_registry,
-                chunk_engine=chunk_engine,
-                embedding_engine=embedding_engine,
-                hierarchy_storage=hierarchy_storage,
+                parser_registry=self.parser_registry,
+                chunk_engine=self.chunk_engine,
+                embedding_engine=self.embedding_engine,
+                hierarchy_storage=self.hierarchy_storage,
                 minio_storage=minio_storage,
-                vector_store=vector_store,
-                layer_store=layer_store,
-                chunk_fulltext_store=es_chunk_store,
+                vector_store=self.vector_store,
+                layer_store=self.layer_store,
+                chunk_fulltext_store=self.chunk_fulltext_store,
+                require_layer_vectors=self.require_layer_vectors,
             )
 
             # Process document
@@ -392,10 +461,10 @@ class TaskWorker:
                         db=db,
                         bucket=workspace.slug,
                         minio=minio_storage,
-                        layer_store=layer_store,
-                        embed_text=embedding_engine.embed_text,
+                        layer_store=self.layer_store,
+                        embedding_engine=self.embedding_engine,
                         leaf_file_id=file_id,
-                        hstorage=hierarchy_storage,
+                        hstorage=self.hierarchy_storage,
                     )
                     if n_dir:
                         print(f"  [DEBUG] Propagated directory L0/L1 for {n_dir} ancestor(s)")
@@ -543,13 +612,71 @@ class TaskWorker:
         finally:
             db.close()
 
+    @staticmethod
+    def _task_retry_delay(retry_count: int) -> int:
+        delays = (30, 120, 300)
+        return delays[min(max(retry_count, 0), len(delays) - 1)]
+
+    def _handle_task_failure(self, task: Dict[str, Any], exc: BaseException) -> None:
+        task_id = task["id"]
+        task_type = task.get("task_type") or "process_document"
+        file_id = task.get("file_id")
+        error = self._sanitize_processing_error(exc)
+        error_code = getattr(exc, "code", "PROCESSING_FAILED")
+        retryable = bool(getattr(exc, "retryable", False))
+        retry_count = int(task.get("retry_count") or 0)
+        max_retries = int(task.get("max_retries") or 0)
+
+        if isinstance(exc, EmbeddingProviderError):
+            self._invalidate_embedding_readiness()
+
+        if retryable and retry_count < max_retries:
+            delay = self._task_retry_delay(retry_count)
+            if task_type == "process_document" and file_id is not None:
+                self._mark_file_pending_for_retry(int(file_id), error)
+            self._update_task_status(
+                task_id,
+                "retry",
+                progress=0,
+                error=error,
+                error_code=error_code,
+                error_retryable=True,
+                next_retry_at=datetime.now(timezone.utc) + timedelta(seconds=delay),
+            )
+            _logger.warning(
+                "document_embedding_failed task_id=%s error_code=%s retryable=true retry_delay_seconds=%d",
+                task_id,
+                error_code,
+                delay,
+            )
+            return
+
+        if task_type == "process_document" and file_id is not None:
+            self._mark_file_failed(int(file_id), error)
+        self._update_task_status(
+            task_id,
+            "failure",
+            error=error,
+            error_code=error_code,
+            error_retryable=retryable,
+        )
+        _logger.warning(
+            "document_embedding_failed task_id=%s error_code=%s retryable=%s final=true",
+            task_id,
+            error_code,
+            retryable,
+        )
+
     def _update_task_status(
         self,
         task_id: int,
         status: str,
         progress: Optional[int] = None,
         result: Optional[Dict] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_retryable: Optional[bool] = None,
+        next_retry_at: Optional[datetime] = None,
     ):
         """Update task status via API
 
@@ -570,9 +697,27 @@ class TaskWorker:
                     task.result = result
                 if error:
                     task.error = error
+                if error_code is not None:
+                    task.error_code = error_code
+                if error_retryable is not None:
+                    task.error_retryable = error_retryable
 
                 if status == "success":
-                    task.completed_at = datetime.now()
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.error = None
+                    task.error_code = None
+                    task.error_retryable = False
+                    task.next_retry_at = None
+                elif status == "retry":
+                    task.retry_count += 1
+                    task.progress = 0
+                    task.next_retry_at = next_retry_at
+                    task.worker_id = None
+                    task.assigned_at = None
+                    task.heartbeat_at = None
+                    task.completed_at = None
+                elif status == "failure":
+                    task.completed_at = datetime.now(timezone.utc)
 
                 db.commit()
         finally:

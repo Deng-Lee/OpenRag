@@ -1,5 +1,27 @@
 """Embedding module for OpenRag."""
 
-from src.openrag.embedding.embedding_engine import EmbeddingEngine
+from .embedding_engine import (
+    EmbeddingEngine,
+    initialize_embedding_dependency,
+    validate_embedding_config,
+)
+from .errors import (
+    EmbeddingConfigurationError,
+    EmbeddingError,
+    EmbeddingInputError,
+    EmbeddingProviderError,
+    EmbeddingResponseError,
+    public_embedding_error,
+)
 
-__all__ = ["EmbeddingEngine"]
+__all__ = [
+    "EmbeddingConfigurationError",
+    "EmbeddingEngine",
+    "EmbeddingError",
+    "EmbeddingInputError",
+    "EmbeddingProviderError",
+    "EmbeddingResponseError",
+    "initialize_embedding_dependency",
+    "public_embedding_error",
+    "validate_embedding_config",
+]

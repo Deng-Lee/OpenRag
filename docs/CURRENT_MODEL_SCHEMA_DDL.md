@@ -11,7 +11,7 @@
 - **`files.processing_status` 等列使用 PostgreSQL 自定义 `ENUM` 类型**：若只执行 `CREATE TABLE files` 而未先创建类型，会报错 **`type "processing_status" does not exist`**。请**从 §2 脚本开头整段执行**（或先单独跑完枚举再跑建表）。
 - **`files.processing_error`**：可空 `TEXT`，记录最近一次流水线失败信息；已有库可执行 `ALTER TABLE files ADD COLUMN IF NOT EXISTS processing_error TEXT;`。
 
-## 1) 表清单（依赖顺序：`team_members` 须在 `teams` 与 `users` 之后创建）
+## 1) 本文件收录的表（依赖顺序：`team_members` 须在 `teams` 与 `users` 之后创建）
 
 1. `roles`  
 2. `users`  
@@ -231,6 +231,9 @@ CREATE TABLE tasks (
     worker_id VARCHAR(64),
     result JSON,
     error TEXT,
+    error_code VARCHAR(64),
+    error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+    next_retry_at TIMESTAMP,
     payload JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -290,6 +293,7 @@ CREATE INDEX idx_task_user_id ON tasks (user_id);
 CREATE INDEX idx_task_running ON tasks (status, started_at);
 CREATE INDEX idx_task_worker ON tasks (worker_id, status);
 CREATE INDEX idx_task_heartbeat ON tasks (status, heartbeat_at);
+CREATE INDEX idx_task_ready_retry ON tasks (status, next_retry_at, priority, created_at);
 ```
 
 ## 4) 维护建议
