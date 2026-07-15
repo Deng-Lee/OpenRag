@@ -14,10 +14,12 @@ from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.team import Team, TeamMember, TeamRole
 from openrag.models.file import File
-from openrag.models.permission import EntityType, FilePermission, Permission
+from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.retrieval.retrieval_service import RetrievalService
 from openrag.retrieval.reranker import Reranker
-from openrag.api.search_api import router, get_current_user, get_db
+from openrag.api.deps import get_current_active_user as get_current_user
+from openrag.api.search_api import router
+from openrag.database import get_db
 
 
 # ============================================================================
@@ -81,12 +83,63 @@ def test_users(db_session):
 
 
 @pytest.fixture
-def test_team(db_session, test_users):
+def test_workspaces(db_session, test_users):
+    workspaces = {
+        name: Workspace(
+            name=f"{name.title()} Workspace",
+            slug=f"{name}-workspace",
+            owner_id=test_users["alice"].id,
+        )
+        for name in ("ml", "database", "security", "private")
+    }
+    db_session.add_all(workspaces.values())
+    db_session.commit()
+    db_session.add_all(
+        [
+            WorkspaceMember(
+                workspace_id=workspaces["ml"].id,
+                user_id=test_users["alice"].id,
+                role="write",
+            ),
+            WorkspaceMember(
+                workspace_id=workspaces["ml"].id,
+                user_id=test_users["bob"].id,
+                role="read",
+            ),
+            WorkspaceMember(
+                workspace_id=workspaces["database"].id,
+                user_id=test_users["bob"].id,
+                role="write",
+            ),
+            WorkspaceMember(
+                workspace_id=workspaces["security"].id,
+                user_id=test_users["charlie"].id,
+                role="write",
+            ),
+            WorkspaceMember(
+                workspace_id=workspaces["security"].id,
+                user_id=test_users["alice"].id,
+                role="read",
+            ),
+            WorkspaceMember(
+                workspace_id=workspaces["private"].id,
+                user_id=test_users["diana"].id,
+                role="write",
+            ),
+        ]
+    )
+    db_session.commit()
+    return workspaces
+
+
+@pytest.fixture
+def test_team(db_session, test_users, test_workspaces):
     """Create test team with members"""
     team = Team(
         name="Engineering",
         description="Engineering team for collaboration",
-        owner_id=test_users["alice"].id
+        owner_id=test_users["alice"].id,
+        workspace_id=test_workspaces["database"].id,
     )
     db_session.add(team)
     db_session.commit()
@@ -110,13 +163,14 @@ def test_team(db_session, test_users):
 
 
 @pytest.fixture
-def test_files(db_session, test_users):
-    """Create test files with different owners and topics"""
+def test_files(db_session, test_users, test_workspaces):
+    """Create files bound to explicit workspace authorization scopes."""
     # Alice's files - Machine Learning topics
     file1 = File(
         uri="viking://bucket/ml_intro.pdf",
         name="ml_intro.pdf",
         owner_id=test_users["alice"].id,
+        workspace_id=test_workspaces["ml"].id,
         size=10240,
         mime_type="application/pdf"
     )
@@ -124,6 +178,7 @@ def test_files(db_session, test_users):
         uri="viking://bucket/deep_learning.pdf",
         name="deep_learning.pdf",
         owner_id=test_users["alice"].id,
+        workspace_id=test_workspaces["ml"].id,
         size=20480,
         mime_type="application/pdf"
     )
@@ -133,6 +188,7 @@ def test_files(db_session, test_users):
         uri="viking://bucket/databases.pdf",
         name="databases.pdf",
         owner_id=test_users["bob"].id,
+        workspace_id=test_workspaces["database"].id,
         size=15360,
         mime_type="application/pdf"
     )
@@ -142,6 +198,7 @@ def test_files(db_session, test_users):
         uri="viking://bucket/security.pdf",
         name="security.pdf",
         owner_id=test_users["charlie"].id,
+        workspace_id=test_workspaces["security"].id,
         size=12288,
         mime_type="application/pdf"
     )
@@ -151,6 +208,7 @@ def test_files(db_session, test_users):
         uri="viking://bucket/private.pdf",
         name="private.pdf",
         owner_id=test_users["diana"].id,
+        workspace_id=test_workspaces["private"].id,
         size=8192,
         mime_type="application/pdf"
     )
@@ -165,40 +223,6 @@ def test_files(db_session, test_users):
         "security": file4,
         "private": file5
     }
-
-
-@pytest.fixture
-def test_permissions(db_session, test_users, test_team, test_files):
-    """Create test permissions for different scenarios"""
-    # Alice shares ml_intro with bob (read)
-    perm1 = FilePermission(
-        file_id=test_files["ml_intro"].id,
-        entity_type=EntityType.USER,
-        entity_id=test_users["bob"].id,
-        permission=Permission.READ
-    )
-
-    # Bob shares databases with Engineering team (write)
-    perm2 = FilePermission(
-        file_id=test_files["databases"].id,
-        entity_type=EntityType.TEAM,
-        entity_id=test_team.id,
-        permission=Permission.WRITE
-    )
-
-    # Charlie shares security with alice (read)
-    perm3 = FilePermission(
-        file_id=test_files["security"].id,
-        entity_type=EntityType.USER,
-        entity_id=test_users["alice"].id,
-        permission=Permission.READ
-    )
-
-    db_session.add_all([perm1, perm2, perm3])
-    db_session.commit()
-
-    return [perm1, perm2, perm3]
-
 
 @pytest.fixture
 def mock_agfs_client():
@@ -356,15 +380,15 @@ def api_client(fastapi_app):
 # ============================================================================
 
 class TestSemanticSearchIntegration:
-    """Integration tests for semantic search with permissions"""
+    """Integration tests for workspace-scoped semantic search."""
 
-    def test_semantic_search_owner_access(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+    def test_semantic_search_workspace_write_access(
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
-        """Test semantic search returns results for file owner"""
+        """Workspace write members can retrieve workspace files."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Alice searches for machine learning (she owns ml_intro and deep_learning)
+        # Alice has workspace write access to both machine-learning files.
         results = service.search(
             query="machine learning",
             user_id=test_users["alice"].id,
@@ -372,7 +396,7 @@ class TestSemanticSearchIntegration:
             use_hierarchical=False
         )
 
-        # Alice should see her own files
+        # Alice should see both files in the authorized workspace.
         assert len(results) >= 2
         uris = [r["uri"] for r in results]
         assert "viking://bucket/ml_intro.pdf" in uris
@@ -383,14 +407,13 @@ class TestSemanticSearchIntegration:
             assert "file_id" in result
             assert result["file_id"] > 0
 
-    def test_semantic_search_shared_access(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+    def test_semantic_search_workspace_read_access(
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
-        """Test semantic search includes shared files"""
+        """Workspace read members see the same workspace candidates."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Bob searches for machine learning
-        # Bob owns databases, has read access to ml_intro, and team access to databases
+        # Bob has read access to the machine-learning workspace.
         results = service.search(
             query="machine learning",
             user_id=test_users["bob"].id,
@@ -398,21 +421,17 @@ class TestSemanticSearchIntegration:
             use_hierarchical=False
         )
 
-        # Bob should see ml_intro (shared by alice)
         uris = [r["uri"] for r in results]
         assert "viking://bucket/ml_intro.pdf" in uris
+        assert "viking://bucket/deep_learning.pdf" in uris
 
-        # Bob should NOT see deep_learning (not shared with him)
-        assert "viking://bucket/deep_learning.pdf" not in uris
-
-    def test_semantic_search_team_access(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+    def test_semantic_search_team_only_has_no_access(
+        self, db_session, test_users, test_files, test_team, mock_agfs_client
     ):
-        """Test semantic search includes team-shared files"""
+        """Team membership does not grant retrieval access."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Charlie searches for databases
-        # Charlie is in Engineering team which has access to databases
+        # Charlie is a team member but not a database workspace member.
         results = service.search(
             query="database",
             user_id=test_users["charlie"].id,
@@ -420,18 +439,16 @@ class TestSemanticSearchIntegration:
             use_hierarchical=False
         )
 
-        # Charlie should see databases through team permission
         uris = [r["uri"] for r in results]
-        assert "viking://bucket/databases.pdf" in uris
+        assert "viking://bucket/databases.pdf" not in uris
 
     def test_semantic_search_no_access(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test semantic search filters out inaccessible files"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Diana searches for security
-        # Diana owns private.pdf but has no access to security.pdf
+        # Diana can read only the private workspace, not the security workspace.
         results = service.search(
             query="security",
             user_id=test_users["diana"].id,
@@ -462,10 +479,10 @@ class TestSemanticSearchIntegration:
 
 
 class TestHierarchicalSearchIntegration:
-    """Integration tests for hierarchical search with permissions"""
+    """Integration tests for workspace-scoped hierarchical search."""
 
     def test_hierarchical_search_structure(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test hierarchical search considers document structure"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -486,10 +503,10 @@ class TestHierarchicalSearchIntegration:
         # Verify hierarchical search was called
         mock_agfs_client.hierarchical_search.assert_called()
 
-    def test_hierarchical_search_with_permissions(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+    def test_hierarchical_search_with_workspace_read(
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
-        """Test hierarchical search respects permissions"""
+        """Hierarchical search respects workspace read scope."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
         # Bob searches with hierarchical search
@@ -503,23 +520,22 @@ class TestHierarchicalSearchIntegration:
         # Bob should only see files he has access to
         uris = [r["uri"] for r in results]
         for uri in uris:
-            # Verify each URI is accessible by bob
             assert uri in [
-                "viking://bucket/ml_intro.pdf",  # Shared with bob
-                "viking://bucket/databases.pdf",  # Owned by bob or team access
+                "viking://bucket/ml_intro.pdf",
+                "viking://bucket/deep_learning.pdf",
             ]
 
 
-class TestPermissionFilteringIntegration:
-    """Integration tests for permission filtering across scenarios"""
+class TestWorkspaceFilteringIntegration:
+    """Integration tests for workspace filtering across scenarios."""
 
-    def test_owner_sees_own_files(
+    def test_workspace_write_member_sees_workspace_files(
         self, db_session, test_users, test_files, mock_agfs_client
     ):
-        """Test file owner can access their own files"""
+        """Workspace write membership, not owner_id, grants access."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Alice searches - should see her files
+        # Alice has write access to the machine-learning workspace.
         results = service.search(
             query="machine learning",
             user_id=test_users["alice"].id,
@@ -530,13 +546,12 @@ class TestPermissionFilteringIntegration:
         assert test_files["ml_intro"].id in file_ids
         assert test_files["deep_learning"].id in file_ids
 
-    def test_user_with_direct_permission(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+    def test_workspace_read_member_access(
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
-        """Test user with direct permission can access file"""
+        """Workspace read membership grants access to all workspace files."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Bob has direct read permission on ml_intro
         results = service.search(
             query="machine learning",
             user_id=test_users["bob"].id,
@@ -545,26 +560,26 @@ class TestPermissionFilteringIntegration:
 
         uris = [r["uri"] for r in results]
         assert "viking://bucket/ml_intro.pdf" in uris
+        assert "viking://bucket/deep_learning.pdf" in uris
 
-    def test_team_member_access(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+    def test_team_member_without_workspace_access_is_denied(
+        self, db_session, test_users, test_files, test_team, mock_agfs_client
     ):
-        """Test team member can access team-shared files"""
+        """Team membership alone cannot expand retrieval scope."""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
 
-        # Bob is team member, should see team files
-        # Bob is in Engineering team which has access to databases.pdf
+        # Charlie is a team member but has no database workspace membership.
         results = service.search(
             query="database",
-            user_id=test_users["bob"].id,
+            user_id=test_users["charlie"].id,
             top_k=10
         )
 
         uris = [r["uri"] for r in results]
-        assert "viking://bucket/databases.pdf" in uris
+        assert "viking://bucket/databases.pdf" not in uris
 
     def test_non_member_no_access(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test non-team member cannot access team files"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -602,7 +617,7 @@ class TestRerankerIntegration:
     """Integration tests for reranking effectiveness"""
 
     def test_reranking_changes_order(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test reranking changes result order"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -630,7 +645,7 @@ class TestRerankerIntegration:
         assert scores == sorted(scores, reverse=True)
 
     def test_reranking_boosts_titles(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test reranking boosts title blocks"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -661,7 +676,7 @@ class TestRerankerIntegration:
                 assert title["reranked_score"] > title["score"]
 
     def test_reranking_boosts_early_pages(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test reranking boosts results from early pages"""
         # Create mock results with different pages
@@ -702,7 +717,7 @@ class TestRerankerIntegration:
         assert page_1_result["reranked_score"] > page_10_result["reranked_score"]
 
     def test_reranking_preserves_metadata(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test reranking preserves all metadata fields"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -737,9 +752,9 @@ class TestSearchAPIIntegration:
     """Integration tests for Search API endpoints"""
 
     def test_semantic_search_api_with_permissions(
-        self, db_session, test_users, test_files, test_permissions
+        self, db_session, test_users, test_files, test_workspaces
     ):
-        """Test semantic search API endpoint with permission filtering"""
+        """Test semantic search API endpoint with workspace filtering."""
         # Create fresh app for this test
         app = FastAPI()
         app.include_router(router)
@@ -785,7 +800,7 @@ class TestSearchAPIIntegration:
             assert data["results"][0]["text"] == "Machine learning is a subset of AI"
 
     def test_semantic_search_api_with_reranking(
-        self, db_session, test_users, test_files, test_permissions
+        self, db_session, test_users, test_files, test_workspaces
     ):
         """Test semantic search API with reranking enabled"""
         app = FastAPI()
@@ -878,7 +893,7 @@ class TestSearchAPIIntegration:
             mock_reranker.rerank.assert_called_once()
 
     def test_hierarchical_search_api(
-        self, db_session, test_users, test_files, test_permissions
+        self, db_session, test_users, test_files, test_workspaces
     ):
         """Test hierarchical search API endpoint"""
         app = FastAPI()
@@ -926,7 +941,7 @@ class TestSearchAPIIntegration:
             assert call_kwargs["use_hierarchical"] is True
 
     def test_api_different_users_different_results(
-        self, db_session, test_users, test_files, test_permissions
+        self, db_session, test_users, test_files, test_workspaces
     ):
         """Test different users get different filtered results via API"""
         with patch("openrag.api.search_api.RetrievalService") as MockRetrieval:
@@ -1060,7 +1075,7 @@ class TestPositionPreservation:
     """Integration tests for position metadata preservation"""
 
     def test_position_metadata_preserved_through_pipeline(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test position metadata (page, offset, bbox, level) preserved through pipeline"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1091,7 +1106,7 @@ class TestPositionPreservation:
             assert isinstance(result["level"], int)
 
     def test_bbox_format_preserved(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test bounding box format is preserved correctly"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1115,7 +1130,7 @@ class TestRetrievalAccuracy:
     """Integration tests for retrieval accuracy and relevance"""
 
     def test_relevant_results_for_ml_query(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test machine learning query returns ML-related documents"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1134,7 +1149,7 @@ class TestRetrievalAccuracy:
         assert any("ml_intro" in uri or "deep_learning" in uri for uri in top_uris)
 
     def test_relevant_results_for_database_query(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test database query returns database-related documents"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1152,7 +1167,7 @@ class TestRetrievalAccuracy:
         assert "databases" in results[0]["uri"]
 
     def test_score_ordering(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test results are ordered by relevance score"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1168,7 +1183,7 @@ class TestRetrievalAccuracy:
         assert scores == sorted(scores, reverse=True)
 
     def test_reranking_improves_relevance(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test reranking improves result relevance"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1230,7 +1245,7 @@ class TestEdgeCases:
         assert len(results) == 0
 
     def test_search_with_top_k_limit(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test search respects top_k limit"""
         # Mock AGFS to return more results than top_k
@@ -1261,7 +1276,7 @@ class TestEdgeCases:
         mock_agfs_client.semantic_search.assert_called_with("machine learning", top_k=1)
 
     def test_search_with_none_bbox(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test search handles None bbox values correctly"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1279,7 +1294,7 @@ class TestEdgeCases:
             assert bbox is None or (isinstance(bbox, list) and len(bbox) == 4)
 
     def test_concurrent_searches_different_users(
-        self, db_session, test_users, test_files, test_permissions, mock_agfs_client
+        self, db_session, test_users, test_files, test_workspaces, mock_agfs_client
     ):
         """Test concurrent searches by different users are isolated"""
         service = RetrievalService(db_session, agfs_client=mock_agfs_client)
@@ -1297,7 +1312,7 @@ class TestEdgeCases:
             top_k=10
         )
 
-        # Results should be different (different permissions)
+        # Results should differ because the users have different workspace scopes.
         alice_uris = set(r["uri"] for r in results_alice)
         bob_uris = set(r["uri"] for r in results_bob)
 

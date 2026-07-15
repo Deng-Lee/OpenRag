@@ -504,7 +504,7 @@ LLM 分析查询意图，返回每个文件应检索哪些切片下标
 
 ## 7. 权限系统
 
-OpenRag 的权限系统采用 **多层复合模型**，从粗到细：
+OpenRag 的内容访问权限以 **工作空间 RBAC** 为唯一用户授权边界；分享链接是独立的外部访问能力：
 
 ### 7.1 权限层级概览
 
@@ -515,13 +515,7 @@ OpenRag 的权限系统采用 **多层复合模型**，从粗到细：
 工作空间级别
     │ 直接成员（WorkspaceMember: read / write）
     │ 角色权限（Role → RoleWorkspacePermission: read / write）
-    │ → 管理员的 write 权限覆盖所有工作空间
-    ▼
-文件级别（ACL）
-    │ 文件所有者（owner_id）→ 完全控制
-    │ 直接用户权限（FilePermission: user, read/write/admin）
-    │ 团队权限（FilePermission: team, read/write/admin）
-    │ 父目录权限继承（递归向上查找）
+    │ → 文件列表、读取、搜索和写操作均继承工作空间权限
     ▼
 分享链接
     │ Token + 可选密码 + 过期时间 + 最大访问次数
@@ -536,24 +530,14 @@ OpenRag 的权限系统采用 **多层复合模型**，从粗到细：
 **角色权限**：User → UserRole → Role → RoleWorkspacePermission → Workspace
 - 一个角色可以在多个工作空间有不同权限
 - 一个用户可以有多个角色
-- 权限合并：取最高权限（admin > write > read）
+- 直接成员与角色权限合并时取最高权限（write > read）；系统管理员独立拥有全部工作空间权限
 
-### 7.3 文件级权限（ACL）
+### 7.3 文件访问边界
 
-**技术**：`FilePermission` 表，支持按用户或团队授权。
-
-**权限级别**（层级包含）：
-```
-admin → [admin, write, read]    （管理权限包含读写）
-write → [write, read]           （写权限包含读）
-read  → [read]                  （只读就是只读）
-```
-
-**权限检查逻辑**（`PermissionManager.check_permission`）：
-1. 是文件所有者？→ ✅ 通过
-2. 有直接的用户权限？→ 检查权限级别是否满足
-3. 所在团队有权限？→ 检查所有团队权限
-4. 父目录有权限？→ 递归向上一级一级查找
+- 工作空间 `read`：可列出、读取、预览、下载和搜索该工作空间内的文件。
+- 工作空间 `write`：包含 `read`，并可上传、移动、删除和重新处理文件。
+- `File.owner_id` 只记录创建/归属审计信息，不产生额外读取或写入权限。
+- Team 关系不参与文件授权；同一工作空间内不提供用户级或团队级文件 ACL。
 
 ### 7.4 分享链接
 
@@ -742,7 +726,7 @@ openrag/
 │   │   ├── search_api.py       # 语义搜索 + 层级搜索
 │   │   ├── share_api.py        # 分享链接创建/验证/访问
 │   │   ├── tasks_api.py        # 任务状态查询/管理
-│   │   ├── permissions_api.py  # 文件权限授予/撤销/查询
+│   │   ├── permissions_api.py  # 用户工作空间权限详情查询
 │   │   ├── roles_api.py        # 角色 + 工作空间权限
 │   │   ├── broker_api.py       # Worker 认领任务/心跳
 │   │   ├── service_api.py      # M2M 服务令牌 API
@@ -751,7 +735,7 @@ openrag/
 │   ├── models/                 # 数据模型（SQLAlchemy ORM）
 │   │   ├── user.py, workspace.py, team.py
 │   │   ├── file.py, document_chunk.py
-│   │   ├── task.py, permission.py
+│   │   ├── task.py
 │   │   ├── role.py, share.py
 │   │   ├── service_token.py, audit.py
 │   │   └── base.py             # 基础模型（Base, TimestampMixin）
@@ -760,7 +744,6 @@ openrag/
 │   │   ├── user_manager.py     # 用户管理
 │   │   ├── workspace_service.py # 工作空间管理
 │   │   ├── team_manager.py     # 团队管理
-│   │   ├── permission_manager.py # 权限检查（ACL + 继承）
 │   │   ├── share_manager.py    # 分享链接管理
 │   │   ├── task_service.py     # 任务管理
 │   │   ├── file_ingest.py      # 文件摄入（上传/替换）

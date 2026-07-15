@@ -5,7 +5,6 @@ from openrag.models.base import Base, TimestampMixin
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.document_parse_artifact import DocumentParseArtifact
 from openrag.models.file import File
-from openrag.models.permission import EntityType, FilePermission, Permission
 from openrag.models.service_token import ServiceToken
 from openrag.models.service_token_workspace import ServiceTokenWorkspace
 from openrag.models.share import ShareLink
@@ -36,9 +35,6 @@ __all__ = [
     "DocumentChunk",
     "DocumentParseArtifact",
     "File",
-    "FilePermission",
-    "EntityType",
-    "Permission",
     "ShareLink",
     "AuditLog",
     "Workspace",

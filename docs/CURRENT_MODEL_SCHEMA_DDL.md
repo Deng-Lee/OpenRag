@@ -6,7 +6,7 @@
 
 **说明**:
 
-- 下列 **15 张表** 为当前代码中声明的全部业务表；已从旧版文档中去掉 **与 `UNIQUE` / `PRIMARY KEY` 完全重叠的冗余索引**（不再单独列出）。
+- 下列脚本收录 **14 张核心业务表**，不是当前 ORM metadata 的全量 DDL；生产环境仍以 **SQLAlchemy / Alembic 生成结果**为准。本次仅从该脚本移除已下线的文件 ACL 表、枚举和索引，未借此补写其他既有缺失模型。
 - `document_chunks.workspace_id` 在模型中**无**指向 `workspaces` 的外键，仅整型列；与 `files.workspace_id` 逻辑一致。
 - **`files.processing_status` 等列使用 PostgreSQL 自定义 `ENUM` 类型**：若只执行 `CREATE TABLE files` 而未先创建类型，会报错 **`type "processing_status" does not exist`**。请**从 §2 脚本开头整段执行**（或先单独跑完枚举再跑建表）。
 - **`files.processing_error`**：可空 `TEXT`，记录最近一次流水线失败信息；已有库可执行 `ALTER TABLE files ADD COLUMN IF NOT EXISTS processing_error TEXT;`。
@@ -24,23 +24,18 @@
 9. `teams`  
 10. `workspace_members`  
 11. `document_chunks`  
-12. `file_permissions`  
-13. `share_links`  
-14. `tasks`  
-15. `team_members`
+12. `share_links`
+13. `tasks`
+14. `team_members`
 
 ## 2) 建表脚本（**请整段执行**：先 `CREATE TYPE`，再 `CREATE TABLE`）
 
-下列脚本**开头**为枚举类型定义（与 ORM 中 Python `Enum` 取值一致），**必须**出现在使用它们的 `CREATE TABLE`（如 `files`、`file_permissions`、`team_members`）之前。若类型已存在，可先 `DROP TYPE IF EXISTS ... CASCADE`（慎用，会波及依赖对象）或跳过四条 `CREATE TYPE`。
+下列脚本**开头**为枚举类型定义（与 ORM 中 Python `Enum` 取值一致），**必须**出现在使用它们的 `CREATE TABLE`（如 `files`、`team_members`）之前。若类型已存在，可先 `DROP TYPE IF EXISTS ... CASCADE`（慎用，会波及依赖对象）或跳过对应的 `CREATE TYPE`。
 
 ```sql
 CREATE TYPE processing_status AS ENUM (
     'pending', 'parsing', 'building_hierarchy', 'embedding', 'completed', 'failed'
 );
-
-CREATE TYPE entity_type AS ENUM ('user', 'team');
-
-CREATE TYPE acl_permission AS ENUM ('read', 'write', 'admin');
 
 CREATE TYPE team_role AS ENUM ('owner', 'admin', 'member');
 
@@ -202,17 +197,6 @@ CREATE TABLE document_chunks (
     CONSTRAINT uq_document_chunks_file_chunk_index UNIQUE (file_id, chunk_index)
 );
 
-CREATE TABLE file_permissions (
-    id SERIAL PRIMARY KEY,
-    file_id INTEGER NOT NULL REFERENCES files (id),
-    workspace_id INTEGER REFERENCES workspaces (id),
-    entity_type entity_type NOT NULL,
-    entity_id INTEGER NOT NULL,
-    permission acl_permission NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_file_entity UNIQUE (file_id, entity_type, entity_id)
-);
-
 CREATE TABLE share_links (
     id SERIAL PRIMARY KEY,
     file_id INTEGER NOT NULL REFERENCES files (id),
@@ -291,10 +275,6 @@ CREATE INDEX ix_teams_owner_id ON teams (owner_id);
 -- document_chunks
 CREATE INDEX ix_document_chunks_file_id ON document_chunks (file_id);
 CREATE INDEX ix_document_chunks_workspace_id ON document_chunks (workspace_id);
-
--- file_permissions
-CREATE INDEX idx_permission_file_id ON file_permissions (file_id);
-CREATE INDEX idx_permission_entity ON file_permissions (entity_type, entity_id);
 
 -- share_links（token 已由 UNIQUE 建索引）
 CREATE INDEX idx_share_file_id ON share_links (file_id);

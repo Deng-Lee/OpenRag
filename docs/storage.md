@@ -29,7 +29,7 @@
 
 ## PostgreSQL 中保存的数据
 
-PostgreSQL 是系统的权威元数据存储，主要保存用户、工作区、文件、权限、任务、切片元数据等结构化数据。
+PostgreSQL 是系统的权威元数据存储，主要保存用户、工作区、文件、工作区权限、任务、切片元数据等结构化数据。
 
 | 数据类型 | 表/模型 | 保存内容 |
 | --- | --- | --- |
@@ -41,10 +41,11 @@ PostgreSQL 是系统的权威元数据存储，主要保存用户、工作区、
 | 文件/目录元数据 | `files` | 逻辑路径 `uri`、文件名、所有者、工作区、是否目录、文件大小、MIME 类型、parser 类型、处理状态、L0/L1/L2 路径、chunk 数、token 数。 |
 | 切片元数据 | `document_chunks` | `chunk_id`、`chunk_index`、对象存储路径、文本预览、页码、层级、bbox、offset、source block/char span 等。 |
 | 后台任务 | `tasks` | task ID、工作区、用户、文件、任务类型、队列、优先级、状态、进度、重试次数、worker、结果、错误、payload。 |
-| 文件权限 | `file_permissions` | 文件级 ACL，支持按用户或团队授予 `read` / `write` / `admin` 权限。 |
 | 分享链接 | `share_links` | 分享 token、密码哈希、过期时间、访问次数限制、当前访问次数。 |
 | 服务令牌 | `service_tokens`、`service_token_workspaces` | 机器访问令牌、创建人、撤销时间、授权工作区和权限。 |
 | 审计日志 | `audit_logs` | 用户操作、资源类型、资源 ID、详情、IP 地址、创建时间。 |
+
+`file_permissions` 文件级 ACL 已由 [R-02 文件级 ACL 下线方案](./R-02文件级ACL下线方案.md) 下线完成，不属于当前代码的活动数据模型；文件访问统一由工作空间 `read` / `write` 权限控制。实施前生产核查结果为 `0` 行，下线迁移按零记录保护路径删除该表。
 
 需要注意的是，`document_chunks.text_preview` 只是 chunk 文本预览，不是完整解析结果。完整 chunk 正文主要保存在对象存储中的 L2 chunk 文件里，同时也会写入 Milvus 和可选的 Elasticsearch 索引中。
 

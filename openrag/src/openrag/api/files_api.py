@@ -756,7 +756,7 @@ async def delete_file(
     db: Session = Depends(get_db),
 ):
     """
-    Delete a file (requires owner or admin permission)
+    Delete a file (requires workspace write permission)
 
     Args:
         file_id: File ID

@@ -13,10 +13,8 @@ from openrag.models import (
     TeamMember,
     TeamRole,
     File,
-    FilePermission,
-    EntityType,
-    Permission,
     ShareLink,
+    Workspace,
 )
 
 
@@ -33,6 +31,28 @@ def db_session():
 
     session.close()
     Base.metadata.drop_all(engine)
+
+
+@pytest.fixture
+def test_workspace(db_session: Session):
+    owner = User(
+        username="workspace-owner",
+        email="workspace-owner@example.com",
+        password_hash="hash",
+        full_name="Workspace Owner",
+    )
+    db_session.add(owner)
+    db_session.commit()
+
+    workspace = Workspace(
+        name="Test Workspace",
+        slug="test-workspace",
+        owner_id=owner.id,
+    )
+    db_session.add(workspace)
+    db_session.commit()
+    db_session.refresh(workspace)
+    return workspace
 
 
 class TestUserModel:
@@ -176,7 +196,7 @@ class TestTeamModel:
 class TestFileModel:
     """Test File model"""
 
-    def test_create_file(self, db_session: Session):
+    def test_create_file(self, db_session: Session, test_workspace: Workspace):
         """Test creating a file"""
         user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
         db_session.add(user)
@@ -186,6 +206,7 @@ class TestFileModel:
             uri="/test/file.txt",
             name="file.txt",
             owner_id=user.id,
+            workspace_id=test_workspace.id,
             is_directory=False,
             size=1024,
             mime_type="text/plain"
@@ -200,7 +221,7 @@ class TestFileModel:
         assert file.is_directory is False
         assert file.size == 1024
 
-    def test_file_hierarchy(self, db_session: Session):
+    def test_file_hierarchy(self, db_session: Session, test_workspace: Workspace):
         """Test file parent-child relationship"""
         user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
         db_session.add(user)
@@ -210,6 +231,7 @@ class TestFileModel:
             uri="/test",
             name="test",
             owner_id=user.id,
+            workspace_id=test_workspace.id,
             is_directory=True
         )
         db_session.add(parent)
@@ -219,6 +241,7 @@ class TestFileModel:
             uri="/test/file.txt",
             name="file.txt",
             owner_id=user.id,
+            workspace_id=test_workspace.id,
             parent_id=parent.id,
             is_directory=False
         )
@@ -230,100 +253,16 @@ class TestFileModel:
         assert child.parent.name == "test"
 
 
-class TestFilePermissionModel:
-    """Test FilePermission model"""
-
-    def test_create_user_permission(self, db_session: Session):
-        """Test creating user permission"""
-        user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
-        db_session.add(user)
-        db_session.commit()
-
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
-        db_session.add(file)
-        db_session.commit()
-
-        permission = FilePermission(
-            file_id=file.id,
-            entity_type=EntityType.USER,
-            entity_id=user.id,
-            permission=Permission.READ
-        )
-        db_session.add(permission)
-        db_session.commit()
-
-        assert permission.id is not None
-        assert permission.file_id == file.id
-        assert permission.entity_type == EntityType.USER
-        assert permission.permission == Permission.READ
-
-    def test_create_team_permission(self, db_session: Session):
-        """Test creating team permission"""
-        user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
-        db_session.add(user)
-        db_session.commit()
-
-        team = Team(name="Team", owner_id=user.id)
-        db_session.add(team)
-        db_session.commit()
-
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
-        db_session.add(file)
-        db_session.commit()
-
-        permission = FilePermission(
-            file_id=file.id,
-            entity_type=EntityType.TEAM,
-            entity_id=team.id,
-            permission=Permission.WRITE
-        )
-        db_session.add(permission)
-        db_session.commit()
-
-        assert permission.entity_type == EntityType.TEAM
-        assert permission.permission == Permission.WRITE
-
-    def test_permission_unique_constraint(self, db_session: Session):
-        """Test permission uniqueness constraint"""
-        user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
-        db_session.add(user)
-        db_session.commit()
-
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
-        db_session.add(file)
-        db_session.commit()
-
-        perm1 = FilePermission(
-            file_id=file.id,
-            entity_type=EntityType.USER,
-            entity_id=user.id,
-            permission=Permission.READ
-        )
-        perm2 = FilePermission(
-            file_id=file.id,
-            entity_type=EntityType.USER,
-            entity_id=user.id,
-            permission=Permission.WRITE
-        )
-
-        db_session.add(perm1)
-        db_session.commit()
-
-        db_session.add(perm2)
-        with pytest.raises(Exception):  # IntegrityError
-            db_session.commit()
-
-
 class TestShareLinkModel:
     """Test ShareLink model"""
 
-    def test_create_share_link(self, db_session: Session):
+    def test_create_share_link(self, db_session: Session, test_workspace: Workspace):
         """Test creating a share link"""
         user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
         db_session.add(user)
         db_session.commit()
 
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
+        file = File(uri="/file.txt", name="file.txt", owner_id=user.id, workspace_id=test_workspace.id)
         db_session.add(file)
         db_session.commit()
 
@@ -341,13 +280,13 @@ class TestShareLinkModel:
         assert share_link.access_count == 0
         assert share_link.creator.username == "user"
 
-    def test_share_link_with_expiration(self, db_session: Session):
+    def test_share_link_with_expiration(self, db_session: Session, test_workspace: Workspace):
         """Test share link with expiration"""
         user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
         db_session.add(user)
         db_session.commit()
 
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
+        file = File(uri="/file.txt", name="file.txt", owner_id=user.id, workspace_id=test_workspace.id)
         db_session.add(file)
         db_session.commit()
 
@@ -365,14 +304,14 @@ class TestShareLinkModel:
         assert share_link.expires_at is not None
         assert share_link.max_access_count == 10
 
-    def test_share_link_unique_token(self, db_session: Session):
+    def test_share_link_unique_token(self, db_session: Session, test_workspace: Workspace):
         """Test share link token uniqueness"""
         user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
         db_session.add(user)
         db_session.commit()
 
-        file1 = File(uri="/file1.txt", name="file1.txt", owner_id=user.id)
-        file2 = File(uri="/file2.txt", name="file2.txt", owner_id=user.id)
+        file1 = File(uri="/file1.txt", name="file1.txt", owner_id=user.id, workspace_id=test_workspace.id)
+        file2 = File(uri="/file2.txt", name="file2.txt", owner_id=user.id, workspace_id=test_workspace.id)
         db_session.add_all([file1, file2])
         db_session.commit()
 
@@ -390,13 +329,13 @@ class TestShareLinkModel:
 class TestRelationships:
     """Test model relationships"""
 
-    def test_cascade_delete_user_files(self, db_session: Session):
+    def test_cascade_delete_user_files(self, db_session: Session, test_workspace: Workspace):
         """Test cascade delete when user is deleted"""
         user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
         db_session.add(user)
         db_session.commit()
 
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
+        file = File(uri="/file.txt", name="file.txt", owner_id=user.id, workspace_id=test_workspace.id)
         db_session.add(file)
         db_session.commit()
 
@@ -408,31 +347,3 @@ class TestRelationships:
         # File should be deleted due to cascade
         deleted_file = db_session.get(File, file_id)
         assert deleted_file is None
-
-    def test_cascade_delete_file_permissions(self, db_session: Session):
-        """Test cascade delete when file is deleted"""
-        user = User(username="user", email="user@example.com", password_hash="hash", full_name="User")
-        db_session.add(user)
-        db_session.commit()
-
-        file = File(uri="/file.txt", name="file.txt", owner_id=user.id)
-        db_session.add(file)
-        db_session.commit()
-
-        permission = FilePermission(
-            file_id=file.id,
-            entity_type=EntityType.USER,
-            entity_id=user.id,
-            permission=Permission.READ
-        )
-        db_session.add(permission)
-        db_session.commit()
-
-        permission_id = permission.id
-
-        db_session.delete(file)
-        db_session.commit()
-
-        # Permission should be deleted due to cascade
-        deleted_permission = db_session.get(FilePermission, permission_id)
-        assert deleted_permission is None

@@ -17,7 +17,6 @@ from openrag.models.user import User
 from openrag.models.file import File, ProcessingStatus
 from openrag.models.task import Task
 from openrag.models.workspace import Workspace, WorkspaceMember
-from openrag.models.permission import FilePermission, EntityType, Permission
 from openrag.security import hash_password
 from openrag.services.file_ingest import MAX_FILE_SIZE
 
@@ -25,6 +24,9 @@ from openrag.services.file_ingest import MAX_FILE_SIZE
 class FakeMinioStorage:
     def put_file(self, *args, **kwargs):
         return None
+
+    def read_object_bytes(self, *args, **kwargs):
+        return b"Test file content"
 
     def remove_document_hierarchy(self, *args, **kwargs):
         return None
@@ -262,8 +264,8 @@ class TestFileUpload:
 class TestFileList:
     """Test file listing endpoint"""
 
-    def test_list_files_owner(self, client, db, test_user, test_file):
-        """Test listing files as owner"""
+    def test_list_files_with_workspace_write(self, client, db, test_user, test_file):
+        """Workspace write members can list files."""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
 
         response = client.get("/files/")
@@ -275,8 +277,10 @@ class TestFileList:
         assert len(result["items"]) == 1
         assert result["items"][0]["id"] == test_file.id
 
-    def test_list_files_with_shared(self, client, db, test_user, test_user2, test_file, test_workspace):
-        """Test listing files includes shared files (workspace read + file ACL)"""
+    def test_list_files_with_workspace_read(
+        self, client, db, test_user2, test_file, test_workspace
+    ):
+        """Workspace read members can list files."""
         db.add(
             WorkspaceMember(
                 workspace_id=test_workspace.id,
@@ -284,13 +288,6 @@ class TestFileList:
                 role="read",
             )
         )
-        perm = FilePermission(
-            file_id=test_file.id,
-            entity_type=EntityType.USER,
-            entity_id=test_user2.id,
-            permission=Permission.READ
-        )
-        db.add(perm)
         db.commit()
 
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
@@ -301,6 +298,53 @@ class TestFileList:
         result = response.json()
         assert len(result["items"]) == 1
         assert result["items"][0]["id"] == test_file.id
+
+    def test_workspace_read_only_lists_its_workspace_files(
+        self, client, db, test_user, test_user2, test_file
+    ):
+        """Workspace access cannot expose the same path from another workspace."""
+        readable_workspace = Workspace(
+            name="ReadableWS",
+            slug="readable-ws",
+            owner_id=test_user.id,
+        )
+        db.add(readable_workspace)
+        db.commit()
+        db.refresh(readable_workspace)
+        readable_file = File(
+            uri=test_file.uri,
+            name=test_file.name,
+            owner_id=test_user.id,
+            workspace_id=readable_workspace.id,
+            is_directory=False,
+            size=1024,
+            mime_type="text/plain",
+        )
+        db.add_all(
+            [
+                WorkspaceMember(
+                    workspace_id=readable_workspace.id,
+                    user_id=test_user2.id,
+                    role="read",
+                ),
+                readable_file,
+            ]
+        )
+        db.commit()
+
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user2
+        )
+
+        response = client.get("/files/")
+
+        assert response.status_code == status.HTTP_200_OK
+        result = response.json()
+        assert result["total"] == 1
+        assert result["items"][0]["id"] == readable_file.id
+        assert result["items"][0]["id"] != test_file.id
+        assert result["items"][0]["uri"] == test_file.uri
+        assert client.get(f"/files/{test_file.id}").status_code == status.HTTP_403_FORBIDDEN
 
     def test_list_files_pagination(self, client, db, test_user, test_workspace):
         """Test file listing with pagination"""
@@ -413,8 +457,8 @@ class TestFileList:
 class TestFileGet:
     """Test get file details endpoint"""
 
-    def test_get_file_as_owner(self, client, db, test_user, test_file):
-        """Test getting file details as owner"""
+    def test_get_file_with_workspace_write(self, client, db, test_user, test_file):
+        """Workspace write members can read file details."""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
 
         response = client.get(f"/files/{test_file.id}")
@@ -425,8 +469,10 @@ class TestFileGet:
         assert result["name"] == test_file.name
         assert result["uri"] == test_file.uri
 
-    def test_get_file_with_permission(self, client, db, test_user, test_user2, test_file, test_workspace):
-        """Test getting file details with read permission"""
+    def test_get_file_with_workspace_read(
+        self, client, db, test_user2, test_file, test_workspace, monkeypatch
+    ):
+        """Workspace read members can read details and previews."""
         db.add(
             WorkspaceMember(
                 workspace_id=test_workspace.id,
@@ -434,20 +480,24 @@ class TestFileGet:
                 role="read",
             )
         )
-        perm = FilePermission(
-            file_id=test_file.id,
-            entity_type=EntityType.USER,
-            entity_id=test_user2.id,
-            permission=Permission.READ
-        )
-        db.add(perm)
         db.commit()
 
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
+        monkeypatch.setattr("openrag.api.files_api.MinioStorage", FakeMinioStorage)
+        monkeypatch.setattr(
+            "openrag.api.files_api.build_file_preview",
+            lambda data, mime_type, filename: ("text", data.decode()),
+        )
 
         response = client.get(f"/files/{test_file.id}")
+        preview_response = client.get(f"/files/{test_file.id}/preview")
 
         assert response.status_code == status.HTTP_200_OK
+        assert preview_response.status_code == status.HTTP_200_OK
+        assert preview_response.json() == {
+            "format": "text",
+            "content": "Test file content",
+        }
 
     def test_get_file_no_permission(self, client, db, test_user, test_user2, test_file):
         """Test getting file details without permission"""
@@ -537,9 +587,30 @@ class TestFileReprocessDocumentType:
 class TestFileDelete:
     """Test file deletion endpoint"""
 
-    def test_delete_file_as_owner(self, client, db, test_user, test_file):
-        """Test deleting file as owner"""
-        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+    def test_delete_file_with_workspace_write(
+        self, client, db, test_user2, test_file, test_workspace, monkeypatch
+    ):
+        """Workspace write members can delete files."""
+        db.add(
+            WorkspaceMember(
+                workspace_id=test_workspace.id,
+                user_id=test_user2.id,
+                role="write",
+            )
+        )
+        db.commit()
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user2
+        )
+
+        def delete_from_db(db, file, _workspace):
+            db.delete(file)
+            db.commit()
+
+        monkeypatch.setattr(
+            "openrag.api.files_api.delete_file_with_storage",
+            delete_from_db,
+        )
 
         response = client.delete(f"/files/{test_file.id}", params={"background": "false"})
 
@@ -558,24 +629,6 @@ class TestFileDelete:
 
         assert response.status_code == status.HTTP_403_FORBIDDEN
 
-    def test_delete_file_with_write_permission(self, client, db, test_user, test_user2, test_file):
-        """Test deleting file with write permission (should fail, needs admin)"""
-        # Grant write permission
-        perm = FilePermission(
-            file_id=test_file.id,
-            entity_type=EntityType.USER,
-            entity_id=test_user2.id,
-            permission=Permission.WRITE
-        )
-        db.add(perm)
-        db.commit()
-
-        app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
-
-        response = client.delete(f"/files/{test_file.id}")
-
-        assert response.status_code == status.HTTP_403_FORBIDDEN
-
     def test_delete_file_not_found(self, client, db, test_user):
         """Test deleting non-existent file"""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
@@ -588,8 +641,10 @@ class TestFileDelete:
 class TestFileMove:
     """Test file move/rename endpoint"""
 
-    def test_move_file_as_owner(self, client, db, test_user, test_file):
-        """Test moving/renaming file as owner"""
+    def test_move_file_with_workspace_write_member(
+        self, client, db, test_user, test_file
+    ):
+        """Existing workspace write members can move files."""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
 
         new_path = "/test/renamed.txt"
@@ -600,8 +655,10 @@ class TestFileMove:
         assert result["uri"] == new_path
         assert result["name"] == "renamed.txt"
 
-    def test_move_file_with_write_permission(self, client, db, test_user, test_user2, test_file, test_workspace):
-        """Test moving file with write permission"""
+    def test_move_file_with_workspace_write(
+        self, client, db, test_user2, test_file, test_workspace
+    ):
+        """Workspace write members can move files."""
         db.add(
             WorkspaceMember(
                 workspace_id=test_workspace.id,
@@ -609,13 +666,6 @@ class TestFileMove:
                 role="write",
             )
         )
-        perm = FilePermission(
-            file_id=test_file.id,
-            entity_type=EntityType.USER,
-            entity_id=test_user2.id,
-            permission=Permission.WRITE
-        )
-        db.add(perm)
         db.commit()
 
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user2)
@@ -642,6 +692,63 @@ class TestFileMove:
         response = client.put(f"/files/{test_file.id}/move", json={"new_path": new_path})
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+class TestFileWorkspaceAuthorization:
+    """Test workspace RBAC boundaries across file endpoints."""
+
+    def test_file_owner_without_workspace_membership_cannot_read_or_write(
+        self, client, db, test_user2, test_file
+    ):
+        test_file.owner_id = test_user2.id
+        db.commit()
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user2
+        )
+
+        responses = [
+            client.get(f"/files/{test_file.id}"),
+            client.delete(f"/files/{test_file.id}", params={"background": "false"}),
+            client.put(
+                f"/files/{test_file.id}/move",
+                json={"new_path": "/test/owner-renamed.txt"},
+            ),
+            client.post(f"/files/{test_file.id}/reprocess", json={}),
+        ]
+
+        assert all(
+            response.status_code == status.HTTP_403_FORBIDDEN
+            for response in responses
+        )
+
+    def test_workspace_read_cannot_delete_move_or_reprocess(
+        self, client, db, test_user2, test_file, test_workspace
+    ):
+        db.add(
+            WorkspaceMember(
+                workspace_id=test_workspace.id,
+                user_id=test_user2.id,
+                role="read",
+            )
+        )
+        db.commit()
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user2
+        )
+
+        responses = [
+            client.delete(f"/files/{test_file.id}", params={"background": "false"}),
+            client.put(
+                f"/files/{test_file.id}/move",
+                json={"new_path": "/test/read-renamed.txt"},
+            ),
+            client.post(f"/files/{test_file.id}/reprocess", json={}),
+        ]
+
+        assert all(
+            response.status_code == status.HTTP_403_FORBIDDEN
+            for response in responses
+        )
 
 
 class TestDirectoryCreate:

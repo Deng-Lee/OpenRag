@@ -3,7 +3,7 @@
 Tests complete user workflows from frontend to backend including:
 - User registration and authentication
 - File upload and management
-- Permission management
+- Workspace RBAC
 - Share link functionality
 - Search operations
 - Performance testing
@@ -22,13 +22,13 @@ from unittest.mock import Mock, patch
 import concurrent.futures
 
 from openrag.api.main import app
-from openrag.api.deps import get_db
+from openrag.api.deps import get_current_user, get_db
 from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.file import File
 from openrag.models.team import Team, TeamMember, TeamRole
-from openrag.models.permission import FilePermission, EntityType, Permission
 from openrag.models.share import ShareLink
+from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.security import hash_password
 
 
@@ -303,130 +303,90 @@ class TestFileOperations:
             assert "/documents/doc.txt" in upload_response.json()["uri"]
 
 
-class TestPermissionManagement:
-    """Test permission grant, revoke, and access control"""
+class TestWorkspacePermissionMatrix:
+    """Test workspace read/write and revocation boundaries."""
 
-    def test_permission_workflow(self, client, db, mock_storage):
-        """Test complete permission management workflow"""
-        # Create two users
-        user1 = create_test_user(db, "user1", "user1@example.com", "pass123")
-        user2 = create_test_user(db, "user2", "user2@example.com", "pass123")
+    def test_workspace_permission_workflow(self, client, db, mock_storage):
+        owner = create_test_user(db, "user1", "user1@example.com", "pass123")
+        member = create_test_user(db, "user2", "user2@example.com", "pass123")
+        workspace = Workspace(name="E2E Workspace", slug="e2e-workspace", owner_id=owner.id)
+        db.add(workspace)
+        db.commit()
+        db.refresh(workspace)
+        db.add(WorkspaceMember(workspace_id=workspace.id, user_id=owner.id, role="write"))
+        file = File(
+            uri="/shared.txt",
+            name="shared.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=14,
+            mime_type="text/plain",
+        )
+        db.add(file)
+        db.commit()
+        db.refresh(file)
+        app.dependency_overrides[get_current_user] = lambda: member
 
-        token1 = login_user(client, "user1@example.com", "pass123")
-        token2 = login_user(client, "user2@example.com", "pass123")
-        headers1 = get_auth_headers(token1)
-        headers2 = get_auth_headers(token2)
+        assert client.get(f"/files/{file.id}").status_code == 403
 
-        # User1 uploads a file
-        with patch("openrag.api.files_api.process_document_async") as mock_task:
-            mock_task.delay.return_value = mock_celery_task("task-perm-1")
-            files = {"file": ("shared.txt", io.BytesIO(b"shared content"), "text/plain")}
-            upload_response = client.post(
-                "/files/upload",
-                files=files,
-                data={"path": "/"},
-                headers=headers1
+        membership = WorkspaceMember(
+            workspace_id=workspace.id,
+            user_id=member.id,
+            role="read",
+        )
+        db.add(membership)
+        db.commit()
+        assert client.get(f"/files/{file.id}").status_code == 200
+        assert client.delete(f"/files/{file.id}").status_code == 403
+
+        membership.role = "write"
+        db.commit()
+        with patch("openrag.api.files_api.MinioStorage.ensure_bucket"):
+            create_response = client.post(
+                "/files/directories",
+                data={"path": "/managed", "workspace_id": str(workspace.id)},
             )
-            assert upload_response.status_code == status.HTTP_201_CREATED
-            file_id = upload_response.json()["id"]
+        assert create_response.status_code == status.HTTP_201_CREATED
 
-        # User2 cannot access file initially
-        access_response = client.get(f"/files/{file_id}", headers=headers2)
-        assert access_response.status_code == status.HTTP_403_FORBIDDEN
+        db.delete(membership)
+        db.commit()
+        assert client.get(f"/files/{file.id}").status_code == 403
 
-        # User1 grants read permission to User2
-        grant_response = client.post(
-            f"/files/{file_id}/permissions",
-            json={
-                "entity_type": "user",
-                "entity_id": user2.id,
-                "permission": "read"
-            },
-            headers=headers1
-        )
-        assert grant_response.status_code == status.HTTP_201_CREATED
-
-        # User2 can now access file
-        access_response = client.get(f"/files/{file_id}", headers=headers2)
-        assert access_response.status_code == status.HTTP_200_OK
-
-        # User2 cannot delete file (only read permission)
-        delete_response = client.delete(f"/files/{file_id}", headers=headers2)
-        assert delete_response.status_code == status.HTTP_403_FORBIDDEN
-
-        # List permissions
-        perm_list_response = client.get(f"/files/{file_id}/permissions", headers=headers1)
-        assert perm_list_response.status_code == status.HTTP_200_OK
-        permissions = perm_list_response.json()
-        assert len(permissions) >= 1
-
-        # Revoke permission
-        permission_id = permissions[0]["id"]
-        revoke_response = client.delete(
-            f"/files/{file_id}/permissions/{permission_id}",
-            headers=headers1
-        )
-        assert revoke_response.status_code == status.HTTP_200_OK
-
-        # User2 cannot access file anymore
-        access_response = client.get(f"/files/{file_id}", headers=headers2)
-        assert access_response.status_code == status.HTTP_403_FORBIDDEN
-
-    def test_team_permissions(self, client, db, mock_storage):
-        """Test team-based permission management"""
-        # Create users and team
+    def test_team_membership_does_not_grant_file_access(self, client, db, mock_storage):
         owner = create_test_user(db, "owner", "owner@example.com", "pass123")
         member = create_test_user(db, "member", "member@example.com", "pass123")
-
-        owner_token = login_user(client, "owner@example.com", "pass123")
-        member_token = login_user(client, "member@example.com", "pass123")
-        owner_headers = get_auth_headers(owner_token)
-        member_headers = get_auth_headers(member_token)
-
-        # Create team
-        team_response = client.post(
-            "/teams",
-            json={"name": "Test Team", "description": "Team for testing"},
-            headers=owner_headers
+        workspace = Workspace(name="Team Workspace", slug="team-workspace", owner_id=owner.id)
+        db.add(workspace)
+        db.commit()
+        db.refresh(workspace)
+        team = Team(
+            name="Test Team",
+            description="Team membership is not file authorization",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
         )
-        assert team_response.status_code == status.HTTP_201_CREATED
-        team_id = team_response.json()["id"]
-
-        # Add member to team
-        add_member_response = client.post(
-            f"/teams/{team_id}/members",
-            json={"user_id": member.id, "role": "member"},
-            headers=owner_headers
+        db.add(team)
+        db.commit()
+        db.refresh(team)
+        db.add(TeamMember(team_id=team.id, user_id=member.id, role=TeamRole.MEMBER))
+        file = File(
+            uri="/team-file.txt",
+            name="team-file.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=12,
+            mime_type="text/plain",
         )
-        assert add_member_response.status_code == status.HTTP_201_CREATED
+        db.add(file)
+        db.commit()
+        db.refresh(file)
+        app.dependency_overrides[get_current_user] = lambda: member
 
-        # Owner uploads file
-        with patch("openrag.api.files_api.process_document_async") as mock_task:
-            mock_task.delay.return_value = mock_celery_task("task-team-1")
-            files = {"file": ("team_file.txt", io.BytesIO(b"team content"), "text/plain")}
-            upload_response = client.post(
-                "/files/upload",
-                files=files,
-                data={"path": "/"},
-                headers=owner_headers
-            )
-            file_id = upload_response.json()["id"]
+        response = client.get(f"/files/{file.id}")
 
-        # Grant team permission
-        grant_response = client.post(
-            f"/files/{file_id}/permissions",
-            json={
-                "entity_type": "team",
-                "entity_id": team_id,
-                "permission": "read"
-            },
-            headers=owner_headers
-        )
-        assert grant_response.status_code == status.HTTP_201_CREATED
-
-        # Team member can access file
-        access_response = client.get(f"/files/{file_id}", headers=member_headers)
-        assert access_response.status_code == status.HTTP_200_OK
+        assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
 class TestShareLinks:
@@ -850,35 +810,6 @@ class TestDataPersistence:
         assert get_response.json()["uri"] == "/moved.txt"
         assert get_response.json()["id"] == file_id
 
-    def test_permission_persistence(self, client, db, mock_storage):
-        """Test permissions persist correctly"""
-        user1 = create_test_user(db, "user1", "user1@example.com", "pass123")
-        user2 = create_test_user(db, "user2", "user2@example.com", "pass123")
-
-        token1 = login_user(client, "user1@example.com", "pass123")
-        token2 = login_user(client, "user2@example.com", "pass123")
-        headers1 = get_auth_headers(token1)
-        headers2 = get_auth_headers(token2)
-
-        # Upload and grant permission
-        with patch("openrag.api.files_api.process_document_async") as mock_task:
-            mock_task.delay.return_value = mock_celery_task("task-perm-persist-1")
-            files = {"file": ("perm.txt", io.BytesIO(b"permission test"), "text/plain")}
-            upload_response = client.post("/files/upload", files=files, data={"path": "/"}, headers=headers1)
-            file_id = upload_response.json()["id"]
-
-        client.post(
-            f"/files/{file_id}/permissions",
-            json={"entity_type": "user", "entity_id": user2.id, "permission": "read"},
-            headers=headers1
-        )
-
-        # Verify permission persists across multiple requests
-        for _ in range(3):
-            response = client.get(f"/files/{file_id}", headers=headers2)
-            assert response.status_code == status.HTTP_200_OK
-
-
 class TestConcurrentOperations:
     """Test concurrent operations and race conditions"""
 
@@ -903,99 +834,58 @@ class TestConcurrentOperations:
         assert list_response.status_code == status.HTTP_200_OK
         assert list_response.json()["total"] >= 5
 
-    def test_concurrent_permission_grants(self, client, db, mock_storage):
-        """Test concurrent permission grants"""
-        owner = create_test_user(db, "owner", "owner@example.com", "pass123")
-        users = [
-            create_test_user(db, f"user{i}", f"user{i}@example.com", "pass123")
-            for i in range(3)
-        ]
-
-        owner_token = login_user(client, "owner@example.com", "pass123")
-        owner_headers = get_auth_headers(owner_token)
-
-        # Upload file
-        with patch("openrag.api.files_api.process_document_async") as mock_task:
-            mock_task.delay.return_value = mock_celery_task("task-perm-grant-1")
-            files = {"file": ("shared.txt", io.BytesIO(b"shared"), "text/plain")}
-            upload_response = client.post("/files/upload", files=files, data={"path": "/"}, headers=owner_headers)
-            file_id = upload_response.json()["id"]
-
-        # Grant permissions to multiple users
-        for user in users:
-            response = client.post(
-                f"/files/{file_id}/permissions",
-                json={"entity_type": "user", "entity_id": user.id, "permission": "read"},
-                headers=owner_headers
-            )
-            assert response.status_code == status.HTTP_201_CREATED
-
-        # Verify all permissions exist
-        perm_response = client.get(f"/files/{file_id}/permissions", headers=owner_headers)
-        assert perm_response.status_code == status.HTTP_200_OK
-        assert len(perm_response.json()) >= 3
-
-
 class TestComplexScenarios:
     """Test complex real-world scenarios"""
 
     def test_multi_user_collaboration(self, client, db, mock_storage):
-        """Test multi-user collaboration scenario"""
-        # Create team owner and members
+        """Workspace readers collaborate while ShareLink remains independent."""
         owner = create_test_user(db, "owner", "owner@example.com", "pass123")
         member1 = create_test_user(db, "member1", "member1@example.com", "pass123")
         member2 = create_test_user(db, "member2", "member2@example.com", "pass123")
-
-        owner_token = login_user(client, "owner@example.com", "pass123")
-        member1_token = login_user(client, "member1@example.com", "pass123")
-        member2_token = login_user(client, "member2@example.com", "pass123")
-
-        owner_headers = get_auth_headers(owner_token)
-        member1_headers = get_auth_headers(member1_token)
-        member2_headers = get_auth_headers(member2_token)
-
-        # Create team
-        team_response = client.post(
-            "/teams",
-            json={"name": "Collaboration Team", "description": "Team for collaboration"},
-            headers=owner_headers
+        workspace = Workspace(
+            name="Collaboration Workspace",
+            slug="collaboration-workspace",
+            owner_id=owner.id,
         )
-        team_id = team_response.json()["id"]
-
-        # Add members
-        client.post(
-            f"/teams/{team_id}/members",
-            json={"user_id": member1.id, "role": "member"},
-            headers=owner_headers
+        db.add(workspace)
+        db.commit()
+        db.refresh(workspace)
+        db.add_all(
+            [
+                WorkspaceMember(workspace_id=workspace.id, user_id=owner.id, role="write"),
+                WorkspaceMember(workspace_id=workspace.id, user_id=member1.id, role="read"),
+                WorkspaceMember(workspace_id=workspace.id, user_id=member2.id, role="read"),
+            ]
         )
-        client.post(
-            f"/teams/{team_id}/members",
-            json={"user_id": member2.id, "role": "member"},
-            headers=owner_headers
+        file = File(
+            uri="/project.txt",
+            name="project.txt",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=False,
+            size=11,
+            mime_type="text/plain",
         )
-
-        # Owner uploads files
-        with patch("openrag.api.files_api.process_document_async") as mock_task:
-            mock_task.delay.return_value = mock_celery_task("task-collab-1")
-            files = {"file": ("project.txt", io.BytesIO(b"project doc"), "text/plain")}
-            upload_response = client.post("/files/upload", files=files, data={"path": "/"}, headers=owner_headers)
-            file_id = upload_response.json()["id"]
-
-        # Grant team permission
-        client.post(
-            f"/files/{file_id}/permissions",
-            json={"entity_type": "team", "entity_id": team_id, "permission": "read"},
-            headers=owner_headers
+        db.add(file)
+        db.commit()
+        db.refresh(file)
+        owner_headers = get_auth_headers(
+            login_user(client, "owner@example.com", "pass123")
+        )
+        member1_headers = get_auth_headers(
+            login_user(client, "member1@example.com", "pass123")
+        )
+        member2_headers = get_auth_headers(
+            login_user(client, "member2@example.com", "pass123")
         )
 
-        # All members can access
-        assert client.get(f"/files/{file_id}", headers=member1_headers).status_code == status.HTTP_200_OK
-        assert client.get(f"/files/{file_id}", headers=member2_headers).status_code == status.HTTP_200_OK
+        assert client.get(f"/files/{file.id}", headers=member1_headers).status_code == 200
+        assert client.get(f"/files/{file.id}", headers=member2_headers).status_code == 200
 
         # Create share link
         share_response = client.post(
             "/share/links",
-            json={"file_id": file_id},
+            json={"file_id": file.id},
             headers=owner_headers
         )
         token_str = share_response.json()["token"]
@@ -1219,43 +1109,4 @@ class TestPerformance:
 
         assert response.status_code == status.HTTP_201_CREATED
         assert registration_time < 1.0, f"Registration took {registration_time:.3f}s, expected < 1s"
-
-    def test_permission_grant_performance(self, client, db, mock_storage):
-        """Test permission grant operation performance"""
-        user1 = create_test_user(db, "user1", "user1@example.com", "pass123")
-        user2 = create_test_user(db, "user2", "user2@example.com", "pass123")
-
-        token1 = login_user(client, "user1@example.com", "pass123")
-        headers1 = get_auth_headers(token1)
-
-        # Create a file record directly in database to avoid Celery issues
-        from openrag.models.file import File as FileModel
-        file_record = FileModel(
-            uri="/test_file.txt",
-            name="test_file.txt",
-            owner_id=user1.id,
-            is_directory=False,
-            size=100,
-            mime_type="text/plain"
-        )
-        db.add(file_record)
-        db.commit()
-        db.refresh(file_record)
-        file_id = file_record.id
-
-        # Measure permission grant performance
-        start = time.time()
-        response = client.post(
-            f"/files/{file_id}/permissions",
-            json={
-                "entity_type": "user",
-                "entity_id": user2.id,
-                "permission": "read"
-            },
-            headers=headers1
-        )
-        grant_time = time.time() - start
-
-        assert response.status_code == status.HTTP_201_CREATED
-        assert grant_time < 0.5, f"Permission grant took {grant_time:.3f}s, expected < 0.5s"
 

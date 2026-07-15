@@ -47,7 +47,7 @@ flowchart LR
 | `/users` | 注册、登录、当前用户信息、用户角色 |
 | `/teams` | 团队 CRUD 与团队成员管理 |
 | `/workspaces` | 工作区 CRUD、成员 |
-| `/files` | 文件上传、目录创建、列表筛选、内容/预览、移动、删除、重处理、文件级权限 |
+| `/files` | 文件上传、目录创建、列表筛选、内容/预览、移动、删除、重处理（按工作区权限校验） |
 | `/workspaces/{workspace_id}/files` | 强工作区身份的文件 chunks、chunk source、内容与预览读取 |
 | `/search` | 语义检索、分层检索、chunk 上下文 |
 | `/workspaces/{workspace_id}/tasks`、`/broker` | 工作区任务查询/重试/取消与 worker 调度运维 |

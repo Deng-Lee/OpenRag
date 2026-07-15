@@ -36,7 +36,6 @@ class ProcessingStatus(enum.Enum):
 
 if TYPE_CHECKING:
     from openrag.models.document_chunk import DocumentChunk
-    from openrag.models.permission import FilePermission
     from openrag.models.share import ShareLink
     from openrag.models.user import User
     from openrag.models.workspace import Workspace
@@ -135,12 +134,6 @@ class File(Base, TimestampMixin):
         back_populates="file",
         cascade="all, delete-orphan",
     )
-    permissions: Mapped[List["FilePermission"]] = relationship(
-        "FilePermission",
-        back_populates="file",
-        cascade="all, delete-orphan",
-    )
-
     # Hierarchy fields (L0/L1/L2 support) — 存 MinIO path-style HTTP URL 或兼容旧本地路径
     l0_path: Mapped[Optional[str]] = mapped_column(
         String(2048), nullable=True, comment="L0 abstract URL (MinIO)"
