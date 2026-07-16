@@ -108,7 +108,7 @@ JWT 重处理时选择 PaddleOCR 的请求体示例：
 
 1. **获取令牌** — 系统管理员在 OpenRag Web 端「服务令牌」页面创建令牌，并授权绑定一个或多个工作区（每个工作区独立设置 `read` 或 `write` 权限）。
 2. **保存密钥** — 将完整密钥字符串（`sk-...`）存入 Secret 管理工具（环境变量、Vault、K8s Secret），禁止写入前端代码或版本库。
-3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 14 个机读接口。
+3. **调用接口** — 所有请求携带 `X-OpenRag-Token` 头即可访问 `/service/v1` 下的 16 个机读接口。
 
 ```bash
 # 示例：列根目录树
@@ -149,7 +149,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 操作 | 所需令牌权限 |
 |------|----------------|
 | 目录树、列子项、按前缀查询、文件元数据、按 tag 查询、语义检索、按文件名搜索、创建预览链接 | **read** 或 **write** |
-| 上传新文件、按 tag 幂等写入、覆盖已有文件、删除文件 | **write** |
+| 上传新文件、按 tag 幂等写入、覆盖已有文件、删除文件、手动重试失败文档处理任务 | **write** |
 
 只读令牌调用写接口 → **403**，`detail`：`Token permission insufficient`。
 多工作区检索中，`write` 绑定同样视为具备读取权限。
@@ -163,6 +163,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | **文件 tag** | 可选的单文件业务标识，工作区内唯一；允许字符为 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:`、`-`，长度 1-128。用于外部系统按业务主键查询或幂等写入文件。 |
 | **软删除** | 默认异步删除会先设置 `deleted_at` 并清空 `tag`，使文件立即从读取接口隐藏并释放 tag；物理清理由后台任务完成。在清理完成前，原路径仍可能被视为“正在删除中”。 |
 | **处理状态** | 文件上传后自动进入解析流水线，`processing_status` 可能值为 `pending` → `parsing` → `building_hierarchy` → `embedding` → `completed`（或 `failed`）。 |
+| **处理任务与重试额度** | 上传、覆盖、按 tag upsert 和文件元数据查询会返回最新 `process_document` 任务的 `task_id`、`task_uuid`、`retry_count`、`max_retries`、`remaining_retries` 与 `can_retry`。`retry_count` 表示已消耗的重试次数，`remaining_retries=max(max_retries-retry_count,0)`。 |
 | **基地址** | 路由前缀 `/service/v1`。若经反向代理加 `/api` 前缀，完整路径为 `/api/service/v1/...`，以实际部署为准。 |
 
 ### 2.4 接口一览
@@ -193,6 +194,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `PUT` | `/workspaces/{workspace_name}/documents/upsert-by-tag` | 按 tag 幂等创建、更新或移动并替换文件 | write |
 | `PUT` | `/workspaces/{workspace_name}/documents/by-path` | 覆盖已有文件 | write |
 | `DELETE` | `/workspaces/{workspace_name}/documents/by-path` | 按路径删除文件，默认异步软删除 | write |
+| `POST` | `/workspaces/{workspace_name}/documents/{document_id}/retry` | 按 OpenRag 文档 ID 手动重试失败处理任务 | write |
+| `POST` | `/workspaces/{workspace_name}/documents/by-path/retry` | 按路径手动重试失败处理任务 | write |
 | `POST` | `/workspaces/{workspace_name}/search` | 语义检索（JSON body） | read |
 | `POST` | `/workspaces/multi_space/search` | 多工作区语义检索（JSON body） | read |
 | `GET` | `/workspaces/{workspace_name}/documents/search-by-name` | 按文件名子串模糊搜索 | read |
@@ -206,6 +209,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | 目录浏览 | `GET /workspaces/{workspace_name}/tree`、`children`、`entries/by-prefix` | 获取嵌套目录树、一级子项或按前缀展开的扁平列表 |
 | 文件元数据查询 | `GET /workspaces/{workspace_name}/documents/by-path`、`documents/by-tag`、`documents/search-by-name` | 按逻辑路径、业务 tag 精确查询文件，或按文件名子串搜索 |
 | 文件写入 | `POST /workspaces/{workspace_name}/documents`、`PUT /workspaces/{workspace_name}/documents/upsert-by-tag`、`PUT /workspaces/{workspace_name}/documents/by-path` | 上传新文件、按 tag 幂等写入或覆盖已有文件，需要 `write` 权限 |
+| 失败处理重试 | `POST /workspaces/{workspace_name}/documents/{document_id}/retry`、`POST /workspaces/{workspace_name}/documents/by-path/retry` | 对最新失败或取消的 `process_document` 任务手动重试，需要 `write` 权限 |
 | 文件删除 | `DELETE /workspaces/{workspace_name}/documents/by-path` | 按逻辑路径删除文件；默认异步软删除，立即隐藏并释放 tag |
 | 单工作区语义检索 | `POST /workspaces/{workspace_name}/search` | 在一个指定工作区中检索，需要 `read` 或 `write` 权限 |
 | 多工作区语义检索 | `POST /workspaces/multi_space/search` | 在请求体指定的多个工作区中检索，可访问工作区正常执行，不可访问工作区写入 `skipped_workspaces` |
@@ -501,6 +505,15 @@ X-OpenRag-Token: sk-<完整密钥字符串>
   "mime_type": "application/pdf",
   "owner_id": 5,
   "processing_status": "completed",
+  "processing_error": null,
+  "task_id": 789,
+  "task_uuid": "de060ad9-b68b-42ab-b387-e185a749648e",
+  "task_status": "success",
+  "task_progress": 100,
+  "retry_count": 0,
+  "max_retries": 3,
+  "remaining_retries": 3,
+  "can_retry": false,
   "parser_type": "pdf",
   "created_at": "2026-04-20T10:00:00+00:00",
   "updated_at": "2026-04-20T12:00:00+00:00"
@@ -517,6 +530,23 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `embedding` | 正在向量化入库 |
 | `completed` | 处理完成，可检索 |
 | `failed` | 处理失败 |
+
+**处理任务与重试字段：**
+
+以下字段会出现在上传、覆盖、upsert、`documents/by-path`、`documents/by-tag`、`documents/search-by-name` 与手动 retry 的响应中。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `processing_status` | string/null | 文件处理状态，见上方枚举 |
+| `processing_error` | string/null | 处理失败原因；未失败或已重新入队时为 `null` |
+| `task_id` | int/null | 最新 `process_document` 任务的数据库自增 ID |
+| `task_uuid` | string/null | 最新 `process_document` 任务 UUID，即任务表 `task_id` 字段 |
+| `task_status` | string/null | 最新任务状态，如 `pending`、`failure`、`cancelled` |
+| `task_progress` | int/null | 最新任务进度百分比 |
+| `retry_count` | int | 已消耗的手动重试次数 |
+| `max_retries` | int | 总可重试次数 |
+| `remaining_retries` | int | 剩余可重试次数，`max(max_retries - retry_count, 0)` |
+| `can_retry` | bool | 最新任务处于 `failure`/`cancelled` 且仍有剩余次数时为 `true` |
 
 文件不存在或已软删除 → **404**；路径为目录 → **400**。
 
@@ -541,6 +571,15 @@ X-OpenRag-Token: sk-<完整密钥字符串>
   "mime_type": "application/pdf",
   "tag": "erp-contract-20260420",
   "processing_status": "completed",
+  "processing_error": null,
+  "task_id": 789,
+  "task_uuid": "de060ad9-b68b-42ab-b387-e185a749648e",
+  "task_status": "success",
+  "task_progress": 100,
+  "retry_count": 0,
+  "max_retries": 3,
+  "remaining_retries": 3,
+  "can_retry": false,
   "updated_at": "2026-04-20T12:00:00+00:00"
 }
 ```
@@ -606,13 +645,50 @@ X-OpenRag-Token: sk-<完整密钥字符串>
   "tag": "erp-contract-20260420",
   "created_at": "2026-04-20T10:00:00+00:00",
   "updated_at": "2026-04-20T10:00:00+00:00",
-  "task_id": 789
+  "processing_status": "pending",
+  "processing_error": null,
+  "task_id": 789,
+  "task_uuid": "de060ad9-b68b-42ab-b387-e185a749648e",
+  "task_status": "pending",
+  "task_progress": 0,
+  "retry_count": 0,
+  "max_retries": 3,
+  "remaining_retries": 3,
+  "can_retry": false
 }
 ```
 
-`task_id` 为自动创建的 `process_document` 任务 ID（MIME 不在支持列表时为 `null`）。
+`task_id` 为自动创建的 `process_document` 任务数据库 ID（MIME 不在支持列表时为 `null`）；`task_uuid` 为该任务 UUID。上传成功只表示文件已接收并创建异步处理任务，不表示解析已经完成。
 
-**冲突：** 同路径已存在文件 → **409**（应改用 PUT 覆盖）；同工作区内 `tag` 已被其它文件占用 → **409**，`detail` 为 `Tag already in use`。
+**冲突：** 同路径已存在文件 → **409**；同工作区内 `tag` 已被其它文件占用 → **409**，`detail` 为 `Tag already in use`。
+
+同路径已有文件时，`detail` 为结构化对象，帮助调用方判断是否可直接重试失败任务：
+
+```json
+{
+  "detail": {
+    "code": "file_already_exists_processing_failed",
+    "message": "File already exists and previous processing failed",
+    "document": {
+      "id": 456,
+      "path": "/incoming/report.pdf",
+      "name": "report.pdf",
+      "processing_status": "failed",
+      "processing_error": "MilvusException: request timed out",
+      "task_id": 789,
+      "task_uuid": "de060ad9-b68b-42ab-b387-e185a749648e",
+      "task_status": "failure",
+      "task_progress": 65,
+      "retry_count": 1,
+      "max_retries": 3,
+      "remaining_retries": 2,
+      "can_retry": true
+    }
+  }
+}
+```
+
+若已有文件不是失败态，`detail.code` 为 `file_already_exists`，并且 `document.can_retry=false`；此时应改用覆盖接口或按业务逻辑处理冲突，不应触发 retry。
 
 ---
 
@@ -658,6 +734,15 @@ X-OpenRag-Token: sk-<完整密钥字符串>
   "created_at": "2026-04-20T10:00:00+00:00",
   "updated_at": "2026-04-20T10:05:00+00:00",
   "task_id": 790,
+  "task_uuid": "7dcd0c5f-e5fc-4e83-ae53-d8a66aa5d7c6",
+  "task_status": "pending",
+  "task_progress": 0,
+  "processing_status": "pending",
+  "processing_error": null,
+  "retry_count": 0,
+  "max_retries": 3,
+  "remaining_retries": 3,
+  "can_retry": false,
   "action": "moved"
 }
 ```
@@ -689,7 +774,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 **成功：** **200 OK**
 
-**响应结构：** 同上传接口（含 `task_id`）。
+**响应结构：** 同上传接口，包含新的 `process_document` 任务 ID、任务 UUID、处理状态和重试额度字段。
 
 文件不存在 → **404**；路径为目录 → **400**；MIME 不支持处理 → **400**。
 
@@ -726,6 +811,65 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 ```
 
 响应状态码为 **200 OK**。文件不存在或已软删除 → **404**；read-only 令牌调用 → **403**。
+
+---
+
+#### 2.6.9.1 POST `/workspaces/{workspace_name}/documents/{document_id}/retry`、`/documents/by-path/retry` — 手动重试失败文档处理
+
+该接口用于外部系统在文档 `processing_status=failed` 且 `can_retry=true` 时，手动触发最新失败或取消的 `process_document` 任务重试。接口不会重新上传文件内容，只会把已有处理任务重新置为待处理，并将文件处理状态重置为 `pending`。
+
+**按 OpenRag 文档 ID 重试：**
+
+```http
+POST /service/v1/workspaces/{workspace_name}/documents/{document_id}/retry
+```
+
+**按路径重试：**
+
+```http
+POST /service/v1/workspaces/{workspace_name}/documents/by-path/retry?path=/docs/report.pdf
+```
+
+| 参数 | 位置 | 类型 | 必填 | 说明 |
+|------|------|------|------|------|
+| `document_id` | path | int | 二选一 | OpenRag 文件 ID，即上传或查询返回的 `id` |
+| `path` | query | string | 二选一 | 文件完整逻辑路径 |
+
+**成功：** **200 OK**
+
+```json
+{
+  "id": 456,
+  "path": "/incoming/report.pdf",
+  "name": "report.pdf",
+  "size": 1048576,
+  "mime_type": "application/pdf",
+  "tag": "erp-contract-20260420",
+  "updated_at": "2026-04-20T10:10:00+00:00",
+  "processing_status": "pending",
+  "processing_error": null,
+  "task_id": 789,
+  "task_uuid": "de060ad9-b68b-42ab-b387-e185a749648e",
+  "task_status": "pending",
+  "task_progress": 0,
+  "retry_count": 2,
+  "max_retries": 3,
+  "remaining_retries": 1,
+  "can_retry": false
+}
+```
+
+成功重试后，`retry_count` 增加 1，`remaining_retries` 相应减少；由于任务已经重新入队，`can_retry=false`。如果后续再次处理失败，调用方可通过 `search-by-name`、`by-path` 或 `by-tag` 重新读取最新额度。
+
+**常见错误：**
+
+| 状态码 | `detail` | 说明 |
+|--------|----------|------|
+| **403** | `Token permission insufficient` | read-only 令牌调用 retry |
+| **404** | `File not found` | 文件不存在、已软删除、路径指向目录或不属于该工作区 |
+| **409** | `No process_document task to retry` | 文件没有可重试的处理任务 |
+| **409** | `Document is not in a retryable state` | 最新处理任务不是 `failure`/`cancelled` |
+| **409** | `Retry limit reached` | 已达到 `max_retries` |
 
 ---
 
@@ -1087,7 +1231,16 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
       "size": 1048576,
       "mime_type": "application/pdf",
       "tag": "erp-contract-20260420",
-      "processing_status": "completed",
+      "processing_status": "failed",
+      "processing_error": "MilvusException: request timed out",
+      "task_id": 789,
+      "task_uuid": "de060ad9-b68b-42ab-b387-e185a749648e",
+      "task_status": "failure",
+      "task_progress": 65,
+      "retry_count": 1,
+      "max_retries": 3,
+      "remaining_retries": 2,
+      "can_retry": true,
       "updated_at": "2026-04-20T14:00:00+00:00"
     }
   ],
@@ -1219,6 +1372,18 @@ curl -sS -H "X-OpenRag-Token: sk-xxxxxxxx" \
 ```bash
 curl -sS -H "X-OpenRag-Token: sk-xxxxxxxx" \
   "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/search-by-name?filename=report&path_prefix=%2Fdocs"
+```
+
+**手动重试失败文档处理任务：**
+
+```bash
+# 推荐：使用 OpenRag 返回的文档 id
+curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/456/retry" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx"
+
+# 或：仅知道路径时按路径重试
+curl -sS -X POST "https://api.example.com/service/v1/workspaces/MyWorkspace/documents/by-path/retry?path=%2Fdocs%2Freport.pdf" \
+  -H "X-OpenRag-Token: sk-xxxxxxxx"
 ```
 
 **按路径删除文件（默认异步软删除）：**
@@ -1372,6 +1537,25 @@ r = requests.get(
 r.raise_for_status()
 print(r.json())
 
+# 手动重试失败文档处理任务（推荐按 OpenRag 文档 id）
+r = requests.post(
+    f"{WS_URL}/documents/456/retry",
+    headers=HEADERS,
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json())
+
+# 或按路径重试
+r = requests.post(
+    f"{WS_URL}/documents/by-path/retry",
+    params={"path": "/docs/report.pdf"},
+    headers=HEADERS,
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json())
+
 # 按路径删除文件（默认异步软删除）
 r = requests.delete(
     f"{WS_URL}/documents/by-path",
@@ -1418,10 +1602,14 @@ print(r.json())
 | **404** | `File not found` | 文件路径不存在 |
 | **404** | `No document with this tag` | 按 tag 查询未命中，或文件已软删除 |
 | **404** | `Chunk not found` | 创建 preview link 时 chunk 不属于该 workspace/file |
-| **409** | `File already exists at <uri>` | 上传时目标路径已有文件 |
+| **409** | `file_already_exists` | 上传时目标路径已有非失败态文件；`detail.document.can_retry=false` |
+| **409** | `file_already_exists_processing_failed` | 上传时目标路径已有失败态文件；`detail.document` 会返回失败原因与重试额度 |
 | **409** | `Tag already in use` | 同工作区内 tag 已被活动文件占用 |
 | **409** | `Path is pending deletion; retry after cleanup completes` | 目标路径或祖先路径仍在异步删除清理中 |
 | **409** | `Target path already occupied by another document: <uri>` | upsert 目标路径被其它活动文件占用 |
+| **409** | `No process_document task to retry` | 手动 retry 时文件没有处理任务 |
+| **409** | `Document is not in a retryable state` | 手动 retry 时最新处理任务不是失败或取消状态 |
+| **409** | `Retry limit reached` | 手动 retry 时重试次数已耗尽 |
 | **409** | `Token already has a binding for this workspace` | 添加已存在的绑定 |
 | **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过 100 MB |
 | **422** | — | multipart/form-data 缺少必填字段，如 upsert 缺少 `target_path` |
@@ -1438,12 +1626,15 @@ print(r.json())
 | 403 `Token permission insufficient` | 令牌对绑定的工作区权限不足（read 调用 write 接口） | 将绑定权限升级为 write |
 | 多工作区检索返回 200，但某些工作区没有结果 | 工作区不存在，或当前 service token 没有该工作区 read/write 权限 | 查看 `skipped_workspaces` 中的 `reason` 和 `message`，补齐绑定或修正工作区名称 |
 | 404 `Directory not found` | `path_prefix` 或 `path` 在库中不存在 | 确认目录路径已通过上传或 Web 端创建 |
-| 409 `File already exists` | 上传路径已有同名文件 | 改用 PUT 覆盖 |
+| 409 `file_already_exists_processing_failed` | 上传路径已有同名失败文档 | 使用响应中的 `detail.document.id/path/can_retry/remaining_retries` 判断是否调用 retry；`can_retry=true` 时可调用手动 retry 接口 |
+| 409 `file_already_exists` | 上传路径已有同名非失败态文件 | 改用 PUT 覆盖，或先按业务规则确认是否应替换 |
 | 409 `Tag already in use` | 同工作区已有活动文件使用该业务 tag | 如果是同一业务文件，改用 `PUT /documents/upsert-by-tag`；否则更换 tag |
 | 409 `Path is pending deletion` | 目标路径或其父路径刚被异步删除，物理清理未完成 | 等后台删除任务完成后重试，或改用其它路径 |
+| 409 `Retry limit reached` | 手动 retry 次数已耗尽 | 展示失败原因并引导人工处理；如需重新处理，需重新上传/覆盖或后台调整任务 |
+| 409 `Document is not in a retryable state` | 文档当前没有处于失败/取消状态的最新处理任务 | 先通过 `search-by-name`、`by-path` 或 `by-tag` 读取 `processing_status` 和 `can_retry` |
 | 400 `Parent directory does not exist` | 上传时父目录未创建 | 上传时带 `create_dirs=true` 自动建目录；或先通过 Web 端 / JWT `POST /files/directories` 创建目录 |
 | 404 `No document with this tag` | tag 不存在，或文件已被软删除并释放 tag | 确认工作区名和 tag；如刚删除过文件，可重新上传或 upsert |
-| 检索返回 0 结果 | 文件 `processing_status` 非 `completed` | 等待文件处理完成再检索 |
+| 检索返回 0 结果 | 文件 `processing_status` 非 `completed` | 等待文件处理完成再检索；若为 `failed` 且 `can_retry=true`，可调用手动 retry |
 | 文件名搜索返回 0 结果 | 文件名不匹配或 `path_prefix` 限定范围内无文件 | 尝试缩短关键词或扩大 path_prefix 范围 |
 | 创建 preview link 返回 404 `File not found` 或 `Chunk not found` | 前端传回的 `file_id`、`chunk_id` 与当前工作区或文件不匹配 | 使用 search 响应原样传递这些字段，不要按文件名或路径自行定位 chunk |
 | 创建 preview link 返回 400 `chunk_index does not match chunk` | `chunk_index` 不是该 chunk 的真实序号 | 使用 search 返回的 `chunk_index`，或不传该可选字段 |
