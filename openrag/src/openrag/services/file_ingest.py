@@ -17,6 +17,7 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel, ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
+from openrag.services.document_retry_status import document_conflict_detail
 from openrag.services.file_deletion import delete_milvus_vectors_for_file
 from openrag.services.task_service import TaskService
 from openrag.services.trace_service import TraceService
@@ -566,9 +567,12 @@ def ingest_new_file(
                 },
                 error_message="duplicate_file",
             )
+            detail = f"File already exists at {file_uri}"
+            if duplicate_status_code == status.HTTP_409_CONFLICT:
+                detail = document_conflict_detail(db, existing_file, file_uri)
             raise HTTPException(
                 status_code=duplicate_status_code,
-                detail=f"File already exists at {file_uri}",
+                detail=detail,
             )
 
         ct = resolve_effective_mime_type(content_type, upload_filename, parser_type)
@@ -632,9 +636,21 @@ def ingest_new_file(
                     detail="Tag already in use",
                 ) from exc
             if kind == "uri":
+                detail = f"File already exists at {file_uri}"
+                if duplicate_status_code == status.HTTP_409_CONFLICT:
+                    existing_file = (
+                        db.query(FileModel)
+                        .filter(
+                            FileModel.uri == file_uri,
+                            FileModel.workspace_id == workspace.id,
+                        )
+                        .first()
+                    )
+                    if existing_file is not None:
+                        detail = document_conflict_detail(db, existing_file, file_uri)
                 raise HTTPException(
                     status_code=duplicate_status_code,
-                    detail=f"File already exists at {file_uri}",
+                    detail=detail,
                 ) from exc
             raise
         db.refresh(file_record)
