@@ -37,13 +37,13 @@ def stub_minio(monkeypatch):
         def remove_document_hierarchy(self, *a, **k): return None
     # patch every module that constructs MinioStorage or deletes vectors on the upsert path:
     # - file_ingest.MinioStorage: move helper put/remove + create via ingest_new_file
-    # - file_ingest.delete_milvus_vectors_for_file: move helper post-commit old-vector cleanup
-    # - files_api.MinioStorage / files_api.delete_milvus_vectors_for_file: update branch goes
+    # - file_ingest.delete_vectors_for_file_across_generations: post-commit old-vector cleanup
+    # - files_api.MinioStorage / files_api.delete_vectors_for_file_across_generations: update branch goes
     #   through replace_file_content -> cleanup_file_processing_data (defined in files_api)
     monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", lambda *a, **k: _M())
-    monkeypatch.setattr("openrag.services.file_ingest.delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr("openrag.services.file_ingest.delete_vectors_for_file_across_generations", lambda *a, **k: {})
     monkeypatch.setattr("openrag.api.files_api.MinioStorage", lambda *a, **k: _M())
-    monkeypatch.setattr("openrag.api.files_api.delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr("openrag.api.files_api.delete_vectors_for_file_across_generations", lambda *a, **k: {})
     return _M()
 
 
@@ -270,9 +270,9 @@ def test_upsert_move_commit_failure_rolls_back_and_cleans_new_object(db, wsowner
         def remove_document_hierarchy(self, *a, **k): return None
 
     monkeypatch.setattr("openrag.services.file_ingest.MinioStorage", lambda *a, **k: _RecMinio())
-    monkeypatch.setattr("openrag.services.file_ingest.delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr("openrag.services.file_ingest.delete_vectors_for_file_across_generations", lambda *a, **k: {})
     monkeypatch.setattr("openrag.api.files_api.MinioStorage", lambda *a, **k: _RecMinio())
-    monkeypatch.setattr("openrag.api.files_api.delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr("openrag.api.files_api.delete_vectors_for_file_across_generations", lambda *a, **k: {})
 
     f0, _, _ = upsert_file_by_tag(
         db, w, u.id, tag="report", target_path="/r.txt",

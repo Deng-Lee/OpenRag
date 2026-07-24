@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -7,10 +8,17 @@ from sqlalchemy.orm import sessionmaker
 
 import openrag.models  # noqa: F401 - register models
 from openrag.chunking.chunk_models import Chunk
-from openrag.models import DocumentChunk, DocumentParseArtifact, File, TraceRun, TraceSpan
+from openrag.models import (
+    DocumentChunk,
+    DocumentParseArtifact,
+    File,
+    TraceRun,
+    TraceSpan,
+)
 from openrag.models.base import Base
 from openrag.models.user import User
 from openrag.models.workspace import Workspace
+from openrag.indexing.runtime import IndexRuntime
 from openrag.parsers.base import DocumentBlock
 from openrag.processors.document_processor import DocumentProcessor
 from openrag.processors.document_processor import (
@@ -27,7 +35,9 @@ class FakeUploadMinio:
     def __init__(self):
         self.puts = []
 
-    def put_file(self, bucket_name, object_name, data, content_type="application/octet-stream"):
+    def put_file(
+        self, bucket_name, object_name, data, content_type="application/octet-stream"
+    ):
         self.puts.append((bucket_name, object_name, data, content_type))
 
 
@@ -38,17 +48,34 @@ class FakeProcessingMinio:
     def get_file_to_path(self, bucket_name, object_name, file_path):
         Path(file_path).write_bytes(b"source document bytes")
 
-    def put_file(self, bucket_name, object_name, data, content_type="application/octet-stream"):
+    def put_file(
+        self, bucket_name, object_name, data, content_type="application/octet-stream"
+    ):
         self.objects[(bucket_name, object_name)] = {
             "data": data,
             "content_type": content_type,
         }
 
     def put_document_hierarchy(self, bucket_name, file_uri, l0, l1, l2):
-        self.put_file(bucket_name, f"hierarchy/{file_uri.lstrip('/')}.abstract.md", l0.encode("utf-8"), "text/markdown")
-        self.put_file(bucket_name, f"hierarchy/{file_uri.lstrip('/')}.overview.md", l1.encode("utf-8"), "text/markdown")
+        self.put_file(
+            bucket_name,
+            f"hierarchy/{file_uri.lstrip('/')}.abstract.md",
+            l0.encode("utf-8"),
+            "text/markdown",
+        )
+        self.put_file(
+            bucket_name,
+            f"hierarchy/{file_uri.lstrip('/')}.overview.md",
+            l1.encode("utf-8"),
+            "text/markdown",
+        )
         for i, chunk in enumerate(l2):
-            self.put_file(bucket_name, f"hierarchy/{file_uri.lstrip('/')}/chunks/{i:04d}.md", chunk.text.encode("utf-8"), "text/markdown")
+            self.put_file(
+                bucket_name,
+                f"hierarchy/{file_uri.lstrip('/')}/chunks/{i:04d}.md",
+                chunk.text.encode("utf-8"),
+                "text/markdown",
+            )
         return {
             "l0_url": "minio://l0",
             "l1_url": "minio://l1",
@@ -93,7 +120,14 @@ class FakeParserRegistry:
 
 
 class FakeChunkEngine:
-    def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
+    def chunk(
+        self,
+        text_blocks,
+        chunk_size,
+        chunk_overlap,
+        chunk_method=None,
+        min_chunk_tokens=0,
+    ):
         return [
             Chunk(
                 text="Heading body",
@@ -119,6 +153,9 @@ class FakeEmbeddingEngine:
     model_name = "fake-embedding"
     dimension = 3
 
+    def assert_fingerprint(self, _fingerprint):
+        return None
+
     def embed_chunks(self, chunks):
         return [(chunk, [0.1, 0.2, 0.3]) for chunk in chunks]
 
@@ -132,7 +169,7 @@ class FakeVectorStore:
     def delete_by_file_id(self, file_id):
         self.deleted_file_id = file_id
 
-    def insert_chunks(self, file_id, chunk_embeddings):
+    def insert_chunks(self, file_id, chunk_embeddings, workspace_id=None):
         return len(chunk_embeddings)
 
 
@@ -181,7 +218,14 @@ class FakeCanonicalChunkEngine:
     def __init__(self):
         self.seen_blocks = None
 
-    def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
+    def chunk(
+        self,
+        text_blocks,
+        chunk_size,
+        chunk_overlap,
+        chunk_method=None,
+        min_chunk_tokens=0,
+    ):
         self.seen_blocks = list(text_blocks)
         assert [block.text for block in self.seen_blocks] == ["Alpha", "Beta"]
         assert [(block.char_start, block.char_end) for block in self.seen_blocks] == [
@@ -255,7 +299,9 @@ def test_extract_chunk_position_fields_coerces_ragflow_metadata():
     )
 
     assert _coerce_int_list(chunk.metadata["page_num_int"]) == [1]
-    assert _coerce_position_int(chunk.metadata["position_int"]) == [[1, 10, 120, 30, 58]]
+    assert _coerce_position_int(chunk.metadata["position_int"]) == [
+        [1, 10, 120, 30, 58]
+    ]
     assert _extract_chunk_position_fields(chunk) == {
         "page_num_int": [1],
         "position_int": [[1, 10, 120, 30, 58]],
@@ -304,7 +350,9 @@ def test_document_processor_uses_canonical_source_for_text_like_parsers(tmp_path
             (workspace.slug, artifact.canonical_json_object_key)
         ]
         payload = json.loads(json_object["data"].decode("utf-8"))
-        stored_chunk = db.query(DocumentChunk).filter_by(chunk_id="canonical-chunk-1").one()
+        stored_chunk = (
+            db.query(DocumentChunk).filter_by(chunk_id="canonical-chunk-1").one()
+        )
 
         assert md_object["data"].decode("utf-8") == "Alpha\nBeta"
         assert payload["canonical_source"]["version"] == "chunk_source_v1"
@@ -345,10 +393,19 @@ def test_upload_ingest_records_upload_trace_spans(monkeypatch):
         assert run.user_id == user.id
         assert run.file_id == file_record.id
         assert run.status == "success"
-        spans = {span.stage: span for span in db.query(TraceSpan).order_by(TraceSpan.id)}
-        assert set(spans) == {"upload.validate", "upload.store_minio", "upload.create_records"}
+        spans = {
+            span.stage: span for span in db.query(TraceSpan).order_by(TraceSpan.id)
+        }
+        assert set(spans) == {
+            "upload.validate",
+            "upload.store_minio",
+            "upload.create_records",
+        }
         assert spans["upload.validate"].output_summary["file_size"] == 5
-        assert spans["upload.store_minio"].output_summary["object_key"] == "/uploads/new.txt"
+        assert (
+            spans["upload.store_minio"].output_summary["object_key"]
+            == "/uploads/new.txt"
+        )
         assert spans["upload.create_records"].output_summary["task_created"] is True
     finally:
         db.close()
@@ -365,7 +422,9 @@ def test_upload_trace_failure_is_best_effort(monkeypatch):
         def boom(*args, **kwargs):
             raise RuntimeError("trace database down")
 
-        monkeypatch.setattr("openrag.services.trace_service.TraceService.start_span", boom)
+        monkeypatch.setattr(
+            "openrag.services.trace_service.TraceService.start_span", boom
+        )
 
         file_record, _ = file_ingest.ingest_new_file(
             db,
@@ -396,7 +455,6 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         monkeypatch.setattr(task_worker, "MinioStorage", lambda: processing_minio)
         monkeypatch.setattr(task_worker, "ParserRegistry", FakeParserRegistry)
         monkeypatch.setattr(task_worker, "ChunkEngine", FakeChunkEngine)
-        monkeypatch.setattr(task_worker, "EmbeddingEngine", FakeEmbeddingEngine)
         monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
         monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "600")
         monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "80")
@@ -421,13 +479,27 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         worker.layer_store = None
         worker.chunk_fulltext_store = FakeEsStore()
         worker.require_layer_vectors = False
+        runtime = IndexRuntime(
+            snapshot=SimpleNamespace(
+                generation_id="generation-test",
+                state="active",
+                embedding_fingerprint="a" * 64,
+                chunk_collection_name="fake_chunks",
+                layer_collection_name=None,
+            ),
+            embedding_engine=worker.embedding_engine,
+            vector_store=worker.vector_store,
+            layer_store=None,
+        )
         result = worker._process_document(
             {
                 "file_id": file_id,
                 "workspace_id": workspace_id,
                 "user_id": user_id,
+                "index_generation_id": "generation-test",
             },
             task_id=77,
+            runtime=runtime,
         )
 
         db2 = sessionmaker(bind=engine)()
@@ -435,7 +507,9 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             assert result["status"] == "success"
             run = db2.query(TraceRun).filter_by(trace_id="processing-trace-1").one()
             assert run.status == "success"
-            stages = {span.stage: span for span in db2.query(TraceSpan).order_by(TraceSpan.id)}
+            stages = {
+                span.stage: span for span in db2.query(TraceSpan).order_by(TraceSpan.id)
+            }
             assert set(stages) == {
                 "worker.download_file",
                 "parse.document",
@@ -455,11 +529,17 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
 
             artifact_span = stages["parsed_artifacts.persist"]
             assert artifact_span.output_summary["status"] == "completed"
-            assert artifact_span.output_summary["canonical_json_object_key"].endswith("/canonical.json")
-            assert artifact_span.output_summary["canonical_md_object_key"].endswith("/canonical.md")
+            assert artifact_span.output_summary["canonical_json_object_key"].endswith(
+                "/canonical.json"
+            )
+            assert artifact_span.output_summary["canonical_md_object_key"].endswith(
+                "/canonical.md"
+            )
             assert artifact_span.output_summary["block_count"] == 2
             assert artifact_span.output_summary["page_count"] == 2
-            assert "SECRET FULL PARSE BODY" not in json.dumps(artifact_span.output_summary)
+            assert "SECRET FULL PARSE BODY" not in json.dumps(
+                artifact_span.output_summary
+            )
 
             assert stages["chunk.build"].output_summary["chunk_count"] == 3
             assert stages["chunk.build"].output_summary["short_chunk_count"] == 2
@@ -480,7 +560,12 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             }
             assert stages["fulltext.es_index"].output_summary["doc_count"] == 3
             assert stages["fulltext.es_index"].output_summary["upsert_count"] == 3
-            assert stages["metadata.persist_chunks"].output_summary["document_chunks_written"] == 3
+            assert (
+                stages["metadata.persist_chunks"].output_summary[
+                    "document_chunks_written"
+                ]
+                == 3
+            )
             assert db2.query(DocumentChunk).count() == 3
             first_chunk = db2.query(DocumentChunk).filter_by(chunk_id="chunk-1").one()
             assert first_chunk.page_num_int == [1, 1]
@@ -493,8 +578,15 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             keys = [key for (_bucket, key) in processing_minio.objects]
             assert any(key.endswith("/canonical.json") for key in keys)
             assert any(key.endswith("/canonical.md") for key in keys)
-            assert not any("blocks" in json.dumps(span.output_summary or {}).lower() for span in stages.values())
-            assert not any("embedding" in json.dumps(span.output_summary or {}).lower() and "[0.1" in json.dumps(span.output_summary or {}) for span in stages.values())
+            assert not any(
+                "blocks" in json.dumps(span.output_summary or {}).lower()
+                for span in stages.values()
+            )
+            assert not any(
+                "embedding" in json.dumps(span.output_summary or {}).lower()
+                and "[0.1" in json.dumps(span.output_summary or {})
+                for span in stages.values()
+            )
         finally:
             db2.close()
     finally:

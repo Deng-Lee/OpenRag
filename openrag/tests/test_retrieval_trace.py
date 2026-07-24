@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -73,6 +74,23 @@ def _patch_search_dependencies(monkeypatch, fulltext_store):
     monkeypatch.setattr(search_api, "_get_layer_store", lambda: None)
     monkeypatch.setattr(search_api, "_get_fulltext_store", lambda: fulltext_store)
     monkeypatch.setattr(
+        search_api,
+        "_resolve_search_runtime",
+        lambda _db: SimpleNamespace(
+            snapshot=SimpleNamespace(
+                generation_id="generation-test",
+                route_version=1,
+                embedding_fingerprint="a" * 64,
+                embedding_revision="revision-test",
+                chunk_collection_name="chunks_test",
+                layer_collection_name=None,
+            ),
+            embedding_engine=FakeEmbeddingEngine(),
+            vector_store=FakeVectorStore(),
+            layer_store=None,
+        ),
+    )
+    monkeypatch.setattr(
         RetrievalService,
         "_accessible_file_ids",
         lambda self, user_id, workspace_id=None: [101, 102, 103],
@@ -81,6 +99,11 @@ def _patch_search_dependencies(monkeypatch, fulltext_store):
         RetrievalService,
         "_resolve_es_index_names",
         lambda self, workspace_id, file_ids: ["idx-test"],
+    )
+    monkeypatch.setattr(
+        RetrievalService,
+        "_filter_hits_to_active_files",
+        lambda self, hits: hits,
     )
     monkeypatch.setattr(
         Reranker,
@@ -122,6 +145,14 @@ def test_semantic_search_records_retrieval_trace_spans_and_top50_snapshots(
     assert run.query_hash != request.query
     assert run.query_preview == request.query
     assert run.status == "success"
+    assert run.search_config_snapshot["index_generation_id"] == "generation-test"
+    assert run.search_config_snapshot["route_version"] == 1
+    assert run.search_config_snapshot["embedding_fingerprint"] == "a" * 64
+    assert run.search_config_snapshot["chunk_collection_name"] == "chunks_test"
+    assert run.index_generation_id == "generation-test"
+    assert run.route_version == 1
+    assert run.embedding_fingerprint == "a" * 64
+    assert run.collection_name == "chunks_test"
 
     spans = {
         span.stage: span

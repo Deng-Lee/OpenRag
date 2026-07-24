@@ -82,6 +82,43 @@ class TraceService:
     def finish_run(self, *, trace_id: Optional[str] = None) -> Optional[TraceRun]:
         return self._complete_run(trace_id=trace_id, status="success")
 
+    def update_search_config_snapshot(
+        self, values: Dict[str, Any], *, trace_id: Optional[str] = None
+    ) -> Optional[TraceRun]:
+        resolved_trace_id = trace_id or get_trace_context()["trace_id"]
+        if not resolved_trace_id:
+            return None
+        run = self.db.query(TraceRun).filter(TraceRun.trace_id == resolved_trace_id).first()
+        if run is None:
+            return None
+        run.search_config_snapshot = {
+            **(run.search_config_snapshot or {}),
+            **values,
+        }
+        run.index_generation_id = values.get(
+            "index_generation_id", run.index_generation_id
+        )
+        run.route_version = values.get("route_version", run.route_version)
+        run.embedding_fingerprint = values.get(
+            "embedding_fingerprint", run.embedding_fingerprint
+        )
+        run.embedding_revision = values.get(
+            "embedding_revision", run.embedding_revision
+        )
+        run.collection_role = values.get("collection_role", run.collection_role)
+        run.collection_name = values.get(
+            "collection_name",
+            values.get("chunk_collection_name", run.collection_name),
+        )
+        try:
+            self.db.commit()
+            self.db.refresh(run)
+        except Exception:
+            self.db.rollback()
+            logger.exception("Failed to update trace search config snapshot")
+            return None
+        return run
+
     def fail_run(
         self,
         *,

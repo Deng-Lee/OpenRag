@@ -65,6 +65,12 @@ class TraceRun(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     sampling_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     search_config_snapshot: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    index_generation_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    route_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    embedding_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    embedding_revision: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    collection_role: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    collection_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     otel_trace_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
@@ -81,6 +87,11 @@ class TraceRun(Base):
         "error_message",
         "sampling_reason",
         "otel_trace_id",
+        "index_generation_id",
+        "embedding_fingerprint",
+        "embedding_revision",
+        "collection_role",
+        "collection_name",
     )
     def _strip_nul_strings(self, _key: str, value: object) -> object:
         return strip_pg_nul_bytes(value)

@@ -14,11 +14,13 @@ router = APIRouter(prefix="/broker", tags=["broker"])
 
 class TaskResponse(BaseModel):
     """Task response model"""
+
     id: int
     task_id: str
     workspace_id: int
     user_id: int
     file_id: Optional[int] = None
+    index_generation_id: Optional[str] = None
     task_type: str
     queue: str
     priority: int
@@ -43,12 +45,14 @@ class TaskResponse(BaseModel):
 
 class GetTasksResponse(BaseModel):
     """Get tasks response"""
+
     tasks: List[dict]
     total: int
 
 
 class HeartbeatResponse(BaseModel):
     """Heartbeat response"""
+
     success: bool
     message: str
 
@@ -61,8 +65,10 @@ def get_broker(db: Session = Depends(get_db)) -> TaskBroker:
 @router.get("/get-tasks", response_model=GetTasksResponse)
 async def get_tasks(
     worker_id: str = Query(..., description="Worker unique identifier"),
-    limit: int = Query(1, ge=1, le=20, description="Number of tasks to fetch (default: 1)"),
-    broker: TaskBroker = Depends(get_broker)
+    limit: int = Query(
+        1, ge=1, le=20, description="Number of tasks to fetch (default: 1)"
+    ),
+    broker: TaskBroker = Depends(get_broker),
 ):
     """Get tasks for worker with dynamic weight-based allocation
 
@@ -82,18 +88,14 @@ async def get_tasks(
     try:
         tasks = broker.get_tasks(worker_id, limit)
         return GetTasksResponse(
-            tasks=[task.to_dict() for task in tasks],
-            total=len(tasks)
+            tasks=[task.to_dict() for task in tasks], total=len(tasks)
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get tasks: {str(e)}")
 
 
 @router.post("/heartbeat/{task_id}", response_model=HeartbeatResponse)
-async def heartbeat(
-    task_id: int,
-    broker: TaskBroker = Depends(get_broker)
-):
+async def heartbeat(task_id: int, broker: TaskBroker = Depends(get_broker)):
     """Update heartbeat for a task
 
     Workers should call this endpoint periodically (every 30 seconds)
@@ -112,13 +114,13 @@ async def heartbeat(
         broker.update_heartbeat(task_id)
         return HeartbeatResponse(success=True, message="Heartbeat updated")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update heartbeat: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update heartbeat: {str(e)}"
+        )
 
 
 @router.post("/recover-timeout")
-async def recover_timeout(
-    broker: TaskBroker = Depends(get_broker)
-):
+async def recover_timeout(broker: TaskBroker = Depends(get_broker)):
     """Manually trigger timeout recovery
 
     This endpoint recovers tasks that haven't received a heartbeat
@@ -132,13 +134,13 @@ async def recover_timeout(
         count = broker.recover_timeout_tasks()
         return {"recovered_count": count}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to recover tasks: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to recover tasks: {str(e)}"
+        )
 
 
 @router.get("/weights")
-async def get_weights(
-    broker: TaskBroker = Depends(get_broker)
-):
+async def get_weights(broker: TaskBroker = Depends(get_broker)):
     """Get current dynamic weights for all workspaces
 
     This is useful for monitoring the broker's scheduling decisions.

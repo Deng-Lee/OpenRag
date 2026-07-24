@@ -4,53 +4,125 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
 from openrag.models.file import File as FileModel
+from openrag.models.index_generation import IndexGeneration, IndexGenerationState
 from openrag.models.task import Task
 from openrag.models.workspace import Workspace
+from openrag.indexing.runtime import (
+    IndexRuntimeResolver,
+    build_vector_stores_from_snapshot,
+)
 from openrag.services.task_service import TaskService
 from openrag.storage.minio_storage import MinioStorage
 
 logger = logging.getLogger(__name__)
 
 
-def delete_milvus_vectors_for_file(file_id: int) -> list[str]:
-    """Remove chunk + L0/L1 layer vectors for a file from Milvus; best-effort ES chunk index.
+class GenerationDeletePropagationError(RuntimeError):
+    code = "GENERATION_DELETE_INCOMPLETE"
+    public_message = "File index deletion is incomplete"
+    retryable = True
 
-    Returns:
-        A list of failed subsystems, used for alerting/observability.
-    """
-    failures: list[str] = []
-    try:
-        from openrag.embedding.embedding_engine import EmbeddingEngine
-        from openrag.vectorstore.milvus_store import MilvusStore
+    def __init__(self, result: dict):
+        super().__init__(self.public_message)
+        self.result = result
 
-        MilvusStore(dimension=EmbeddingEngine().dimension).delete_by_file_id(file_id)
-    except Exception as e:
-        logger.warning("Milvus chunk delete failed for file %s: %s", file_id, e)
-        failures.append("milvus_chunk")
-    try:
-        from openrag.embedding.embedding_engine import EmbeddingEngine
-        from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
 
-        MilvusLayerStore(dimension=EmbeddingEngine().dimension).delete_by_file_id(
-            file_id
+_DELETE_TARGET_STATES = {
+    IndexGenerationState.BUILDING.value,
+    IndexGenerationState.RECONCILING.value,
+    IndexGenerationState.VALIDATING.value,
+    IndexGenerationState.READY.value,
+    IndexGenerationState.ACTIVE.value,
+    IndexGenerationState.RETIRED.value,
+}
+
+
+def resolve_generations_containing_file(
+    db: Session, file_id: int
+) -> list[IndexGeneration]:
+    del file_id  # physical membership is conservatively assumed for every retained target
+    return (
+        db.query(IndexGeneration)
+        .filter(
+            or_(
+                IndexGeneration.state.in_(_DELETE_TARGET_STATES),
+                and_(
+                    IndexGeneration.state == IndexGenerationState.FAILED.value,
+                    IndexGeneration.build_started_at.is_not(None),
+                ),
+            )
         )
-    except Exception as e:
-        logger.warning("Milvus L0/L1 delete failed for file %s: %s", file_id, e)
-        failures.append("milvus_l0_l1")
+        .order_by(IndexGeneration.created_at)
+        .all()
+    )
+
+
+def delete_file_from_generation(
+    db: Session,
+    generation: IndexGeneration,
+    file_id: int,
+    *,
+    resolver: IndexRuntimeResolver | None = None,
+) -> None:
+    resolver = resolver or IndexRuntimeResolver()
+    snapshot = resolver.get_generation_snapshot(db, generation.id)
+    chunk_store, layer_store = build_vector_stores_from_snapshot(snapshot)
+    chunk_store.delete_by_file_id(file_id)
+    if layer_store is not None:
+        layer_store.delete_by_file_id(file_id)
+
+
+def record_generation_delete_result(
+    result: dict,
+    generation_id: str,
+    *,
+    success: bool,
+) -> None:
+    key = "succeeded_generation_ids" if success else "failed_generation_ids"
+    result[key].append(generation_id)
+
+
+def delete_vectors_for_file_across_generations(
+    db: Session,
+    file_id: int,
+    *,
+    resolver: IndexRuntimeResolver | None = None,
+) -> dict:
+    generations = resolve_generations_containing_file(db, file_id)
+    result = {
+        "file_id": file_id,
+        "target_generation_ids": [item.id for item in generations],
+        "succeeded_generation_ids": [],
+        "failed_generation_ids": [],
+        "failed_subsystems": [],
+    }
+    if not generations:
+        result["failed_subsystems"].append("generation_registry")
+        raise GenerationDeletePropagationError(result)
+    resolver = resolver or IndexRuntimeResolver()
+    for generation in generations:
+        try:
+            delete_file_from_generation(
+                db, generation, file_id, resolver=resolver
+            )
+            record_generation_delete_result(result, generation.id, success=True)
+        except Exception:
+            logger.exception(
+                "generation_vector_delete_failed generation_id=%s file_id=%s",
+                generation.id,
+                file_id,
+            )
+            record_generation_delete_result(result, generation.id, success=False)
     if not _delete_elasticsearch_chunks_for_file_best_effort(file_id):
-        failures.append("elasticsearch_chunks")
-    if failures:
-        logger.error(
-            "ALERT: vector/chunk index deletion partially failed for file_id=%s, failed_subsystems=%s",
-            file_id,
-            ",".join(failures),
-        )
-    return failures
+        result["failed_subsystems"].append("elasticsearch_chunks")
+    if result["failed_generation_ids"] or result["failed_subsystems"]:
+        raise GenerationDeletePropagationError(result)
+    return result
 
 
 def _delete_elasticsearch_chunks_for_file_best_effort(file_id: int) -> bool:
@@ -86,11 +158,12 @@ def delete_file_with_storage(
     db: Session,
     file: FileModel,
     workspace: Workspace,
-) -> None:
+) -> dict:
     """删除存储与向量，移除任务记录，再删除 file 行并 commit。"""
     minio_storage = MinioStorage()
     hierarchy_storage = HierarchyStorage()
     slug = workspace.slug
+    delete_results = []
 
     if file.is_directory:
         directory_prefix = file.uri.rstrip("/")
@@ -105,23 +178,28 @@ def delete_file_with_storage(
             .all()
         )
         for child in children:
-            db.query(Task).filter(Task.file_id == child.id).delete(
-                synchronize_session=False
+            delete_results.append(
+                delete_vectors_for_file_across_generations(db, child.id)
             )
+        delete_results.append(
+            delete_vectors_for_file_across_generations(db, file.id)
+        )
+        for child in children:
             hierarchy_storage.delete_document_hierarchy(file_uri=child.uri)
             minio_storage.remove_document_hierarchy(slug, child.uri)
-            delete_milvus_vectors_for_file(child.id)
         minio_storage.remove_directory(slug, file.uri)
     else:
+        delete_results.append(
+            delete_vectors_for_file_across_generations(db, file.id)
+        )
         minio_storage.remove_document_hierarchy(slug, file.uri)
         minio_storage.remove_file(slug, file.uri)
 
     hierarchy_storage.delete_document_hierarchy(file_uri=file.uri)
-    delete_milvus_vectors_for_file(file.id)
 
-    db.query(Task).filter(Task.file_id == file.id).delete(synchronize_session=False)
     db.delete(file)
     db.commit()
+    return _merge_generation_delete_results(delete_results)
 
 
 def normalize_uri_prefix_for_delete(path: str) -> str:
@@ -269,7 +347,9 @@ def soft_delete_subtree_and_enqueue(
         raise
 
 
-def _physically_delete_row_only(db: Session, file: FileModel, workspace: Workspace) -> None:
+def _physically_delete_row_only(
+    db: Session, file: FileModel, workspace: Workspace
+) -> dict:
     """Physically delete ONE row's storage/vectors/DB, WITHOUT touching any other
     row's objects (Codex round-2 #1 + round-3 #1).
 
@@ -285,6 +365,7 @@ def _physically_delete_row_only(db: Session, file: FileModel, workspace: Workspa
     The watermark cleanup enumerates every soft-deleted row (children included) and
     deletes deepest-first, so each file's own objects are removed by its own row.
     """
+    result = delete_vectors_for_file_across_generations(db, file.id)
     if file.is_directory:
         # DB-only virtual node: NO MinIO object, NO remove_directory (prefix-recursive).
         pass
@@ -293,10 +374,9 @@ def _physically_delete_row_only(db: Session, file: FileModel, workspace: Workspa
         minio_storage.remove_document_hierarchy(workspace.slug, file.uri)
         minio_storage.remove_file(workspace.slug, file.uri)
         HierarchyStorage().delete_document_hierarchy(file_uri=file.uri)
-        delete_milvus_vectors_for_file(file.id)
-    db.query(Task).filter(Task.file_id == file.id).delete(synchronize_session=False)
     db.delete(file)
     db.commit()
+    return result
 
 
 def physically_delete_soft_deleted_under_prefix(
@@ -305,6 +385,7 @@ def physically_delete_soft_deleted_under_prefix(
     prefix: str,
     deleted_before: datetime,
     workspace: Workspace,
+    delete_results: list[dict] | None = None,
 ) -> list[int]:
     """Physically delete ONLY soft-deleted rows at/under ``prefix`` whose
     ``deleted_at <= deleted_before`` (deepest URI first). Active rows created after
@@ -339,6 +420,23 @@ def physically_delete_soft_deleted_under_prefix(
         fresh = db.query(FileModel).filter(FileModel.id == f.id).first()
         if fresh is None:
             continue
-        _physically_delete_row_only(db, fresh, workspace)
+        result = _physically_delete_row_only(db, fresh, workspace)
+        if delete_results is not None:
+            delete_results.append(result)
         deleted_ids.append(f.id)
     return deleted_ids
+
+
+def _merge_generation_delete_results(results: list[dict]) -> dict:
+    merged = {
+        "target_generation_ids": [],
+        "succeeded_generation_ids": [],
+        "failed_generation_ids": [],
+        "failed_subsystems": [],
+    }
+    for result in results:
+        for key in merged:
+            merged[key].extend(
+                value for value in result.get(key, []) if value not in merged[key]
+            )
+    return merged

@@ -17,7 +17,7 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel, ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
-from openrag.services.file_deletion import delete_milvus_vectors_for_file
+from openrag.services.file_deletion import delete_vectors_for_file_across_generations
 from openrag.services.task_service import TaskService
 from openrag.services.trace_service import TraceService
 from openrag.storage.minio_storage import MinioStorage
@@ -875,7 +875,7 @@ def _move_replace_no_intermediate_commit(
     except Exception:
         pass
     try:
-        delete_milvus_vectors_for_file(file.id)
+        delete_vectors_for_file_across_generations(db, file.id)
     except Exception:
         pass
     return task

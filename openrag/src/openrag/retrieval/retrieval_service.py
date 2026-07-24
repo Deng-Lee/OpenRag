@@ -136,12 +136,18 @@ class RetrievalService:
         vector_store,
         layer_store: Optional["MilvusLayerStore"] = None,
         fulltext_store: Optional["EsChunkStore"] = None,
+        generation_id: Optional[str] = None,
+        route_version: Optional[int] = None,
+        embedding_fingerprint: Optional[str] = None,
     ):
         self.db = db
         self.embedding_engine = embedding_engine
         self.vector_store = vector_store
         self.layer_store = layer_store
         self.fulltext_store = fulltext_store
+        self.generation_id = generation_id
+        self.route_version = route_version
+        self.embedding_fingerprint = embedding_fingerprint
         self.trace_service = TraceService(db)
 
     def search(

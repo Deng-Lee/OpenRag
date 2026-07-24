@@ -14,8 +14,13 @@ class VectorSchemaMismatchError(VectorStoreError):
         super().__init__("VECTOR_SCHEMA_MISMATCH", public_message)
 
 
+class VectorCollectionUnavailableError(VectorStoreError):
+    def __init__(self, public_message: str):
+        super().__init__(
+            "VECTOR_COLLECTION_UNAVAILABLE", public_message, retryable=True
+        )
+
+
 class VectorWriteIncompleteError(VectorStoreError):
     def __init__(self, public_message: str, *, retryable: bool = False):
-        super().__init__(
-            "VECTOR_WRITE_INCOMPLETE", public_message, retryable=retryable
-        )
+        super().__init__("VECTOR_WRITE_INCOMPLETE", public_message, retryable=retryable)

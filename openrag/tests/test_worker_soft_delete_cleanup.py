@@ -19,7 +19,11 @@ def session_factory(monkeypatch):
     # worker uses SessionLocal()
     monkeypatch.setattr("openrag.worker.task_worker.SessionLocal", Local)
     # stub external storage/vector deletes
-    monkeypatch.setattr(file_deletion, "delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr(
+        file_deletion,
+        "delete_vectors_for_file_across_generations",
+        lambda *a, **k: {},
+    )
     monkeypatch.setattr(file_deletion, "MinioStorage", lambda *a, **k: type("M", (), {
         "remove_document_hierarchy": lambda *a, **k: None,
         "remove_file": lambda *a, **k: None,

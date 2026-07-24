@@ -14,7 +14,8 @@ from sqlalchemy.orm import Session
 import threading
 import time
 
-from openrag.models.task import Task, TaskStatus
+from openrag.models.index_generation import IndexGenerationRoute
+from openrag.models.task import Task, TaskStatus, TaskType
 from openrag.models.workspace import Workspace
 
 
@@ -31,6 +32,18 @@ class TaskBroker:
     - Automatic weight decay and recovery
     - Timeout detection and recovery
     """
+
+    INDEX_WRITE_TASK_TYPES = frozenset(
+        {
+            TaskType.PROCESS_DOCUMENT.value,
+            TaskType.PARSE_DOCUMENT.value,
+            TaskType.BUILD_HIERARCHY.value,
+            TaskType.EMBED_DOCUMENT.value,
+            TaskType.REINDEX_GENERATION_FILE.value,
+            TaskType.RECONCILE_GENERATION_FILE.value,
+            TaskType.MIRROR_PREVIOUS_GENERATION_FILE.value,
+        }
+    )
 
     def __init__(self, db: Session):
         self.db = db
@@ -66,13 +79,15 @@ class TaskBroker:
     def _count_active_workers(self) -> int:
         """Count unique workers with heartbeat in the last 15 minutes."""
         threshold = datetime.now() - timedelta(minutes=15)
-        result = self.db.query(
-            func.count(func.distinct(Task.worker_id))
-        ).filter(
-            Task.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.STARTED.value]),
-            Task.heartbeat_at >= threshold,
-            Task.worker_id.isnot(None),
-        ).scalar()
+        result = (
+            self.db.query(func.count(func.distinct(Task.worker_id)))
+            .filter(
+                Task.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.STARTED.value]),
+                Task.heartbeat_at >= threshold,
+                Task.worker_id.isnot(None),
+            )
+            .scalar()
+        )
         return result or 1
 
     def update_heartbeat(self, task_id: int) -> None:
@@ -82,9 +97,7 @@ class TaskBroker:
             task_id: Task ID to update
         """
         self.db.execute(
-            update(Task)
-            .where(Task.id == task_id)
-            .values(heartbeat_at=func.now())
+            update(Task).where(Task.id == task_id).values(heartbeat_at=func.now())
         )
         self.db.commit()
 
@@ -104,13 +117,13 @@ class TaskBroker:
             update(Task)
             .where(
                 Task.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.STARTED.value]),
-                Task.heartbeat_at < timeout_threshold
+                Task.heartbeat_at < timeout_threshold,
             )
             .values(
                 status=TaskStatus.PENDING.value,
                 worker_id=None,
                 assigned_at=None,
-                progress=0
+                progress=0,
             )
         )
 
@@ -130,12 +143,12 @@ class TaskBroker:
             Dict mapping workspace_id to quota
         """
         # Get workspaces with pending tasks
-        workspace_stats = self.db.query(
-            Task.workspace_id,
-            func.count(Task.id).label('pending_count')
-        ).filter(
-            self._ready_task_filter()
-        ).group_by(Task.workspace_id).all()
+        workspace_stats = (
+            self.db.query(Task.workspace_id, func.count(Task.id).label("pending_count"))
+            .filter(self._ready_task_filter())
+            .group_by(Task.workspace_id)
+            .all()
+        )
 
         if not workspace_stats:
             with self._lock:
@@ -145,18 +158,20 @@ class TaskBroker:
         workspace_ids = [ws.workspace_id for ws in workspace_stats]
 
         # Get workspace configurations (base weights from priority_strategy)
-        workspaces = self.db.query(Workspace).filter(
-            Workspace.id.in_(workspace_ids)
-        ).all()
+        workspaces = (
+            self.db.query(Workspace).filter(Workspace.id.in_(workspace_ids)).all()
+        )
         ws_max = {ws.id: ws.max_concurrent_tasks for ws in workspaces}
 
         # Count currently ASSIGNED/STARTED tasks per workspace
-        active_stats = self.db.query(
-            Task.workspace_id,
-            func.count(Task.id).label('active_count')
-        ).filter(
-            Task.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.STARTED.value])
-        ).group_by(Task.workspace_id).all()
+        active_stats = (
+            self.db.query(Task.workspace_id, func.count(Task.id).label("active_count"))
+            .filter(
+                Task.status.in_([TaskStatus.ASSIGNED.value, TaskStatus.STARTED.value])
+            )
+            .group_by(Task.workspace_id)
+            .all()
+        )
         ws_active = {s.workspace_id: s.active_count for s in active_stats}
 
         # Compute available slots per workspace
@@ -174,9 +189,7 @@ class TaskBroker:
 
         # Check if all weights are near 0 (need reset)
         with self._lock:
-            all_near_zero = all(
-                w < 0.01 for w in self._dynamic_weights.values()
-            )
+            all_near_zero = all(w < 0.01 for w in self._dynamic_weights.values())
             if all_near_zero:
                 for ws in workspaces:
                     self._dynamic_weights[ws.id] = float(ws.max_concurrent_tasks)
@@ -198,8 +211,12 @@ class TaskBroker:
         # Distribute remaining quota by dynamic weight proportion (also capped by available slots)
         if remaining > 0:
             with self._lock:
-                eligible_ws = [ws for ws in workspaces
-                               if ws.id in quotas and ws_available.get(ws.id, 0) > quotas.get(ws.id, 0)]
+                eligible_ws = [
+                    ws
+                    for ws in workspaces
+                    if ws.id in quotas
+                    and ws_available.get(ws.id, 0) > quotas.get(ws.id, 0)
+                ]
                 total_weight = sum(
                     self._dynamic_weights.get(ws.id, 0) for ws in eligible_ws
                 )
@@ -236,6 +253,7 @@ class TaskBroker:
         """
         assigned_tasks = []
         now = datetime.now()
+        route = self.db.get(IndexGenerationRoute, "global")
 
         for workspace_id, quota in quotas.items():
             if quota <= 0:
@@ -243,14 +261,16 @@ class TaskBroker:
 
             # Use SKIP LOCKED to avoid blocking and ensure only one worker gets the task
             # Must query and update in the same transaction for locking to work
-            tasks = self.db.query(Task).filter(
-                Task.workspace_id == workspace_id,
-                self._ready_task_filter()
-            ).with_for_update(
-                skip_locked=True
-            ).limit(quota).all()
+            tasks = (
+                self.db.query(Task)
+                .filter(Task.workspace_id == workspace_id, self._ready_task_filter())
+                .with_for_update(skip_locked=True)
+                .limit(quota)
+                .all()
+            )
 
             for task in tasks:
+                self._bind_active_generation(task, route)
                 task.status = TaskStatus.ASSIGNED.value
                 task.worker_id = worker_id
                 task.assigned_at = now
@@ -261,6 +281,17 @@ class TaskBroker:
         self.db.commit()
 
         return assigned_tasks
+
+    def _bind_active_generation(
+        self, task: Task, route: IndexGenerationRoute | None
+    ) -> None:
+        if task.task_type not in self.INDEX_WRITE_TASK_TYPES:
+            return
+        if task.index_generation_id:
+            return
+        if route is None:
+            raise RuntimeError("INDEX_ROUTE_UNAVAILABLE: cannot bind index write task")
+        task.index_generation_id = route.active_generation_id
 
     def get_workspace_weights(self) -> Dict[int, Dict]:
         """Get current dynamic weights for monitoring
@@ -273,16 +304,26 @@ class TaskBroker:
                 ws_id: {
                     "dynamic_weight": weight,
                     "base_weight": self.db.query(Workspace.max_concurrent_tasks)
-                    .filter(Workspace.id == ws_id).scalar()
+                    .filter(Workspace.id == ws_id)
+                    .scalar(),
                 }
                 for ws_id, weight in self._dynamic_weights.items()
             }
-    @staticmethod
-    def _ready_task_filter():
-        return or_(
+
+    def _ready_task_filter(self):
+        ready = or_(
             Task.status == TaskStatus.PENDING.value,
             and_(
                 Task.status == TaskStatus.RETRY.value,
                 Task.next_retry_at <= func.now(),
             ),
         )
+        return and_(ready, self._write_barrier_filter())
+
+    def _write_barrier_filter(self):
+        route = self.db.get(IndexGenerationRoute, "global")
+        if route is None:
+            return Task.task_type.notin_(self.INDEX_WRITE_TASK_TYPES)
+        if route.write_barrier:
+            return Task.task_type.notin_(self.INDEX_WRITE_TASK_TYPES)
+        return True

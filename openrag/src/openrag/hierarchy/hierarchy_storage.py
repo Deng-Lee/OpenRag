@@ -8,7 +8,9 @@ from typing import Any, List, Optional, Union
 
 from .models import HierarchyResult, DirectoryHierarchy, Section
 
-_DEFAULT_STORAGE = os.path.join(os.path.dirname(__file__), "..", "..", "..", "storage", "hierarchies")
+_DEFAULT_STORAGE = os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "storage", "hierarchies"
+)
 
 # OpenViking-style filenames (see OpenViking docs: context layers)
 ABSTRACT_NAME = ".abstract.md"
@@ -67,7 +69,9 @@ class HierarchyStorage:
                        Falls back to HIERARCHY_STORAGE_PATH env var,
                        then to {project_root}/storage/hierarchies.
         """
-        resolved = base_path or os.environ.get("HIERARCHY_STORAGE_PATH") or _DEFAULT_STORAGE
+        resolved = (
+            base_path or os.environ.get("HIERARCHY_STORAGE_PATH") or _DEFAULT_STORAGE
+        )
         self.base_path = Path(resolved).resolve()
         self.base_path.mkdir(parents=True, exist_ok=True)
 
@@ -175,7 +179,9 @@ class HierarchyStorage:
 
             l1_md = _coerce_l1_markdown(l1)
             if l1_md:
-                (self.base_path / f"{fid}.overview.md").write_text(l1_md, encoding="utf-8")
+                (self.base_path / f"{fid}.overview.md").write_text(
+                    l1_md, encoding="utf-8"
+                )
 
             self._save_l2_chunks(self._get_file_id_bundle_dir(file_id), l2)
         else:
@@ -368,6 +374,38 @@ class HierarchyStorage:
 
         raise ValueError("Either file_id or file_uri must be provided")
 
+    def load_l1(
+        self, file_id: Optional[int] = None, file_uri: Optional[str] = None
+    ) -> Optional[str]:
+        """Load only L1 (overview) without creating or modifying hierarchy files."""
+        if file_uri:
+            parent, stem = self._uri_parent_and_stem(file_uri)
+            bundle = parent / stem
+            candidates = (
+                parent / f"{stem}.overview.md",
+                bundle / OVERVIEW_NAME,
+                bundle / LEGACY_L1,
+            )
+        elif file_id:
+            fid = str(file_id)
+            bundle = self._get_file_id_bundle_dir(file_id, create=False)
+            candidates = (
+                self.base_path / f"{fid}.overview.md",
+                bundle / OVERVIEW_NAME,
+                bundle / LEGACY_L1,
+            )
+        else:
+            raise ValueError("Either file_id or file_uri must be provided")
+        for path in candidates:
+            if not path.is_file():
+                continue
+            if path.name == LEGACY_L1:
+                return _legacy_l1_json_to_markdown(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            return path.read_text(encoding="utf-8")
+        return None
+
     def get_l0_path(self, file_uri: str) -> str:
         """Full path to L0 abstract file (新: 平级 *.abstract.md)。"""
         parent, stem = self._uri_parent_and_stem(file_uri)
@@ -384,7 +422,11 @@ class HierarchyStorage:
 
     def get_chunk_file_path(self, file_uri: str, chunk_index: int) -> str:
         """本地 L2 下单个切片文件的绝对路径（与 chunks/NNNN.md 一致）。"""
-        return str(self._get_uri_dir(file_uri, create=False) / CHUNKS_DIR / f"{chunk_index:04d}.md")
+        return str(
+            self._get_uri_dir(file_uri, create=False)
+            / CHUNKS_DIR
+            / f"{chunk_index:04d}.md"
+        )
 
     def delete_document_hierarchy(
         self, file_id: Optional[int] = None, file_uri: Optional[str] = None

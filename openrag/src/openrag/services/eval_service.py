@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 import hashlib
+import time
 import uuid
 from typing import Any, Optional
 
@@ -27,6 +28,7 @@ from openrag.models import (
     EvalRun,
 )
 from openrag.services.trace_service import TraceService
+from openrag.indexing.runtime import IndexRuntimeResolver
 from openrag.tracing.context import reset_trace_context
 
 
@@ -174,21 +176,72 @@ class EvalService:
         name: Optional[str] = None,
         code_version: Optional[str] = None,
         index_version: Optional[str] = None,
+        generation_id: Optional[str] = None,
         created_by: Optional[int] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> EvalRun:
         self.get_dataset(dataset_id)
+        config = dict(search_config_snapshot or {})
+        if "index_generation_id" in config and generation_id is None:
+            raise ValueError(
+                "index_generation_id is internal; use the generation_id argument"
+            )
+        if generation_id is not None:
+            snapshot = IndexRuntimeResolver().get_generation_snapshot(
+                self.db, generation_id
+            )
+            if index_version is not None and index_version != generation_id:
+                raise ValueError("Eval index_version must match generation_id")
+            index_version = generation_id
+            config.update(
+                {
+                    "index_generation_id": generation_id,
+                    "route_version": snapshot.route_version,
+                    "embedding_fingerprint": snapshot.embedding_fingerprint,
+                    "chunk_collection_name": snapshot.chunk_collection_name,
+                    "layer_collection_name": snapshot.layer_collection_name,
+                }
+            )
         run = EvalRun(
             dataset_id=dataset_id,
             name=name,
             status="pending",
-            search_config_snapshot=search_config_snapshot or {},
+            search_config_snapshot=config,
             code_version=code_version,
             index_version=index_version,
             created_by=created_by,
             metadata_=metadata,
         )
         return self._commit_new(run)
+
+    def compare_eval_runs(self, active_run_id: int, candidate_run_id: int) -> dict[str, Any]:
+        active = self._get_eval_run(active_run_id)
+        candidate = self._get_eval_run(candidate_run_id)
+        if active.dataset_id != candidate.dataset_id:
+            raise ValueError("Eval runs must use the same dataset")
+        if not active.index_version or not candidate.index_version:
+            raise ValueError("Eval runs must be bound to index generations")
+        active_summary = self._run_summary(active.id)
+        candidate_summary = self._run_summary(candidate.id)
+        keys = sorted(set(active_summary) & set(candidate_summary))
+        deltas = {
+            key: float(candidate_summary[key]) - float(active_summary[key])
+            for key in keys
+            if isinstance(active_summary[key], (int, float))
+            and not isinstance(active_summary[key], bool)
+            and isinstance(candidate_summary[key], (int, float))
+            and not isinstance(candidate_summary[key], bool)
+        }
+        return {
+            "dataset_id": active.dataset_id,
+            "active_run_id": active.id,
+            "candidate_run_id": candidate.id,
+            "active_generation_id": active.index_version,
+            "candidate_generation_id": candidate.index_version,
+            "active_metrics": active_summary,
+            "candidate_metrics": candidate_summary,
+            "metric_deltas": deltas,
+        }
 
     def execute_eval_run(self, eval_run_id: int) -> EvalRun:
         run = self._get_eval_run(eval_run_id)
@@ -232,6 +285,15 @@ class EvalService:
             if result.metrics.get("status") != "failed"
         ]
         summary = _average_numeric_metrics(successful_metrics)
+        latencies = sorted(
+            float(metrics["latency_ms"])
+            for metrics in successful_metrics
+            if isinstance(metrics.get("latency_ms"), (int, float))
+        )
+        if latencies:
+            summary["latency_p95_ms"] = latencies[
+                min(len(latencies) - 1, max(0, (95 * len(latencies) + 99) // 100 - 1))
+            ]
         summary.update(
             {
                 "status": "success",
@@ -285,6 +347,7 @@ class EvalService:
         )
 
         try:
+            query_started = time.monotonic()
             raw_output = self.search_callable(
                 query=eval_query.query_text,
                 user_id=run.created_by or 0,
@@ -303,7 +366,13 @@ class EvalService:
                 top_k=top_k,
                 source_scope=source_scope,
             )
-            metrics.update({"status": "success", "result_count": len(results)})
+            metrics.update(
+                {
+                    "status": "success",
+                    "result_count": len(results),
+                    "latency_ms": (time.monotonic() - query_started) * 1000,
+                }
+            )
             trace_service.finish_span(
                 output_summary={"result_count": len(results)},
                 metrics=metrics,
@@ -382,6 +451,19 @@ class EvalService:
             raise ValueError(f"Eval run not found: {eval_run_id}")
         return run
 
+    def _run_summary(self, eval_run_id: int) -> dict[str, Any]:
+        result = (
+            self.db.query(EvalResult)
+            .filter(
+                EvalResult.eval_run_id == eval_run_id,
+                EvalResult.metric_scope == "run_summary",
+            )
+            .one_or_none()
+        )
+        if result is None:
+            raise ValueError(f"Eval run has no summary: {eval_run_id}")
+        return dict(result.metrics)
+
     def _commit_new(self, obj: Any) -> Any:
         self.db.add(obj)
         self.db.commit()
@@ -399,12 +481,20 @@ class EvalService:
         }
         request = SearchRequest(query=query, workspace_id=workspace_id, **request_kwargs)
         endpoint = str(config.get("endpoint", "semantic"))
+        generation_id = config.get("index_generation_id")
+        runtime = None
+        if generation_id:
+            resolver = IndexRuntimeResolver()
+            runtime = resolver.get_runtime(
+                resolver.get_generation_snapshot(self.db, str(generation_id))
+            )
         response = _execute_search(
             self.db,
             user_id,
             request,
             endpoint=endpoint,
             rerank_hierarchical_boost=0.15 if endpoint == "hierarchical" else None,
+            runtime=runtime,
         )
         return [_model_to_dict(result) for result in response.results]
 

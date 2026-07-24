@@ -13,6 +13,12 @@ from .errors import (
     EmbeddingResponseError,
     public_embedding_error,
 )
+from openrag.indexing.fingerprint import (
+    build_embedding_manifest,
+    compute_embedding_fingerprint,
+    normalize_embedding_manifest,
+    resolve_model_identity,
+)
 
 __all__ = [
     "EmbeddingConfigurationError",
@@ -24,4 +30,8 @@ __all__ = [
     "initialize_embedding_dependency",
     "public_embedding_error",
     "validate_embedding_config",
+    "build_embedding_manifest",
+    "compute_embedding_fingerprint",
+    "normalize_embedding_manifest",
+    "resolve_model_identity",
 ]

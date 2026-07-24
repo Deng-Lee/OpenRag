@@ -91,6 +91,16 @@ spec:
               value: milvus
             - name: MILVUS_PORT
               value: "19530"
+            - name: MILVUS_RUNTIME_USER
+              valueFrom:
+                secretKeyRef:
+                  name: openrag-secrets
+                  key: MILVUS_RUNTIME_USER
+            - name: MILVUS_RUNTIME_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openrag-secrets
+                  key: MILVUS_RUNTIME_PASSWORD
             - name: ELASTICSEARCH__ENABLED
               value: "true"
             - name: ELASTICSEARCH__HOSTS

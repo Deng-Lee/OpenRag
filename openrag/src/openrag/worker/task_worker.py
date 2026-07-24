@@ -23,16 +23,20 @@ from openrag.processors.document_processor import DocumentProcessor
 from openrag.parsers.parser_registry import ParserRegistry
 from openrag.chunking.chunk_engine import ChunkEngine
 from openrag.chunking.document_type import normalize_document_type
-from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.embedding.errors import (
     EmbeddingConfigurationError,
     EmbeddingProviderError,
 )
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
+from openrag.indexing.runtime import IndexRuntime, IndexRuntimeResolver
 from openrag.storage.minio_storage import MinioStorage
 from openrag.database import SessionLocal, get_engine
 from openrag.services.trace_service import TraceService
-from openrag.tracing.context import get_trace_context, reset_trace_context, set_trace_context
+from openrag.tracing.context import (
+    get_trace_context,
+    reset_trace_context,
+    set_trace_context,
+)
 
 import logging as _logging
 
@@ -41,22 +45,6 @@ _logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 _logger = _logging.getLogger(__name__)
-
-
-def _create_vector_store(embedding_engine: EmbeddingEngine):
-    """Create the required chunk vector store with the configured dimension."""
-    from openrag.vectorstore.milvus_store import MilvusStore
-
-    return MilvusStore(dimension=embedding_engine.dimension)
-
-
-def _create_layer_store(embedding_engine: EmbeddingEngine, required: bool):
-    """Create the layer vector store only when L0/L1 retrieval is enabled."""
-    if not required:
-        return None
-    from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
-
-    return MilvusLayerStore(dimension=embedding_engine.dimension)
 
 
 def _create_es_chunk_store():
@@ -86,9 +74,9 @@ class TaskWorker:
         api_base_url: str = "http://localhost:8001",
         worker_id: Optional[str] = None,
         batch_size: int = 5,
-        poll_interval: int = 5
+        poll_interval: int = 5,
     ):
-        self.api_base_url = api_base_url.rstrip('/')
+        self.api_base_url = api_base_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.batch_size = batch_size
         self.poll_interval = poll_interval
@@ -103,6 +91,7 @@ class TaskWorker:
         self.require_layer_vectors = False
         self.dependencies_ready = False
         self.next_dependency_probe_at = 0.0
+        self.index_runtime_resolver = IndexRuntimeResolver()
 
     _MAX_PROCESSING_ERROR_LEN = 4096
 
@@ -145,7 +134,6 @@ class TaskWorker:
     def _initialize_processing_dependencies(self) -> None:
         from openrag.retrieval.retrieval_service import l0_l1_retrieval_enabled
 
-        self.embedding_engine = EmbeddingEngine()
         self.parser_registry = ParserRegistry()
         self.chunk_engine = ChunkEngine()
         self.hierarchy_storage = HierarchyStorage()
@@ -154,34 +142,25 @@ class TaskWorker:
         self._preflight_processing_dependencies()
 
     def _preflight_processing_dependencies(self) -> bool:
-        if self.embedding_engine is None:
-            raise EmbeddingConfigurationError(
-                "EMBEDDING_CONFIG_INVALID", "Embedding dependency is not initialized"
-            )
+        db = SessionLocal()
         try:
-            self.embedding_engine.probe()
-            if self.vector_store is None:
-                self.vector_store = _create_vector_store(self.embedding_engine)
-            self.vector_store.probe()
-            if self.require_layer_vectors and self.layer_store is None:
-                self.layer_store = _create_layer_store(
-                    self.embedding_engine, self.require_layer_vectors
-                )
-            if self.require_layer_vectors:
-                self.layer_store.probe()
+            runtime = self.index_runtime_resolver.probe_active_runtime(db)
+            self.embedding_engine = runtime.embedding_engine
+            self.vector_store = runtime.vector_store
+            self.layer_store = runtime.layer_store
         except EmbeddingConfigurationError:
             raise
         except Exception as exc:
             self.dependencies_ready = False
-            self.next_dependency_probe_at = (
-                time.monotonic() + self.embedding_engine.config.probe_interval_seconds
-            )
+            self.next_dependency_probe_at = time.monotonic() + 30
             _logger.warning(
                 "embedding_probe_failure worker_id=%s error_code=%s",
                 self.worker_id,
                 getattr(exc, "code", "PROCESSING_DEPENDENCY_UNAVAILABLE"),
             )
             return False
+        finally:
+            db.close()
         self.dependencies_ready = True
         self.next_dependency_probe_at = 0.0
         return True
@@ -210,9 +189,6 @@ class TaskWorker:
 
         while self.running:
             try:
-                if not self._ensure_processing_dependencies_ready():
-                    time.sleep(self.poll_interval)
-                    continue
                 # Pull a single task from broker
                 task = self._pull_one_task()
 
@@ -242,11 +218,8 @@ class TaskWorker:
         try:
             response = requests.get(
                 f"{self.api_base_url}/broker/get-tasks",
-                params={
-                    "worker_id": self.worker_id,
-                    "limit": 1
-                },
-                timeout=30
+                params={"worker_id": self.worker_id, "limit": 1},
+                timeout=30,
             )
             response.raise_for_status()
             data = response.json()
@@ -290,16 +263,23 @@ class TaskWorker:
                 result = self._delete_file_task(task)
             elif task_type == "delete_path_prefix":
                 result = self._delete_path_prefix_task(task)
+            elif task_type == "purge_file_from_generations":
+                result = self._purge_file_from_generations_task(task)
             else:
-                result = self._process_document(task, task_id)
+                runtime = self._resolve_task_runtime(task)
+                if task_type in {
+                    "reindex_generation_file",
+                    "reconcile_generation_file",
+                    "mirror_previous_generation_file",
+                }:
+                    result = self._reindex_generation_file_task(task, runtime)
+                else:
+                    result = self._process_document(task, task_id, runtime=runtime)
+                    self._reconcile_candidates_after_online_change(task)
+                    self._mirror_previous_after_online_change(task)
 
             # Report success
-            self._update_task_status(
-                task_id,
-                "success",
-                progress=100,
-                result=result
-            )
+            self._update_task_status(task_id, "success", progress=100, result=result)
             print(f"Task {task_id} completed successfully")
 
         except Exception as e:
@@ -311,7 +291,74 @@ class TaskWorker:
             heartbeat_proc.join(timeout=5)
             reset_trace_context()
 
-    def _process_document(self, task: Dict[str, Any], task_id: int) -> Dict[str, Any]:
+    def _resolve_task_runtime(self, task: Dict[str, Any]) -> IndexRuntime:
+        self._assert_task_generation_writable(task)
+        db = SessionLocal()
+        try:
+            snapshot = self.index_runtime_resolver.get_generation_snapshot(
+                db, task["index_generation_id"]
+            )
+        finally:
+            close = getattr(db, "close", None)
+            if close is not None:
+                close()
+        runtime = self.index_runtime_resolver.get_runtime(snapshot)
+        self._assert_task_generation_writable(task, runtime)
+        return runtime
+
+    @staticmethod
+    def _assert_task_generation_writable(
+        task: Dict[str, Any], runtime: IndexRuntime | None = None
+    ) -> None:
+        generation_id = task.get("index_generation_id")
+        if not generation_id:
+            raise RuntimeError(
+                "INDEX_GENERATION_UNBOUND: index write task has no target"
+            )
+        if runtime is None:
+            return
+        snapshot = runtime.snapshot
+        chunk_name = getattr(runtime.vector_store, "collection_name", None)
+        layer_name = (
+            getattr(runtime.layer_store, "collection_name", None)
+            if runtime.layer_store is not None
+            else None
+        )
+        if (
+            snapshot.generation_id != generation_id
+            or chunk_name != snapshot.chunk_collection_name
+            or layer_name != snapshot.layer_collection_name
+        ):
+            raise RuntimeError(
+                "INDEX_RUNTIME_MISMATCH: task generation and runtime stores differ"
+            )
+        task_type = task.get("task_type") or "process_document"
+        state = getattr(snapshot, "state", None)
+        if task_type in {
+            "reindex_generation_file",
+            "reconcile_generation_file",
+        }:
+            if state not in {"building", "reconciling"}:
+                raise RuntimeError(
+                    "INDEX_GENERATION_NOT_WRITABLE: candidate is not building"
+                )
+        elif task_type == "mirror_previous_generation_file":
+            if state != "retired":
+                raise RuntimeError(
+                    "INDEX_GENERATION_NOT_WRITABLE: mirror target is not previous"
+                )
+        elif state != "active":
+            raise RuntimeError(
+                "INDEX_GENERATION_NOT_WRITABLE: online task target is not active"
+            )
+        runtime.embedding_engine.assert_fingerprint(snapshot.embedding_fingerprint)
+
+    def _process_document(
+        self,
+        task: Dict[str, Any],
+        task_id: int,
+        runtime: IndexRuntime | None = None,
+    ) -> Dict[str, Any]:
         """Process a document task
 
         Args:
@@ -323,6 +370,8 @@ class TaskWorker:
         file_id = task.get("file_id")
         workspace_id = task.get("workspace_id")
         user_id = task.get("user_id")
+        runtime = runtime or self._resolve_task_runtime(task)
+        self._assert_task_generation_writable(task, runtime)
 
         # Get database session
         db = SessionLocal()
@@ -370,8 +419,7 @@ class TaskWorker:
             minio_storage = MinioStorage()
             temp_dir = tempfile.mkdtemp()
             file_path = os.path.join(
-                temp_dir,
-                f"doc_{file_id}_{os.path.basename(file.uri)}"
+                temp_dir, f"doc_{file_id}_{os.path.basename(file.uri)}"
             )
             download_span = None
             try:
@@ -393,9 +441,11 @@ class TaskWorker:
                             span_id=download_span.span_id,
                             output_summary={
                                 "local_path": os.path.basename(file_path),
-                                "size_bytes": os.path.getsize(file_path)
-                                if os.path.exists(file_path)
-                                else None,
+                                "size_bytes": (
+                                    os.path.getsize(file_path)
+                                    if os.path.exists(file_path)
+                                    else None
+                                ),
                                 "status": "downloaded",
                             },
                         )
@@ -417,17 +467,20 @@ class TaskWorker:
                 db=db,
                 parser_registry=self.parser_registry,
                 chunk_engine=self.chunk_engine,
-                embedding_engine=self.embedding_engine,
+                embedding_engine=runtime.embedding_engine,
                 hierarchy_storage=self.hierarchy_storage,
                 minio_storage=minio_storage,
-                vector_store=self.vector_store,
-                layer_store=self.layer_store,
+                vector_store=runtime.vector_store,
+                layer_store=runtime.layer_store,
                 chunk_fulltext_store=self.chunk_fulltext_store,
                 require_layer_vectors=self.require_layer_vectors,
+                generation_context=runtime.snapshot,
             )
 
             # Process document
-            print(f"  [DEBUG] Starting processing: file_id={file_id}, parser={parser_type}, path={file_path}")
+            print(
+                f"  [DEBUG] Starting processing: file_id={file_id}, parser={parser_type}, path={file_path}"
+            )
             print(f"  [DEBUG] file.uri={file.uri}")
 
             def _on_progress(pct: int):
@@ -461,17 +514,21 @@ class TaskWorker:
                         db=db,
                         bucket=workspace.slug,
                         minio=minio_storage,
-                        layer_store=self.layer_store,
-                        embedding_engine=self.embedding_engine,
+                        layer_store=runtime.layer_store,
+                        embedding_engine=runtime.embedding_engine,
                         leaf_file_id=file_id,
                         hstorage=self.hierarchy_storage,
                     )
                     if n_dir:
-                        print(f"  [DEBUG] Propagated directory L0/L1 for {n_dir} ancestor(s)")
+                        print(
+                            f"  [DEBUG] Propagated directory L0/L1 for {n_dir} ancestor(s)"
+                        )
                 except Exception as exc:
                     _logger.warning("Directory hierarchy propagation failed: %s", exc)
 
-            print(f"  [DEBUG] Final paths: l0={file.l0_path}, l1={file.l1_path}, l2={file.l2_path}")
+            print(
+                f"  [DEBUG] Final paths: l0={file.l0_path}, l1={file.l1_path}, l2={file.l2_path}"
+            )
 
             try:
                 trace_service.finish_run()
@@ -482,9 +539,7 @@ class TaskWorker:
                 "file_id": file_id,
                 "status": "success",
                 "parser_type": processing_result.get("parser_type", parser_type),
-                "document_type": processing_result.get(
-                    "document_type", document_type
-                ),
+                "document_type": processing_result.get("document_type", document_type),
                 "l0_path": file.l0_path,
                 "l1_path": file.l1_path,
                 "l2_path": file.l2_path,
@@ -527,7 +582,9 @@ class TaskWorker:
                 _logger.info("delete_file task: file %s already gone, skip", file_id)
                 return {"file_id": file_id, "status": "skipped", "reason": "not_found"}
             if file.deleted_at is None:
-                _logger.warning("delete_file task: file %s not soft-deleted, skip", file_id)
+                _logger.warning(
+                    "delete_file task: file %s not soft-deleted, skip", file_id
+                )
                 return {"file_id": file_id, "status": "skipped", "reason": "active"}
 
             ws_service = WorkspaceService(db)
@@ -535,8 +592,181 @@ class TaskWorker:
             if not workspace:
                 raise ValueError(f"Workspace {file.workspace_id} not found")
 
-            delete_file_with_storage(db, file, workspace)
-            return {"file_id": file_id, "status": "deleted"}
+            result = delete_file_with_storage(db, file, workspace)
+            return {"file_id": file_id, "status": "deleted", **result}
+        finally:
+            db.close()
+
+    def _purge_file_from_generations_task(
+        self, task: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        file_id = task.get("file_id") or (task.get("payload") or {}).get("file_id")
+        if not file_id:
+            raise ValueError("purge_file_from_generations task missing file_id")
+
+        db = SessionLocal()
+        try:
+            from openrag.services.file_deletion import (
+                delete_vectors_for_file_across_generations,
+            )
+
+            result = delete_vectors_for_file_across_generations(db, int(file_id))
+            return {"file_id": int(file_id), "status": "purged", **result}
+        finally:
+            db.close()
+
+    def _reindex_generation_file_task(
+        self, task: Dict[str, Any], runtime: IndexRuntime
+    ) -> Dict[str, Any]:
+        from openrag.indexing.reindex_processor import GenerationReindexProcessor
+        from openrag.indexing.reindex_service import GenerationReindexService
+        from openrag.indexing.source_reader import GenerationSourceReader
+
+        generation_id = task.get("index_generation_id")
+        file_id = task.get("file_id")
+        payload = task.get("payload") or {}
+        if (
+            not generation_id
+            or not file_id
+            or payload.get("generation_id") != generation_id
+            or not payload.get("source_content_hash")
+        ):
+            raise RuntimeError("REINDEX_TASK_INVALID: generation source is missing")
+        db = SessionLocal()
+        try:
+            reader = GenerationSourceReader(
+                db,
+                minio_storage=MinioStorage(),
+                hierarchy_storage=self.hierarchy_storage or HierarchyStorage(),
+            )
+            service = GenerationReindexService(db, reader)
+            row = service.claim_file(
+                generation_id, int(file_id), worker_id=self.worker_id
+            )
+            if row is None:
+                return {
+                    "generation_id": generation_id,
+                    "file_id": file_id,
+                    "status": "skipped",
+                    "reason": "not_claimable",
+                }
+            result = GenerationReindexProcessor(reader, runtime).reindex_file(
+                int(file_id),
+                expected_source_content_hash=payload["source_content_hash"],
+            )
+            service.mark_file_success(generation_id, int(file_id), result)
+            if task.get("task_type") == "mirror_previous_generation_file":
+                from openrag.indexing.mirror_service import (
+                    PreviousGenerationMirrorService,
+                )
+
+                PreviousGenerationMirrorService(db, reader).calculate_previous_lag()
+            else:
+                try:
+                    from openrag.indexing.reconciliation_service import (
+                        ReconciliationService,
+                    )
+
+                    reconciliation = ReconciliationService(db, reader)
+                    if reconciliation.calculate_build_lag(generation_id) == 0:
+                        reconciliation.reconcile_until_stable(
+                            generation_id,
+                            user_id=int(task["user_id"]),
+                            max_passes=1,
+                        )
+                except Exception:
+                    _logger.exception(
+                        "candidate_reconciliation_schedule_failed source_task_id=%s",
+                        task.get("id"),
+                    )
+            return {
+                "generation_id": generation_id,
+                "file_id": file_id,
+                "status": "success",
+                "source_content_hash": result.source_content_hash,
+                "written_chunk_count": result.written_chunk_count,
+                "written_layer_count": result.written_layer_count,
+            }
+        finally:
+            db.close()
+
+    def _reconcile_candidates_after_online_change(
+        self, task: Dict[str, Any]
+    ) -> None:
+        from openrag.indexing.reconciliation_service import ReconciliationService
+        from openrag.indexing.source_reader import GenerationSourceReader
+        from openrag.models.index_generation import (
+            IndexGeneration,
+            IndexGenerationState,
+        )
+
+        db = SessionLocal()
+        try:
+            generations = (
+                db.query(IndexGeneration)
+                .filter(
+                    IndexGeneration.state.in_(
+                        [
+                            IndexGenerationState.BUILDING.value,
+                            IndexGenerationState.RECONCILING.value,
+                        ]
+                    ),
+                    IndexGeneration.build_paused.is_(False),
+                )
+                .all()
+            )
+            if not generations:
+                return
+            reader = GenerationSourceReader(
+                db,
+                minio_storage=MinioStorage(),
+                hierarchy_storage=self.hierarchy_storage or HierarchyStorage(),
+            )
+            service = ReconciliationService(db, reader)
+            for generation in generations:
+                service.capture_source_watermark(generation.id)
+                service.scan_changed_files(generation.id)
+                deleted = service.scan_deleted_files(generation.id)
+                service.enqueue_deleted_files(
+                    deleted, user_id=int(task["user_id"])
+                )
+                service.enqueue_reconciliation_tasks(
+                    generation.id, user_id=int(task["user_id"])
+                )
+                service.calculate_build_lag(generation.id)
+        except Exception:
+            _logger.exception(
+                "candidate_reconciliation_schedule_failed source_task_id=%s",
+                task.get("id"),
+            )
+        finally:
+            db.close()
+
+    def _mirror_previous_after_online_change(self, task: Dict[str, Any]) -> None:
+        file_id = task.get("file_id")
+        user_id = task.get("user_id")
+        if not file_id or not user_id:
+            return
+        db = SessionLocal()
+        try:
+            from openrag.indexing.mirror_service import (
+                PreviousGenerationMirrorService,
+            )
+            from openrag.indexing.source_reader import GenerationSourceReader
+
+            reader = GenerationSourceReader(
+                db,
+                minio_storage=MinioStorage(),
+                hierarchy_storage=self.hierarchy_storage or HierarchyStorage(),
+            )
+            PreviousGenerationMirrorService(db, reader).enqueue_file_mirror(
+                int(file_id), user_id=int(user_id)
+            )
+        except Exception:
+            _logger.exception(
+                "previous_generation_mirror_schedule_failed source_task_id=%s",
+                task.get("id"),
+            )
         finally:
             db.close()
 
@@ -546,7 +776,9 @@ class TaskWorker:
         payload = task.get("payload") or {}
         path = payload.get("path")
         if not workspace_id or not path:
-            raise ValueError("delete_path_prefix task missing workspace_id or payload.path")
+            raise ValueError(
+                "delete_path_prefix task missing workspace_id or payload.path"
+            )
 
         # Codex round-4 #1: never let a root/empty/"/" prefix trigger workspace-wide
         # physical cleanup, even from a legacy/manual/malformed task. Guard BEFORE opening
@@ -555,7 +787,9 @@ class TaskWorker:
         if not path or path.rstrip("/") == "":
             _logger.error(
                 "delete_path_prefix task with root/empty path=%r; skipping workspace-wide "
-                "cleanup (workspace_id=%s)", path, workspace_id,
+                "cleanup (workspace_id=%s)",
+                path,
+                workspace_id,
             )
             return {
                 "workspace_id": workspace_id,
@@ -587,7 +821,9 @@ class TaskWorker:
                 # a task missing it is malformed/legacy — skip and let an operator requeue.
                 _logger.error(
                     "delete_path_prefix task missing payload.deleted_before; skipping "
-                    "(workspace_id=%s path=%s)", workspace_id, path,
+                    "(workspace_id=%s path=%s)",
+                    workspace_id,
+                    path,
                 )
                 return {
                     "workspace_id": workspace_id,
@@ -599,15 +835,38 @@ class TaskWorker:
                 }
 
             deleted_before = datetime.fromisoformat(deleted_before_raw)
-            deleted_ids = physically_delete_soft_deleted_under_prefix(
-                db, workspace_id, path, deleted_before, workspace
+            delete_results: list[dict] = []
+            from openrag.services.file_deletion import (
+                GenerationDeletePropagationError,
+                _merge_generation_delete_results,
             )
+
+            try:
+                deleted_ids = physically_delete_soft_deleted_under_prefix(
+                    db,
+                    workspace_id,
+                    path,
+                    deleted_before,
+                    workspace,
+                    delete_results=delete_results,
+                )
+            except GenerationDeletePropagationError as exc:
+                exc.result = {
+                    "workspace_id": workspace_id,
+                    "path": path,
+                    **_merge_generation_delete_results(
+                        [*delete_results, exc.result]
+                    ),
+                }
+                raise
+
             return {
                 "workspace_id": workspace_id,
                 "path": path,
                 "deleted_count": len(deleted_ids),
                 "deleted_ids": deleted_ids,
                 "status": "deleted",
+                **_merge_generation_delete_results(delete_results),
             }
         finally:
             db.close()
@@ -627,8 +886,45 @@ class TaskWorker:
         retry_count = int(task.get("retry_count") or 0)
         max_retries = int(task.get("max_retries") or 0)
 
-        if isinstance(exc, EmbeddingProviderError):
+        if isinstance(exc, EmbeddingProviderError) and task_type == "process_document":
             self._invalidate_embedding_readiness()
+
+        if task_type in {
+            "reindex_generation_file",
+            "reconcile_generation_file",
+            "mirror_previous_generation_file",
+        } and file_id is not None:
+            from openrag.indexing.reindex_service import GenerationReindexService
+
+            generation_id = task.get("index_generation_id")
+            if generation_id:
+                db = SessionLocal()
+                try:
+                    service = GenerationReindexService(db)
+                    try:
+                        if retryable and retry_count < max_retries:
+                            service.mark_file_retry(
+                                generation_id,
+                                int(file_id),
+                                error_code=error_code,
+                                error=error,
+                                delay_seconds=self._task_retry_delay(retry_count),
+                            )
+                        else:
+                            service.mark_file_failed(
+                                generation_id,
+                                int(file_id),
+                                error_code=error_code,
+                                error=error,
+                            )
+                    except RuntimeError:
+                        _logger.exception(
+                            "reindex_file_state_update_failed generation_id=%s file_id=%s",
+                            generation_id,
+                            file_id,
+                        )
+                finally:
+                    db.close()
 
         if retryable and retry_count < max_retries:
             delay = self._task_retry_delay(retry_count)
@@ -642,6 +938,7 @@ class TaskWorker:
                 error_code=error_code,
                 error_retryable=True,
                 next_retry_at=datetime.now(timezone.utc) + timedelta(seconds=delay),
+                result=getattr(exc, "result", None),
             )
             _logger.warning(
                 "document_embedding_failed task_id=%s error_code=%s retryable=true retry_delay_seconds=%d",
@@ -659,6 +956,7 @@ class TaskWorker:
             error=error,
             error_code=error_code,
             error_retryable=retryable,
+            result=getattr(exc, "result", None),
         )
         _logger.warning(
             "document_embedding_failed task_id=%s error_code=%s retryable=%s final=true",
@@ -730,8 +1028,7 @@ def _heartbeat_loop(api_base_url: str, task_id: int, interval: int = 30):
     while True:
         try:
             response = requests.post(
-                f"{api_base_url}/broker/heartbeat/{task_id}",
-                timeout=10
+                f"{api_base_url}/broker/heartbeat/{task_id}", timeout=10
             )
             if response.status_code != 200:
                 print(f"Heartbeat failed for task {task_id}: {response.status_code}")
@@ -797,7 +1094,12 @@ def _worker_process(
     except KeyboardInterrupt:
         worker.stop()
     except BaseException as exc:
-        _logger.critical("Worker %s crashed with unhandled %s: %s", worker_id, type(exc).__name__, exc)
+        _logger.critical(
+            "Worker %s crashed with unhandled %s: %s",
+            worker_id,
+            type(exc).__name__,
+            exc,
+        )
         raise
 
 
@@ -816,7 +1118,8 @@ def main():
         help="API server base URL (default: http://localhost:8001)",
     )
     parser.add_argument(
-        "-n", "--num-workers",
+        "-n",
+        "--num-workers",
         type=int,
         default=int(os.environ.get("WORKER_NUM", 4)),
         help="Number of worker processes (default: 4)",
@@ -865,15 +1168,35 @@ def main():
                     if exitcode is not None:
                         if exitcode < 0:
                             sig = -exitcode
-                            sig_name = signal.Signals(sig).name if sig < len(signal.Signals) else f"signal-{sig}"
-                            _logger.error("Worker %s died with signal %s (exitcode=%d), restarting...", p.name, sig_name, exitcode)
+                            sig_name = (
+                                signal.Signals(sig).name
+                                if sig < len(signal.Signals)
+                                else f"signal-{sig}"
+                            )
+                            _logger.error(
+                                "Worker %s died with signal %s (exitcode=%d), restarting...",
+                                p.name,
+                                sig_name,
+                                exitcode,
+                            )
                         else:
-                            _logger.error("Worker %s died with exit code %d, restarting...", p.name, exitcode)
+                            _logger.error(
+                                "Worker %s died with exit code %d, restarting...",
+                                p.name,
+                                exitcode,
+                            )
                     else:
-                        _logger.error("Worker %s died (exitcode=None), restarting...", p.name)
+                        _logger.error(
+                            "Worker %s died (exitcode=None), restarting...", p.name
+                        )
                     new_p = multiprocessing.Process(
                         target=_worker_process,
-                        args=(args.api_url, f"{args.prefix}-{uuid.uuid4().hex[:8]}", args.batch_size, args.poll_interval),
+                        args=(
+                            args.api_url,
+                            f"{args.prefix}-{uuid.uuid4().hex[:8]}",
+                            args.batch_size,
+                            args.poll_interval,
+                        ),
                         name=f"TaskWorker-restart-{i}",
                     )
                     new_p.start()

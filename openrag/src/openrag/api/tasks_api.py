@@ -18,6 +18,7 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/tasks", tags=["tasks"])
 # Pydantic schemas
 class TaskListResponse(BaseModel):
     """Task list response"""
+
     items: List[Dict[str, Any]]
     total: int
     skip: int
@@ -26,11 +27,13 @@ class TaskListResponse(BaseModel):
 
 class TaskResponse(BaseModel):
     """Task detail response"""
+
     id: int
     task_id: str
     workspace_id: int
     user_id: int
     file_id: Optional[int]
+    index_generation_id: Optional[str]
     task_type: str
     queue: str
     priority: int
@@ -51,6 +54,7 @@ class TaskResponse(BaseModel):
 
 class TaskStatsResponse(BaseModel):
     """Task statistics response"""
+
     total: int
     running: int
     pending: int
@@ -59,6 +63,7 @@ class TaskStatsResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     """Generic message response"""
+
     message: str
 
 
@@ -71,10 +76,13 @@ def task_to_response(task: Task) -> Dict[str, Any]:
         "workspace_id": task.workspace_id,
         "user_id": task.user_id,
         "file_id": task.file_id,
+        "index_generation_id": task.index_generation_id,
         "task_type": task.task_type,
         "queue": task.queue,
         "priority": task.priority,
-        "status": task.status.value if isinstance(task.status, TaskStatus) else task.status,
+        "status": (
+            task.status.value if isinstance(task.status, TaskStatus) else task.status
+        ),
         "progress": task.progress,
         "retry_count": task.retry_count,
         "max_retries": task.max_retries,
@@ -106,7 +114,7 @@ async def get_task_stats(
         total=stats["total"],
         running=stats["running"],
         pending=stats["pending"],
-        by_status=stats["by_status"]
+        by_status=stats["by_status"],
     )
 
 
@@ -139,7 +147,7 @@ async def list_tasks(
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status: {status}"
+                detail=f"Invalid status: {status}",
             )
 
     tasks, total = service.list_tasks(
@@ -147,14 +155,14 @@ async def list_tasks(
         user_id=user_id,
         status=status_filter,
         skip=skip,
-        limit=limit
+        limit=limit,
     )
 
     return TaskListResponse(
         items=[task_to_response(task) for task in tasks],
         total=total,
         skip=skip,
-        limit=limit
+        limit=limit,
     )
 
 
@@ -172,15 +180,14 @@ async def get_task_detail(
 
     if not task:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
         )
 
     # Verify task belongs to this workspace
     if task.workspace_id != workspace_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found in this workspace"
+            detail="Task not found in this workspace",
         )
 
     return TaskResponse(**task_to_response(task))
@@ -203,36 +210,40 @@ async def cancel_task(
 
     if not task:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
         )
 
     # Verify task belongs to this workspace
     if task.workspace_id != workspace_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found in this workspace"
+            detail="Task not found in this workspace",
         )
 
     # Check permission (task owner or workspace admin)
     if task.user_id != current_user.id:
         from openrag.models.workspace import WorkspaceMember
-        membership = db.query(WorkspaceMember).filter(
-            WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == current_user.id
-        ).first()
+
+        membership = (
+            db.query(WorkspaceMember)
+            .filter(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.user_id == current_user.id,
+            )
+            .first()
+        )
 
         if not membership or membership.role not in ("admin", "write"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only task owner or workspace member can cancel tasks"
+                detail="Only task owner or workspace member can cancel tasks",
             )
 
     cancelled = service.cancel_task(task_id)
     if not cancelled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Task cannot be cancelled (may not be in pending/started state)"
+            detail="Task cannot be cancelled (may not be in pending/started state)",
         )
 
     return MessageResponse(message="Task cancelled successfully")
@@ -255,36 +266,40 @@ async def retry_task(
 
     if not task:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
         )
 
     # Verify task belongs to this workspace
     if task.workspace_id != workspace_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found in this workspace"
+            detail="Task not found in this workspace",
         )
 
     # Check permission (task owner or workspace admin)
     if task.user_id != current_user.id:
         from openrag.models.workspace import WorkspaceMember
-        membership = db.query(WorkspaceMember).filter(
-            WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == current_user.id
-        ).first()
+
+        membership = (
+            db.query(WorkspaceMember)
+            .filter(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.user_id == current_user.id,
+            )
+            .first()
+        )
 
         if not membership or membership.role not in ("admin", "write"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only task owner or workspace member can retry tasks"
+                detail="Only task owner or workspace member can retry tasks",
             )
 
     retried = service.retry_task(task_id)
     if not retried:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Task cannot be retried (may not be in failed state or max retries reached)"
+            detail="Task cannot be retried (may not be in failed state or max retries reached)",
         )
 
     return TaskResponse(**task_to_response(retried))

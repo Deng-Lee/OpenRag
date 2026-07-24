@@ -524,6 +524,16 @@ def test_execute_search_maps_permission_scope_failure_to_sanitized_503(monkeypat
     monkeypatch.setattr(sapi, "_get_vector_store", lambda: Mock())
     monkeypatch.setattr(sapi, "_get_layer_store", lambda: None)
     monkeypatch.setattr(sapi, "_get_fulltext_store", lambda: None)
+    runtime = Mock()
+    runtime.snapshot = Mock(
+        generation_id="generation-test",
+        route_version=1,
+        embedding_fingerprint="a" * 64,
+        embedding_revision="revision-test",
+        chunk_collection_name="chunks_test",
+        layer_collection_name=None,
+    )
+    monkeypatch.setattr(sapi, "_resolve_search_runtime", lambda _db: runtime)
 
     root_cause = RuntimeError("secret database connection details")
     failure = PermissionScopeResolutionError("permission scope unavailable")

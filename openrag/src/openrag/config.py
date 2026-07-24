@@ -75,8 +75,32 @@ class VectorDBConfig(BaseSettings):
     """向量数据库配置"""
 
     type: str = "milvus"
-    host: str = "localhost"
-    port: int = 19530
+    host: str = Field(default="localhost", validation_alias="MILVUS_HOST")
+    port: int = Field(default=19530, validation_alias="MILVUS_PORT")
+    runtime_user: Optional[str] = Field(
+        default=None, validation_alias="MILVUS_RUNTIME_USER"
+    )
+    runtime_password: Optional[SecretStr] = Field(
+        default=None, validation_alias="MILVUS_RUNTIME_PASSWORD"
+    )
+    admin_user: Optional[str] = Field(
+        default=None, validation_alias="MILVUS_INDEX_ADMIN_USER"
+    )
+    admin_password: Optional[SecretStr] = Field(
+        default=None, validation_alias="MILVUS_INDEX_ADMIN_PASSWORD"
+    )
+    cleanup_user: Optional[str] = Field(
+        default=None, validation_alias="MILVUS_CLEANUP_USER"
+    )
+    cleanup_password: Optional[SecretStr] = Field(
+        default=None, validation_alias="MILVUS_CLEANUP_PASSWORD"
+    )
+    secure: bool = Field(default=False, validation_alias="MILVUS_SECURE")
+    connection_timeout_seconds: int = Field(
+        default=10, validation_alias="MILVUS_CONNECTION_TIMEOUT_SECONDS"
+    )
+
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 
 
 class ElasticsearchConfig(BaseSettings):
@@ -115,6 +139,25 @@ class EmbeddingConfig(BaseSettings):
     api_key: Optional[SecretStr] = Field(default=None, validation_alias="OPENAI_API_KEY")
     base_url: Optional[str] = Field(default=None, validation_alias="OPENAI_BASE_URL")
     dimension: int = Field(default=0, validation_alias="EMBEDDING_DIMENSION")
+    revision: str = Field(default="", validation_alias="EMBEDDING_REVISION")
+    model_identity: str = Field(default="", validation_alias="EMBEDDING_MODEL_IDENTITY")
+    normalization: str = Field(default="none", validation_alias="EMBEDDING_NORMALIZATION")
+    input_type: str = Field(default="text", validation_alias="EMBEDDING_INPUT_TYPE")
+    encoding_format: str = Field(default="float", validation_alias="EMBEDDING_ENCODING_FORMAT")
+    distance_metric: str = Field(default="COSINE", validation_alias="EMBEDDING_DISTANCE_METRIC")
+    query_prefix_revision: str = Field(
+        default="", validation_alias="EMBEDDING_QUERY_PREFIX_REVISION"
+    )
+    document_prefix_revision: str = Field(
+        default="", validation_alias="EMBEDDING_DOCUMENT_PREFIX_REVISION"
+    )
+    text_preprocess_revision: str = Field(
+        default="", validation_alias="EMBEDDING_TEXT_PREPROCESS_REVISION"
+    )
+    sdk_contract_revision: str = Field(
+        default="openai-v1", validation_alias="EMBEDDING_SDK_CONTRACT_REVISION"
+    )
+    config_ref: str = Field(default="", validation_alias="EMBEDDING_CONFIG_REF")
     batch_size: int = Field(default=8, validation_alias="EMBEDDING_BATCH_SIZE")
     request_timeout_seconds: int = Field(
         default=60, validation_alias="EMBEDDING_TIMEOUT_SECONDS"
@@ -155,6 +198,29 @@ class PreviewConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PREVIEW_", populate_by_name=True)
 
 
+class IndexQualityConfig(BaseSettings):
+    recall_max_regression: float = Field(
+        default=0.02, validation_alias="INDEX_QUALITY_RECALL_MAX_REGRESSION"
+    )
+    ndcg_max_regression: float = Field(
+        default=0.02, validation_alias="INDEX_QUALITY_NDCG_MAX_REGRESSION"
+    )
+    mrr_max_regression: float = Field(
+        default=0.02, validation_alias="INDEX_QUALITY_MRR_MAX_REGRESSION"
+    )
+    p95_max_regression: float = Field(
+        default=0.20, validation_alias="INDEX_QUALITY_P95_MAX_REGRESSION"
+    )
+    shadow_sample_rate: float = Field(
+        default=0.0, ge=0.0, le=1.0, validation_alias="INDEX_SHADOW_SAMPLE_RATE"
+    )
+    shadow_budget_ms: int = Field(
+        default=100, ge=1, validation_alias="INDEX_SHADOW_BUDGET_MS"
+    )
+
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
+
+
 class Config(BaseSettings):
     """全局配置"""
 
@@ -165,6 +231,7 @@ class Config(BaseSettings):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     preview: PreviewConfig = Field(default_factory=PreviewConfig)
+    index_quality: IndexQualityConfig = Field(default_factory=IndexQualityConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",

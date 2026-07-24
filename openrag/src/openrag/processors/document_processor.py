@@ -12,8 +12,15 @@ if TYPE_CHECKING:
     from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
 
 from openrag.chunking.chunk_engine import ChunkEngine
-from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
-from openrag.chunking.chunk_params import chunk_size_overlap_from_env, min_chunk_tokens_from_env, resolve_chunk_method
+from openrag.chunking.document_type import (
+    DEFAULT_DOCUMENT_TYPE,
+    normalize_document_type,
+)
+from openrag.chunking.chunk_params import (
+    chunk_size_overlap_from_env,
+    min_chunk_tokens_from_env,
+    resolve_chunk_method,
+)
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.document_hierarchy_builder import DocumentHierarchyBuilder
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
@@ -38,6 +45,7 @@ _TEXT_PREVIEW_MAX = 16000
 try:
     from common.token_utils import num_tokens_from_string
 except ImportError:
+
     def num_tokens_from_string(text: str) -> int:
         return max(1, len(text) // 4)
 
@@ -122,7 +130,10 @@ def _safe_fail_run(
 
 
 def _chunk_token_stats(chunks) -> dict:
-    token_counts = [num_tokens_from_string(getattr(chunk, "text", str(chunk)) or "") for chunk in chunks]
+    token_counts = [
+        num_tokens_from_string(getattr(chunk, "text", str(chunk)) or "")
+        for chunk in chunks
+    ]
     if not token_counts:
         return {
             "token_min": 0,
@@ -210,6 +221,7 @@ class DocumentProcessor:
         l1_max_tokens: int = 2000,
         l1_section_preview_tokens: int = 200,
         require_layer_vectors: bool = False,
+        generation_context=None,
     ):
         if vector_store is None:
             raise VectorWriteIncompleteError(
@@ -229,11 +241,38 @@ class DocumentProcessor:
         self.layer_store = layer_store
         self.require_layer_vectors = require_layer_vectors
         self.chunk_fulltext_store = chunk_fulltext_store
+        self.generation_context = generation_context
+        self._assert_generation_consistency(
+            generation_context,
+            embedding_engine,
+            vector_store,
+            layer_store,
+        )
         self.hierarchy_builder = DocumentHierarchyBuilder(
             l0_max_tokens=l0_max_tokens,
             l1_max_tokens=l1_max_tokens,
             l1_section_preview_tokens=l1_section_preview_tokens,
         )
+
+    @staticmethod
+    def _assert_generation_consistency(
+        generation_context,
+        embedding_engine,
+        vector_store,
+        layer_store,
+    ) -> None:
+        if generation_context is None:
+            return
+        embedding_engine.assert_fingerprint(generation_context.embedding_fingerprint)
+        if (
+            getattr(vector_store, "collection_name", None)
+            != generation_context.chunk_collection_name
+            or getattr(layer_store, "collection_name", None)
+            != generation_context.layer_collection_name
+        ):
+            raise VectorWriteIncompleteError(
+                "Document processor generation and vector stores do not match"
+            )
 
     @staticmethod
     def _validate_chunks(chunks: list) -> None:
@@ -244,31 +283,41 @@ class DocumentProcessor:
             chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
             text = getattr(chunk, "text", None)
             if not chunk_id:
-                raise VectorWriteIncompleteError("Every document chunk must have a chunk ID")
+                raise VectorWriteIncompleteError(
+                    "Every document chunk must have a chunk ID"
+                )
             if not isinstance(text, str) or not text.strip():
-                raise VectorWriteIncompleteError("Every document chunk must contain text")
+                raise VectorWriteIncompleteError(
+                    "Every document chunk must contain text"
+                )
             chunk_ids.append(chunk_id[:64])
         if len(set(chunk_ids)) != len(chunk_ids):
             raise VectorWriteIncompleteError("Document chunk IDs must be unique")
 
-    def _build_layer_embeddings(self, hierarchy_result) -> list[tuple[str, str, list[float]]]:
+    def _build_layer_embeddings(
+        self, hierarchy_result
+    ) -> list[tuple[str, str, list[float]]]:
         if not self.require_layer_vectors:
             return []
         layer_texts = [
             (layer, text.strip())
-            for layer, text in (("l0", hierarchy_result.l0), ("l1", hierarchy_result.l1))
+            for layer, text in (
+                ("l0", hierarchy_result.l0),
+                ("l1", hierarchy_result.l1),
+            )
             if isinstance(text, str) and text.strip()
         ]
         if not layer_texts:
-            raise VectorWriteIncompleteError("L0/L1 retrieval requires non-empty layer text")
+            raise VectorWriteIncompleteError(
+                "L0/L1 retrieval requires non-empty layer text"
+            )
         vectors = self.embedding_engine.embed_batch([text for _, text in layer_texts])
         if len(vectors) != len(layer_texts):
             raise VectorWriteIncompleteError(
                 "Layer embedding count does not match non-empty layer count"
             )
         return [
-            (layer, text, vector)
-            for (layer, text), vector in zip(layer_texts, vectors)
+            (layer, text, vector) for (layer, text), vector in zip(layer_texts, vectors)
         ]
 
     @staticmethod
@@ -280,7 +329,17 @@ class DocumentProcessor:
         document_chunk_metadata_count: int,
         expected_layer_count: int,
         milvus_layer_insert_count: int,
+        generation_context=None,
+        embedding_engine=None,
+        vector_store=None,
+        layer_store=None,
     ) -> None:
+        DocumentProcessor._assert_generation_consistency(
+            generation_context,
+            embedding_engine,
+            vector_store,
+            layer_store,
+        )
         counts = {
             "chunk_count": chunk_count,
             "chunk_embedding_count": chunk_embedding_count,
@@ -351,7 +410,9 @@ class DocumentProcessor:
                 trace_service,
                 parse_span,
                 str(exc),
-                metrics={"duration_ms": int((time.perf_counter() - parse_started) * 1000)},
+                metrics={
+                    "duration_ms": int((time.perf_counter() - parse_started) * 1000)
+                },
                 output_summary=(
                     {"pdf_stage_profile": fail_profile} if fail_profile else None
                 ),
@@ -394,7 +455,9 @@ class DocumentProcessor:
         )
         print(f"  [PIPELINE] Step 1 — Parsed {len(text_blocks)} text blocks")
         for i, b in enumerate(text_blocks[:3]):
-            print(f"    block[{i}]: level={b.level}, type={b.block_type}, text={b.text[:80]!r}")
+            print(
+                f"    block[{i}]: level={b.level}, type={b.block_type}, text={b.text[:80]!r}"
+            )
         if progress_callback:
             progress_callback(20)
 
@@ -529,7 +592,9 @@ class DocumentProcessor:
                     sum(
                         1
                         for chunk in chunks
-                        if num_tokens_from_string(getattr(chunk, "text", str(chunk)) or "")
+                        if num_tokens_from_string(
+                            getattr(chunk, "text", str(chunk)) or ""
+                        )
                         < min_chunk_tokens
                     )
                     if min_chunk_tokens > 0
@@ -547,7 +612,9 @@ class DocumentProcessor:
             f"min_chunk_tokens={min_chunk_tokens}, chunks={len(chunks)}"
         )
         for i, c in enumerate(chunks[:3]):
-            print(f"    chunk[{i}]: level={c.level}, type={c.block_type}, text={c.text[:80]!r}")
+            print(
+                f"    chunk[{i}]: level={c.level}, type={c.block_type}, text={c.text[:80]!r}"
+            )
         if progress_callback:
             progress_callback(35)
 
@@ -576,6 +643,12 @@ class DocumentProcessor:
             },
         )
         try:
+            self._assert_generation_consistency(
+                self.generation_context,
+                self.embedding_engine,
+                self.vector_store,
+                self.layer_store,
+            )
             chunk_embeddings = self.embedding_engine.embed_chunks(chunks)
             if len(chunk_embeddings) != len(chunks):
                 raise VectorWriteIncompleteError(
@@ -603,7 +676,8 @@ class DocumentProcessor:
                 "dimension": getattr(self.embedding_engine, "dimension", None),
                 "batch_size": len(chunks),
                 "batch_count": math.ceil(
-                    len(chunks) / max(1, getattr(self.embedding_engine, "batch_size", len(chunks)))
+                    len(chunks)
+                    / max(1, getattr(self.embedding_engine, "batch_size", len(chunks)))
                 ),
                 "chunk_count": len(chunks),
                 "success_count": len(chunk_embeddings),
@@ -630,7 +704,11 @@ class DocumentProcessor:
         )
         try:
             self.vector_store.delete_by_file_id(file_id)
-            vectors_stored = self.vector_store.insert_chunks(file_id, chunk_embeddings)
+            vectors_stored = self.vector_store.insert_chunks(
+                file_id,
+                chunk_embeddings,
+                workspace_id=file_record.workspace_id,
+            )
             if vectors_stored != len(chunk_embeddings):
                 raise VectorWriteIncompleteError(
                     "Milvus chunk insert count does not match embedding count"
@@ -712,7 +790,9 @@ class DocumentProcessor:
                                 "workspace_id": file_record.workspace_id,
                                 "workspace_slug": slug_kw,
                                 "content": text[:65000],
-                                "doc_type_kwd": str(md.get("doc_type_kwd", "text"))[:16],
+                                "doc_type_kwd": str(md.get("doc_type_kwd", "text"))[
+                                    :16
+                                ],
                                 "content_with_weight": str(
                                     md.get("content_with_weight", text)
                                 )[:65000],
@@ -730,7 +810,9 @@ class DocumentProcessor:
                     )
                     es_doc_count = len(es_docs)
                     es_upsert_count = n_es
-                    print(f"  [PIPELINE] Step 5a — Indexed {n_es} chunks in Elasticsearch")
+                    print(
+                        f"  [PIPELINE] Step 5a — Indexed {n_es} chunks in Elasticsearch"
+                    )
                 except Exception as exc:
                     es_failure_reason = str(exc)
                     logger.warning("Elasticsearch chunk index failed: %s", exc)
@@ -756,7 +838,11 @@ class DocumentProcessor:
         # Step 5b: L0/L1 向量写入 Milvus（与 openrag_layers 集合对齐）
         n_layers = 0
         if self.require_layer_vectors:
-            n_layers = self.layer_store.upsert_file_layers(file_id, layer_embeddings)
+            n_layers = self.layer_store.upsert_file_layers(
+                file_id,
+                layer_embeddings,
+                workspace_id=file_record.workspace_id,
+            )
             if n_layers != len(layer_embeddings):
                 raise VectorWriteIncompleteError(
                     "Milvus layer insert count does not match embedding count"
@@ -780,7 +866,9 @@ class DocumentProcessor:
                 "file_id": file_id,
                 "bucket": bucket,
                 "chunk_count": len(chunks),
-                "storage_backend": "minio" if self.minio_storage and bucket else "local",
+                "storage_backend": (
+                    "minio" if self.minio_storage and bucket else "local"
+                ),
             },
         )
         if self.minio_storage and bucket:
@@ -816,7 +904,9 @@ class DocumentProcessor:
             trace_service,
             storage_span,
             output_summary={
-                "storage_backend": "minio" if self.minio_storage and bucket else "local",
+                "storage_backend": (
+                    "minio" if self.minio_storage and bucket else "local"
+                ),
                 "chunk_count": len(chunks),
                 "l0_saved": bool(file_record.l0_path),
                 "l1_saved": bool(file_record.l1_path),
@@ -855,7 +945,9 @@ class DocumentProcessor:
                     file_record.uri, i
                 )
             text = getattr(chunk, "text", str(chunk))
-            preview = text if len(text) <= _TEXT_PREVIEW_MAX else text[:_TEXT_PREVIEW_MAX]
+            preview = (
+                text if len(text) <= _TEXT_PREVIEW_MAX else text[:_TEXT_PREVIEW_MAX]
+            )
             bx = getattr(chunk, "bbox", None)
             bbox_x0 = bbox_y0 = bbox_x1 = bbox_y1 = None
             if bx is not None and len(bx) == 4:
@@ -915,6 +1007,10 @@ class DocumentProcessor:
             document_chunk_metadata_count=document_chunk_metadata_count,
             expected_layer_count=len(layer_embeddings),
             milvus_layer_insert_count=n_layers,
+            generation_context=self.generation_context,
+            embedding_engine=self.embedding_engine,
+            vector_store=self.vector_store,
+            layer_store=self.layer_store,
         )
 
         # Step 7: Update file metadata

@@ -59,6 +59,7 @@ class RunCreateRequest(BaseModel):
     name: Optional[str] = None
     code_version: Optional[str] = None
     index_version: Optional[str] = None
+    generation_id: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
     execute: bool = False
 
@@ -184,6 +185,11 @@ async def create_run(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     _get_dataset_or_404(request.dataset_id, current_user, db)
+    if request.generation_id is not None and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Index generation evaluation requires administrator privileges",
+        )
     service = EvalService(db)
     run = service.create_eval_run(
         request.dataset_id,
@@ -191,6 +197,7 @@ async def create_run(
         name=request.name,
         code_version=request.code_version,
         index_version=request.index_version,
+        generation_id=request.generation_id,
         created_by=current_user.id,
         metadata=request.metadata,
     )

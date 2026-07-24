@@ -23,7 +23,7 @@ def _stub_storage(monkeypatch):
     monkeypatch.setattr(MinioStorage, "remove_file", lambda *a, **k: None)
     monkeypatch.setattr(MinioStorage, "remove_document_hierarchy", lambda *a, **k: None)
     monkeypatch.setattr("openrag.api.files_api.cleanup_file_processing_data", lambda *a, **k: None)
-    monkeypatch.setattr("openrag.services.file_ingest.delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr("openrag.services.file_ingest.delete_vectors_for_file_across_generations", lambda *a, **k: {})
 
 
 def _put_upsert(client, workspace, headers, *, tag, target_path, content, filename="upload.bin", parser="txt"):

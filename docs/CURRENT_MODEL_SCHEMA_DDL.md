@@ -1,12 +1,12 @@
 # OpenRag 当前模型 DDL 快照（PostgreSQL）
 
-**更新时间**: 2026-04-17  
+**更新时间**: 2026-07-15
 **来源**: `openrag/src/openrag/models/*.py`  
 **用途**: 与当前 ORM 对齐的 **PostgreSQL** 参考 DDL；生产环境以 **SQLAlchemy / Alembic 生成结果** 为准，勿直接复制执行若与迁移历史冲突。
 
 **说明**:
 
-- 下列脚本收录 **14 张核心业务表**，不是当前 ORM metadata 的全量 DDL；生产环境仍以 **SQLAlchemy / Alembic 生成结果**为准。本次仅从该脚本移除已下线的文件 ACL 表、枚举和索引，未借此补写其他既有缺失模型。
+- 下列脚本收录 **17 张核心业务表**，不是当前 ORM metadata 的全量 DDL；生产环境仍以 **SQLAlchemy / Alembic 生成结果**为准。
 - `document_chunks.workspace_id` 在模型中**无**指向 `workspaces` 的外键，仅整型列；与 `files.workspace_id` 逻辑一致。
 - **`files.processing_status` 等列使用 PostgreSQL 自定义 `ENUM` 类型**：若只执行 `CREATE TABLE files` 而未先创建类型，会报错 **`type "processing_status" does not exist`**。请**从 §2 脚本开头整段执行**（或先单独跑完枚举再跑建表）。
 - **`files.processing_error`**：可空 `TEXT`，记录最近一次流水线失败信息；已有库可执行 `ALTER TABLE files ADD COLUMN IF NOT EXISTS processing_error TEXT;`。
@@ -26,7 +26,10 @@
 11. `document_chunks`  
 12. `share_links`
 13. `tasks`
-14. `team_members`
+14. `index_generations`
+15. `index_generation_routes`
+16. `index_generation_files`
+17. `team_members`
 
 ## 2) 建表脚本（**请整段执行**：先 `CREATE TYPE`，再 `CREATE TABLE`）
 
@@ -217,6 +220,7 @@ CREATE TABLE tasks (
     workspace_id INTEGER NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     file_id INTEGER REFERENCES files (id) ON DELETE SET NULL,
+    index_generation_id VARCHAR(36),
     task_type VARCHAR(32) NOT NULL,
     queue VARCHAR(32) NOT NULL,
     priority INTEGER NOT NULL,
@@ -239,6 +243,126 @@ CREATE TABLE tasks (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_tasks_task_id UNIQUE (task_id)
 );
+
+CREATE TABLE index_generations (
+    id VARCHAR(36) PRIMARY KEY,
+    client_request_id VARCHAR(128),
+    scope VARCHAR(32) NOT NULL,
+    state VARCHAR(32) NOT NULL,
+    source_generation_id VARCHAR(36) REFERENCES index_generations (id) ON DELETE SET NULL,
+    embedding_provider VARCHAR(64) NOT NULL,
+    embedding_model VARCHAR(256) NOT NULL,
+    embedding_revision VARCHAR(256) NOT NULL,
+    embedding_dimension INTEGER NOT NULL,
+    embedding_fingerprint VARCHAR(64) NOT NULL,
+    embedding_config_ref VARCHAR(256) NOT NULL,
+    vector_normalization VARCHAR(32) NOT NULL,
+    distance_metric VARCHAR(16) NOT NULL,
+    schema_version INTEGER NOT NULL,
+    chunk_policy_revision VARCHAR(128) NOT NULL,
+    hierarchy_policy_revision VARCHAR(128) NOT NULL,
+    chunk_collection_name VARCHAR(255) NOT NULL,
+    layer_collection_name VARCHAR(255),
+    es_generation VARCHAR(128),
+    manifest JSON NOT NULL,
+    source_watermark_at TIMESTAMP,
+    build_paused BOOLEAN NOT NULL DEFAULT FALSE,
+    last_reconciled_at TIMESTAMP,
+    build_lag_files BIGINT NOT NULL DEFAULT 0,
+    mirror_lag_files BIGINT NOT NULL DEFAULT 0,
+    last_mirrored_at TIMESTAMP,
+    expected_file_count BIGINT NOT NULL DEFAULT 0,
+    expected_chunk_count BIGINT NOT NULL DEFAULT 0,
+    expected_layer_count BIGINT NOT NULL DEFAULT 0,
+    indexed_file_count BIGINT NOT NULL DEFAULT 0,
+    indexed_chunk_count BIGINT NOT NULL DEFAULT 0,
+    indexed_layer_count BIGINT NOT NULL DEFAULT 0,
+    failed_file_count BIGINT NOT NULL DEFAULT 0,
+    validation_report JSON,
+    validation_started_at TIMESTAMP,
+    validation_completed_at TIMESTAMP,
+    validation_error_code VARCHAR(64),
+    quality_report JSON,
+    quality_gate_passed BOOLEAN,
+    quality_validated_at TIMESTAMP,
+    created_by INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    build_started_at TIMESTAMP,
+    ready_at TIMESTAMP,
+    activated_at TIMESTAMP,
+    retired_at TIMESTAMP,
+    delete_after TIMESTAMP,
+    backup_id VARCHAR(128),
+    backup_status VARCHAR(32),
+    deletion_plan JSON,
+    deleted_at TIMESTAMP,
+    deleted_by INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    last_error_code VARCHAR(64),
+    last_error TEXT,
+    lock_version INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_index_generation_chunk_collection UNIQUE (chunk_collection_name),
+    CONSTRAINT uq_index_generation_layer_collection UNIQUE (layer_collection_name),
+    CONSTRAINT uq_index_generations_client_request_id UNIQUE (client_request_id),
+    CONSTRAINT ck_index_generation_state CHECK (state IN ('draft', 'provisioning', 'building', 'reconciling', 'validating', 'ready', 'activating', 'active', 'retired', 'deleting', 'deleted', 'failed')),
+    CONSTRAINT ck_index_generation_dimension_positive CHECK (embedding_dimension > 0),
+    CONSTRAINT ck_index_generation_schema_version_positive CHECK (schema_version > 0),
+    CONSTRAINT ck_index_generation_expected_files CHECK (expected_file_count >= 0),
+    CONSTRAINT ck_index_generation_expected_chunks CHECK (expected_chunk_count >= 0),
+    CONSTRAINT ck_index_generation_expected_layers CHECK (expected_layer_count >= 0),
+    CONSTRAINT ck_index_generation_indexed_files CHECK (indexed_file_count >= 0),
+    CONSTRAINT ck_index_generation_indexed_chunks CHECK (indexed_chunk_count >= 0),
+    CONSTRAINT ck_index_generation_indexed_layers CHECK (indexed_layer_count >= 0),
+    CONSTRAINT ck_index_generation_failed_files CHECK (failed_file_count >= 0),
+    CONSTRAINT ck_index_generation_build_lag CHECK (build_lag_files >= 0),
+    CONSTRAINT ck_index_generation_mirror_lag CHECK (mirror_lag_files >= 0),
+    CONSTRAINT ck_index_generation_lock_version CHECK (lock_version >= 0)
+);
+
+CREATE TABLE index_generation_routes (
+    scope VARCHAR(32) PRIMARY KEY,
+    active_generation_id VARCHAR(36) NOT NULL REFERENCES index_generations (id) ON DELETE RESTRICT,
+    previous_generation_id VARCHAR(36) REFERENCES index_generations (id) ON DELETE SET NULL,
+    route_version BIGINT NOT NULL DEFAULT 0,
+    activated_at TIMESTAMP,
+    activated_by INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    rollback_deadline TIMESTAMP,
+    write_barrier BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ck_index_generation_route_version CHECK (route_version >= 0)
+);
+
+CREATE TABLE index_generation_files (
+    generation_id VARCHAR(36) NOT NULL REFERENCES index_generations (id) ON DELETE CASCADE,
+    file_id INTEGER NOT NULL REFERENCES files (id) ON DELETE CASCADE,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
+    state VARCHAR(32) NOT NULL,
+    source_content_hash VARCHAR(64),
+    source_updated_at TIMESTAMP NOT NULL,
+    expected_chunk_count INTEGER NOT NULL DEFAULT 0,
+    written_chunk_count INTEGER NOT NULL DEFAULT 0,
+    expected_layer_count INTEGER NOT NULL DEFAULT 0,
+    written_layer_count INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMP,
+    worker_id VARCHAR(64),
+    heartbeat_at TIMESTAMP,
+    error_code VARCHAR(64),
+    error TEXT,
+    completed_at TIMESTAMP,
+    PRIMARY KEY (generation_id, file_id),
+    CONSTRAINT ck_index_generation_file_state CHECK (state IN ('pending', 'running', 'success', 'retry', 'failed', 'deleted', 'stale')),
+    CONSTRAINT ck_index_generation_file_expected_chunks CHECK (expected_chunk_count >= 0),
+    CONSTRAINT ck_index_generation_file_written_chunks CHECK (written_chunk_count >= 0),
+    CONSTRAINT ck_index_generation_file_expected_layers CHECK (expected_layer_count >= 0),
+    CONSTRAINT ck_index_generation_file_written_layers CHECK (written_layer_count >= 0),
+    CONSTRAINT ck_index_generation_file_retry_count CHECK (retry_count >= 0)
+);
+
+ALTER TABLE tasks
+    ADD CONSTRAINT fk_tasks_index_generation_id
+    FOREIGN KEY (index_generation_id)
+    REFERENCES index_generations (id) ON DELETE RESTRICT;
 
 CREATE TABLE team_members (
     id SERIAL PRIMARY KEY,
@@ -288,12 +412,19 @@ CREATE INDEX ix_tasks_workspace_id ON tasks (workspace_id);
 CREATE INDEX ix_tasks_user_id ON tasks (user_id);
 CREATE INDEX ix_tasks_file_id ON tasks (file_id);
 CREATE INDEX ix_tasks_worker_id ON tasks (worker_id);
+CREATE INDEX ix_tasks_index_generation_id ON tasks (index_generation_id);
 CREATE INDEX idx_task_workspace_status ON tasks (workspace_id, status);
 CREATE INDEX idx_task_user_id ON tasks (user_id);
 CREATE INDEX idx_task_running ON tasks (status, started_at);
 CREATE INDEX idx_task_worker ON tasks (worker_id, status);
 CREATE INDEX idx_task_heartbeat ON tasks (status, heartbeat_at);
 CREATE INDEX idx_task_ready_retry ON tasks (status, next_retry_at, priority, created_at);
+
+-- index generations
+CREATE UNIQUE INDEX uq_index_generation_active_scope ON index_generations (scope) WHERE state = 'active';
+CREATE INDEX idx_index_generation_scope_state ON index_generations (scope, state);
+CREATE INDEX idx_index_generation_file_state_retry ON index_generation_files (generation_id, state, next_retry_at);
+CREATE INDEX idx_index_generation_file_workspace ON index_generation_files (workspace_id, generation_id);
 ```
 
 ## 4) 维护建议

@@ -1169,6 +1169,15 @@ python -m alembic upgrade head
 
 迁移必须在 API 和 worker 正式启动前执行。`Base.metadata.create_all()` 只作为全新空库的兜底建表能力，不负责升级已有表结构，不能替代 Alembic 迁移。
 
+首次部署包含 R-05 registry 的版本时，还需在 API 镜像内显式注册现有 `openrag_chunks` 和 `openrag_layers`。先执行默认 dry-run，核对 Schema、实体数、模型 revision/digest 和输出清单；审批后才加 `--execute`：
+
+```bash
+python -m openrag.cli.index_generation bootstrap-legacy --operator <变更单或操作者>
+python -m openrag.cli.index_generation bootstrap-legacy --operator <变更单或操作者> --execute
+```
+
+该命令只读取 Milvus 元数据并写 PostgreSQL registry，不修改 Collection 或 Alias；不得加入 API 自动启动流程。`EMBEDDING_REVISION`、`EMBEDDING_MODEL_IDENTITY` 无法证明时，manifest 会明确标记为 `declared`，不能误当作已验证身份。
+
 如果上传或解析时报以下错误，优先检查第 12 步迁移是否成功，而不是手动长期维护 `ALTER TABLE`：
 
 ```text

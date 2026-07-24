@@ -88,7 +88,11 @@ def _stub_storage(monkeypatch):
     can assert the prefix-recursive object delete was NOT used on a directory row.
     """
     rmdir_calls: list = []
-    monkeypatch.setattr(file_deletion, "delete_milvus_vectors_for_file", lambda *a, **k: [])
+    monkeypatch.setattr(
+        file_deletion,
+        "delete_vectors_for_file_across_generations",
+        lambda *a, **k: {},
+    )
 
     class _M:
         def remove_document_hierarchy(self, *a, **k):

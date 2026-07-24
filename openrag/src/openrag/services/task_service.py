@@ -28,6 +28,7 @@ class TaskService:
         max_retries: int = 3,
         status: Optional[TaskStatus] = None,
         payload: Optional[Dict[str, Any]] = None,
+        index_generation_id: Optional[str] = None,
     ) -> Task:
         """Build + add a Task to the session WITHOUT committing.
 
@@ -51,6 +52,7 @@ class TaskService:
             retry_count=0,
             max_retries=max_retries,
             payload=payload,
+            index_generation_id=index_generation_id,
         )
         self.db.add(task)
         return task
@@ -66,6 +68,7 @@ class TaskService:
         max_retries: int = 3,
         status: Optional[TaskStatus] = None,
         payload: Optional[Dict[str, Any]] = None,
+        index_generation_id: Optional[str] = None,
     ) -> Task:
         """Create a new task and commit (commit-on-call contract, unchanged)."""
         task = self.add_task(
@@ -78,6 +81,7 @@ class TaskService:
             max_retries=max_retries,
             status=status,
             payload=payload,
+            index_generation_id=index_generation_id,
         )
         self.db.commit()
         self.db.refresh(task)
@@ -111,7 +115,7 @@ class TaskService:
         user_id: Optional[int] = None,
         status: Optional[TaskStatus] = None,
         skip: int = 0,
-        limit: int = 100
+        limit: int = 100,
     ) -> Tuple[List[Task], int]:
         """List tasks with filtering
 
@@ -218,7 +222,9 @@ class TaskService:
         task.error = error
         task.error_code = error_code
         task.error_retryable = True
-        task.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        task.next_retry_at = datetime.now(timezone.utc) + timedelta(
+            seconds=delay_seconds
+        )
         task.worker_id = None
         task.assigned_at = None
         task.heartbeat_at = None
@@ -261,7 +267,11 @@ class TaskService:
             return None
 
         # Can only cancel pending or running tasks
-        if task.status not in (TaskStatus.PENDING, TaskStatus.STARTED, TaskStatus.RETRY):
+        if task.status not in (
+            TaskStatus.PENDING,
+            TaskStatus.STARTED,
+            TaskStatus.RETRY,
+        ):
             return None
 
         task.status = TaskStatus.CANCELLED
@@ -332,9 +342,8 @@ class TaskService:
         total = sum(status_counts.values())
 
         # Running tasks count (including assigned and started)
-        running = (
-            status_counts.get(TaskStatus.ASSIGNED.value, 0) +
-            status_counts.get(TaskStatus.STARTED.value, 0)
+        running = status_counts.get(TaskStatus.ASSIGNED.value, 0) + status_counts.get(
+            TaskStatus.STARTED.value, 0
         )
 
         # Pending tasks count
@@ -356,10 +365,20 @@ class TaskService:
         Returns:
             Number of running tasks
         """
-        return self.db.query(Task).filter(
-            Task.workspace_id == workspace_id,
-            Task.status.in_([TaskStatus.PENDING.value, TaskStatus.STARTED.value, TaskStatus.RETRY.value])
-        ).count()
+        return (
+            self.db.query(Task)
+            .filter(
+                Task.workspace_id == workspace_id,
+                Task.status.in_(
+                    [
+                        TaskStatus.PENDING.value,
+                        TaskStatus.STARTED.value,
+                        TaskStatus.RETRY.value,
+                    ]
+                ),
+            )
+            .count()
+        )
 
     def delete_task(self, task_id: int) -> bool:
         """Delete a task
@@ -391,13 +410,19 @@ class TaskService:
         Returns:
             Number of tasks deleted
         """
-        cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         cutoff = cutoff.replace(day=cutoff.day - days)
 
-        result = self.db.query(Task).filter(
-            Task.status.in_([TaskStatus.SUCCESS.value, TaskStatus.CANCELLED.value]),
-            Task.completed_at < cutoff
-        ).delete(synchronize_session=False)
+        result = (
+            self.db.query(Task)
+            .filter(
+                Task.status.in_([TaskStatus.SUCCESS.value, TaskStatus.CANCELLED.value]),
+                Task.completed_at < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
 
         self.db.commit()
 

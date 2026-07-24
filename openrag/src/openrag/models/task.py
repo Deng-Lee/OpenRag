@@ -4,7 +4,16 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, JSON, String, Text, TIMESTAMP
+from sqlalchemy import (
+    Boolean,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    TIMESTAMP,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from openrag.models.base import Base, TimestampMixin
@@ -18,22 +27,28 @@ if TYPE_CHECKING:
 
 class TaskStatus(str, enum.Enum):
     """Task processing status"""
-    PENDING = "pending"       # 等待执行
-    ASSIGNED = "assigned"     # 已分配给Worker
-    STARTED = "started"       # 执行中
-    SUCCESS = "success"       # 成功完成
-    FAILURE = "failure"       # 失败
-    RETRY = "retry"          # 重试中
-    CANCELLED = "cancelled"   # 已取消
+
+    PENDING = "pending"  # 等待执行
+    ASSIGNED = "assigned"  # 已分配给Worker
+    STARTED = "started"  # 执行中
+    SUCCESS = "success"  # 成功完成
+    FAILURE = "failure"  # 失败
+    RETRY = "retry"  # 重试中
+    CANCELLED = "cancelled"  # 已取消
 
 
 class TaskType(str, enum.Enum):
     """Task type enumeration"""
+
     PROCESS_DOCUMENT = "process_document"  # 文档处理
-    PARSE_DOCUMENT = "parse_document"      # 文档解析
-    BUILD_HIERARCHY = "build_hierarchy"    # 构建层级
-    EMBED_DOCUMENT = "embed_document"      # 文档嵌入
-    DELETE_FILE = "delete_file"            # 异步删除（存储 + 向量 + DB）
+    PARSE_DOCUMENT = "parse_document"  # 文档解析
+    BUILD_HIERARCHY = "build_hierarchy"  # 构建层级
+    EMBED_DOCUMENT = "embed_document"  # 文档嵌入
+    REINDEX_GENERATION_FILE = "reindex_generation_file"
+    RECONCILE_GENERATION_FILE = "reconcile_generation_file"
+    MIRROR_PREVIOUS_GENERATION_FILE = "mirror_previous_generation_file"
+    PURGE_FILE_FROM_GENERATIONS = "purge_file_from_generations"
+    DELETE_FILE = "delete_file"  # 异步删除（存储 + 向量 + DB）
     DELETE_PATH_PREFIX = "delete_path_prefix"  # 按路径前缀级联删除（虚拟目录 + 文件）
 
 
@@ -52,7 +67,7 @@ class Task(Base, TimestampMixin):
         unique=True,
         nullable=False,
         index=True,
-        comment="Celery task ID (UUID)"
+        comment="Celery task ID (UUID)",
     )
 
     # Foreign keys
@@ -60,19 +75,25 @@ class Task(Base, TimestampMixin):
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="Workspace ID"
+        comment="Workspace ID",
     )
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="User who submitted the task"
+        comment="User who submitted the task",
     )
     file_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("files.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
-        comment="Associated file ID"
+        comment="Associated file ID",
+    )
+    index_generation_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("index_generations.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+        comment="Immutable index generation target for vector write tasks",
     )
 
     # Task configuration
@@ -80,19 +101,19 @@ class Task(Base, TimestampMixin):
         String(32),
         nullable=False,
         default=TaskType.PROCESS_DOCUMENT.value,
-        comment="Task type"
+        comment="Task type",
     )
     queue: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default="normal",
-        comment="Queue name: fast, normal, slow"
+        comment="Queue name: fast, normal, slow",
     )
     priority: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=5,
-        comment="Priority score (0-10, higher is more important)"
+        comment="Priority score (0-10, higher is more important)",
     )
 
     # Task state
@@ -100,49 +121,32 @@ class Task(Base, TimestampMixin):
         String(16),
         nullable=False,
         default=TaskStatus.PENDING.value,
-        comment="Task status"
+        comment="Task status",
     )
     progress: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        default=0,
-        comment="Progress percentage (0-100)"
+        Integer, nullable=False, default=0, comment="Progress percentage (0-100)"
     )
 
     # Retry configuration
     retry_count: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        default=0,
-        comment="Current retry count"
+        Integer, nullable=False, default=0, comment="Current retry count"
     )
     max_retries: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        default=3,
-        comment="Maximum retry attempts"
+        Integer, nullable=False, default=3, comment="Maximum retry attempts"
     )
 
     # Timing
     assigned_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP,
-        nullable=True,
-        comment="Task assignment time"
+        TIMESTAMP, nullable=True, comment="Task assignment time"
     )
     started_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP,
-        nullable=True,
-        comment="Task start time"
+        TIMESTAMP, nullable=True, comment="Task start time"
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP,
-        nullable=True,
-        comment="Task completion time"
+        TIMESTAMP, nullable=True, comment="Task completion time"
     )
     heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP,
-        nullable=True,
-        comment="Last heartbeat timestamp"
+        TIMESTAMP, nullable=True, comment="Last heartbeat timestamp"
     )
 
     # Worker tracking
@@ -150,19 +154,15 @@ class Task(Base, TimestampMixin):
         String(64),
         nullable=True,
         index=True,
-        comment="Worker ID that is processing this task"
+        comment="Worker ID that is processing this task",
     )
 
     # Results
     result: Mapped[Optional[Dict[str, Any]]] = mapped_column(
-        JSON,
-        nullable=True,
-        comment="Task result data"
+        JSON, nullable=True, comment="Task result data"
     )
     error: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-        comment="Error message if failed"
+        Text, nullable=True, comment="Error message if failed"
     )
     error_code: Mapped[Optional[str]] = mapped_column(
         String(64), nullable=True, comment="Stable task error code"
@@ -190,7 +190,9 @@ class Task(Base, TimestampMixin):
         return strip_pg_nul_in_json(value)
 
     # Relationships
-    workspace: Mapped["Workspace"] = relationship("Workspace", foreign_keys=[workspace_id])
+    workspace: Mapped["Workspace"] = relationship(
+        "Workspace", foreign_keys=[workspace_id]
+    )
     user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
     file: Mapped[Optional["File"]] = relationship("File", foreign_keys=[file_id])
 
@@ -226,10 +228,15 @@ class Task(Base, TimestampMixin):
             "workspace_id": self.workspace_id,
             "user_id": self.user_id,
             "file_id": self.file_id,
+            "index_generation_id": self.index_generation_id,
             "task_type": self.task_type,
             "queue": self.queue,
             "priority": self.priority,
-            "status": self.status.value if isinstance(self.status, TaskStatus) else self.status,
+            "status": (
+                self.status.value
+                if isinstance(self.status, TaskStatus)
+                else self.status
+            ),
             "progress": self.progress,
             "retry_count": self.retry_count,
             "max_retries": self.max_retries,
@@ -237,13 +244,19 @@ class Task(Base, TimestampMixin):
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "assigned_at": self.assigned_at.isoformat() if self.assigned_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "heartbeat_at": self.heartbeat_at.isoformat() if self.heartbeat_at else None,
+            "completed_at": (
+                self.completed_at.isoformat() if self.completed_at else None
+            ),
+            "heartbeat_at": (
+                self.heartbeat_at.isoformat() if self.heartbeat_at else None
+            ),
             "worker_id": self.worker_id,
             "result": self.result,
             "error": self.error,
             "error_code": self.error_code,
             "error_retryable": self.error_retryable,
-            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
+            "next_retry_at": (
+                self.next_retry_at.isoformat() if self.next_retry_at else None
+            ),
             "payload": self.payload,
         }

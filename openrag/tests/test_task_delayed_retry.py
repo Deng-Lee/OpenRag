@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from openrag.broker.task_broker import TaskBroker
 from openrag.models.base import Base
-from openrag.models.task import TaskStatus
+from openrag.models.task import TaskStatus, TaskType
 from openrag.models.user import User
 from openrag.models.workspace import Workspace
 from openrag.services.task_service import TaskService
@@ -46,6 +46,7 @@ def new_task(db, user, workspace):
         workspace_id=workspace.id,
         user_id=user.id,
         max_retries=3,
+        task_type=TaskType.DELETE_FILE.value,
     )
 
 

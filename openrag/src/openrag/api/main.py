@@ -32,6 +32,7 @@ from openrag.api.service_tokens_admin import router as service_tokens_admin_rout
 from openrag.api.permissions_api import user_permissions_router
 from openrag.api.traces_api import router as traces_router
 from openrag.api.eval_api import router as eval_router
+from openrag.api.index_generations_api import router as index_generations_router
 from openrag.config import get_config
 from openrag.tracing.context import reset_trace_context, set_trace_context
 
@@ -192,6 +193,24 @@ async def health_check() -> Dict[str, Any]:
         # Simple query to verify connection
         db.execute(text("SELECT 1"))
         health_status["database"] = "connected"
+        from openrag.indexing.health import build_index_health_snapshot
+        from openrag.api import search_api as index_search_api
+
+        resolver = index_search_api._get_index_runtime_resolver()
+
+        def runtime_probe(generation_id):
+            runtime = resolver.get_runtime(
+                resolver.get_generation_snapshot(db, generation_id)
+            )
+            runtime.vector_store.probe()
+            if runtime.layer_store is None:
+                return {"chunks": True, "layers": False}
+            runtime.layer_store.probe()
+            return {"chunks": True, "layers": True}
+
+        health_status["index"] = build_index_health_snapshot(
+            db, runtime_probe=runtime_probe
+        )
         # Cleanup
         try:
             next(db_generator)
@@ -219,6 +238,52 @@ async def health_check() -> Dict[str, Any]:
     return health_status
 
 
+@app.get("/ready", tags=["health"])
+async def readiness_check():
+    from openrag.indexing.health import build_index_health_snapshot
+    from openrag.api import search_api as index_search_api
+
+    db_generator = get_db()
+    try:
+        db = next(db_generator)
+        db.execute(text("SELECT 1"))
+        resolver = index_search_api._get_index_runtime_resolver()
+
+        def runtime_probe(generation_id):
+            runtime = resolver.get_runtime(
+                resolver.get_generation_snapshot(db, generation_id)
+            )
+            runtime.vector_store.probe()
+            if runtime.layer_store is None:
+                return {"chunks": True, "layers": False}
+            runtime.layer_store.probe()
+            return {"chunks": True, "layers": True}
+
+        snapshot = build_index_health_snapshot(db, runtime_probe=runtime_probe)
+        payload = {
+            "status": "ready" if snapshot["ready"] else "not_ready",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "index": snapshot,
+        }
+        if snapshot["ready"]:
+            return payload
+        return JSONResponse(status_code=503, content=payload)
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "database": "disconnected",
+            },
+        )
+    finally:
+        try:
+            next(db_generator)
+        except StopIteration:
+            pass
+
+
 # Include Routers
 app.include_router(users_router)
 app.include_router(teams_router)
@@ -236,6 +301,7 @@ app.include_router(roles_router)
 app.include_router(user_permissions_router)
 app.include_router(traces_router)
 app.include_router(eval_router)
+app.include_router(index_generations_router)
 
 
 # Startup Event
@@ -260,6 +326,19 @@ async def startup_event():
         db = next(db_generator)
         db.execute(text("SELECT 1"))
         print("✓ Database connection verified, tables synced")
+        try:
+            from openrag.indexing.legacy_bootstrap import (
+                LegacyBootstrapError,
+                validate_active_route_on_startup,
+            )
+
+            route = validate_active_route_on_startup(db)
+            print(
+                "✓ Active index route verified "
+                f"generation={route['active_generation_id']} version={route['route_version']}"
+            )
+        except LegacyBootstrapError as route_error:
+            print(f"⚠ Active index route not ready: {route_error.code}")
         try:
             next(db_generator)
         except StopIteration:

@@ -18,9 +18,11 @@ class FakeCollection:
         self.insert_count = insert_count
         self.insert_calls = 0
         self.delete_calls = 0
+        self.last_data = None
 
     def insert(self, data):
         self.insert_calls += 1
+        self.last_data = data
         count = self.insert_count
         if count is None:
             count = len(data[0])
@@ -96,6 +98,27 @@ def test_layer_insert_count_must_match():
         store.upsert_file_layers(1, layers)
 
 
+def test_schema_v2_writes_require_and_include_workspace_id():
+    chunks = chunk_store()
+    chunks.expected_schema_version = 2
+    layers = layer_store()
+    layers.expected_schema_version = 2
+    chunk_batch = [(Chunk(text="one", chunk_id="one"), [1.0, 1.0, 1.0])]
+    layer_batch = [("l0", "summary", [1.0, 1.0, 1.0])]
+
+    with pytest.raises(VectorWriteIncompleteError):
+        chunks.insert_chunks(1, chunk_batch)
+    with pytest.raises(VectorWriteIncompleteError):
+        layers.upsert_file_layers(1, layer_batch)
+
+    assert chunks._collection.insert_calls == 0
+    assert layers._collection.delete_calls == 0
+    chunks.insert_chunks(1, chunk_batch, workspace_id=9)
+    layers.upsert_file_layers(1, layer_batch, workspace_id=9)
+    assert chunks._collection.last_data[2] == [9]
+    assert layers._collection.last_data[2] == [9]
+
+
 @pytest.mark.parametrize(
     "module_name,store_class",
     [
@@ -103,25 +126,35 @@ def test_layer_insert_count_must_match():
         ("src.openrag.vectorstore.milvus_layer_store", MilvusLayerStore),
     ],
 )
-def test_dimension_mismatch_never_drops_collection(monkeypatch, module_name, store_class):
+def test_dimension_mismatch_never_drops_collection(
+    monkeypatch, module_name, store_class
+):
     module = __import__(module_name, fromlist=["unused"])
     existing = SimpleNamespace(
         schema=SimpleNamespace(
             fields=[
                 SimpleNamespace(
+                    name="embedding",
                     dtype=module.DataType.FLOAT_VECTOR,
                     params={"dim": 2},
                 )
             ]
         ),
+        indexes=[
+            SimpleNamespace(field_name="embedding", params={"metric_type": "COSINE"})
+        ],
+        properties={},
         drop=lambda: pytest.fail("collection.drop must not be called"),
     )
-    monkeypatch.setattr(module.utility, "has_collection", lambda _: True)
-    monkeypatch.setattr(module, "Collection", lambda _: existing)
+    monkeypatch.setattr(module.utility, "has_collection", lambda *_, **__: True)
+    monkeypatch.setattr(module, "Collection", lambda *_, **__: existing)
     store = object.__new__(store_class)
     store.collection_name = "existing"
     store.dimension = 3
     store._collection = None
 
     with pytest.raises(VectorSchemaMismatchError):
-        store._ensure_collection()
+        store._connection_alias = "test"
+        store.expected_schema_version = 1
+        store.expected_embedding_fingerprint = None
+        store._load_and_validate_collection()

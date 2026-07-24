@@ -10,7 +10,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
-from openrag.database import get_db
+from openrag.database import SessionLocal, get_db
+from openrag.indexing.shadow_search import ShadowSearchService
+from openrag.models.index_generation import IndexGeneration, IndexGenerationState
 from openrag.models import TraceRun
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel
@@ -20,6 +22,12 @@ from openrag.embedding.errors import (
     EmbeddingError,
     EmbeddingInputError,
     EmbeddingResponseError,
+)
+from openrag.indexing.runtime import (
+    IndexRouteUnavailableError,
+    IndexRuntime,
+    IndexRuntimeResolver,
+    IndexRuntimeSnapshot,
 )
 from openrag.retrieval.reranker import Reranker
 from openrag.retrieval.retrieval_service import (
@@ -43,52 +51,51 @@ _vector_store = None
 _layer_store_instance = None
 _fulltext_store = None
 _fulltext_store_attempted: bool = False
+_index_runtime_resolver: Optional[IndexRuntimeResolver] = None
+
+
+def _get_index_runtime_resolver() -> IndexRuntimeResolver:
+    global _index_runtime_resolver
+    if _index_runtime_resolver is None:
+        _index_runtime_resolver = IndexRuntimeResolver()
+    return _index_runtime_resolver
+
+
+def _resolve_search_runtime(db: Session) -> IndexRuntime:
+    try:
+        resolver = _get_index_runtime_resolver()
+        snapshot = resolver.get_active_snapshot(db)
+        return resolver.get_runtime(snapshot)
+    except (IndexRouteUnavailableError, EmbeddingConfigurationError) as exc:
+        logger.warning("index_runtime_unavailable error_code=%s", getattr(exc, "code", "INDEX_ROUTE_UNAVAILABLE"))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "index_generation_unavailable",
+                "message": "Search index is temporarily unavailable",
+            },
+        ) from exc
+    except Exception as exc:
+        logger.exception("index_runtime_resolution_failed exception_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "index_generation_unavailable",
+                "message": "Search index is temporarily unavailable",
+            },
+        ) from exc
 
 
 def _get_embedding_engine() -> EmbeddingEngine:
-    global _embedding_engine
-    if _embedding_engine is None:
-        _embedding_engine = EmbeddingEngine()
-    return _embedding_engine
+    raise RuntimeError("Fixed embedding routing is disabled; use IndexRuntimeResolver")
 
 
 def _get_vector_store():
-    global _vector_store
-    if _vector_store is None:
-        try:
-            from openrag.vectorstore.milvus_store import MilvusStore
-
-            _vector_store = MilvusStore(dimension=_get_embedding_engine().dimension)
-        except Exception as exc:
-            logger.error("Cannot connect to Milvus: %s", exc)
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "vector_database_unavailable",
-                    "message": "Vector database is temporarily unavailable",
-                },
-            )
-    return _vector_store
+    raise RuntimeError("Fixed vector routing is disabled; use IndexRuntimeResolver")
 
 
 def _get_layer_store():
-    """Milvus L0/L1 集合；不可用时返回 None（退化为平面切片检索）。"""
-    if not l0_l1_retrieval_enabled():
-        return None
-
-    global _layer_store_instance
-    if _layer_store_instance is not None:
-        return _layer_store_instance
-    try:
-        from openrag.vectorstore.milvus_layer_store import MilvusLayerStore
-
-        _layer_store_instance = MilvusLayerStore(
-            dimension=_get_embedding_engine().dimension
-        )
-        return _layer_store_instance
-    except Exception as exc:
-        logger.warning("Layer store unavailable: %s", exc)
-        return None
+    raise RuntimeError("Fixed layer routing is disabled; use IndexRuntimeResolver")
 
 
 def _get_fulltext_store():
@@ -315,6 +322,8 @@ def _execute_search(
     endpoint: str,
     rerank_hierarchical_boost: Optional[float],
     workspace_access_prevalidated: bool = False,
+    runtime=None,
+    allow_shadow: bool = True,
 ) -> SearchResponse:
     start = time.time()
     trace_service, started_trace_run = _prepare_retrieval_trace(
@@ -386,13 +395,27 @@ def _execute_search(
                 l1_llm_skip_reason=None,
             )
 
+        runtime = runtime or _resolve_search_runtime(db)
+        trace_service.update_search_config_snapshot(
+            {
+                "index_generation_id": runtime.snapshot.generation_id,
+                "route_version": runtime.snapshot.route_version,
+                "embedding_fingerprint": runtime.snapshot.embedding_fingerprint,
+                "embedding_revision": runtime.snapshot.embedding_revision,
+                "chunk_collection_name": runtime.snapshot.chunk_collection_name,
+                "layer_collection_name": runtime.snapshot.layer_collection_name,
+            }
+        )
         hierarchy_enabled = l0_l1_retrieval_enabled()
         is_hierarchical = endpoint == "hierarchical"
         needs_layer_store = request.use_contextual_retrieval or is_hierarchical
-        svc.embedding_engine = _get_embedding_engine()
-        svc.vector_store = _get_vector_store()
-        svc.layer_store = _get_layer_store() if needs_layer_store else None
+        svc.embedding_engine = runtime.embedding_engine
+        svc.vector_store = runtime.vector_store
+        svc.layer_store = runtime.layer_store if needs_layer_store else None
         svc.fulltext_store = _get_fulltext_store()
+        svc.generation_id = runtime.snapshot.generation_id
+        svc.route_version = runtime.snapshot.route_version
+        svc.embedding_fingerprint = runtime.snapshot.embedding_fingerprint
 
         use_contextual_retrieval = request.use_contextual_retrieval and hierarchy_enabled
         use_l1_llm_navigation = request.use_l1_llm_navigation and hierarchy_enabled
@@ -522,13 +545,31 @@ def _execute_search(
         if started_trace_run:
             trace_service.finish_run()
 
-        return SearchResponse(
+        response = SearchResponse(
             results=formatted,
             total=len(formatted),
             query_time_ms=elapsed_ms,
             l1_llm_applied=l1_llm_applied,
             l1_llm_skip_reason=l1_llm_skip_reason,
         )
+        if allow_shadow:
+            try:
+                _run_internal_candidate_shadow(
+                    db=db,
+                    user_id=user_id,
+                    request=request,
+                    endpoint=endpoint,
+                    rerank_hierarchical_boost=rerank_hierarchical_boost,
+                    active_generation_id=runtime.snapshot.generation_id,
+                    active_results=[
+                        item.model_dump() if hasattr(item, "model_dump") else dict(item)
+                        for item in formatted
+                    ],
+                    resolved_file_ids=resolved_file_scope.file_ids,
+                )
+            except Exception:
+                logger.exception("generation_shadow_schedule_failed")
+        return response
     except PermissionScopeResolutionError as exc:
         if started_trace_run:
             trace_service.fail_run(
@@ -566,6 +607,74 @@ def _execute_search(
         raise
 
 
+def _run_internal_candidate_shadow(
+    *,
+    db: Session,
+    user_id: int,
+    request: SearchRequest,
+    endpoint: str,
+    rerank_hierarchical_boost: Optional[float],
+    active_generation_id: str,
+    active_results: list[dict],
+    resolved_file_ids: Optional[tuple[int, ...]],
+) -> None:
+    service = ShadowSearchService(
+        recorder=lambda comparison: logger.info(
+            "generation_shadow_comparison %s", comparison
+        )
+    )
+    context = get_trace_context()
+    request_key = str(context.get("trace_id") or uuid.uuid4().hex)
+    if not service.should_shadow(request_key):
+        return
+    candidate = (
+        db.query(IndexGeneration)
+        .filter(
+            IndexGeneration.state == IndexGenerationState.READY.value,
+            IndexGeneration.id != active_generation_id,
+        )
+        .order_by(IndexGeneration.ready_at.desc(), IndexGeneration.created_at.desc())
+        .first()
+    )
+    if candidate is None:
+        return
+    if resolved_file_ids is None:
+        allowed_query = db.query(FileModel.id).filter(FileModel.deleted_at.is_(None))
+        if request.workspace_id is not None:
+            allowed_query = allowed_query.filter(
+                FileModel.workspace_id == request.workspace_id
+            )
+        allowed_file_ids = {row[0] for row in allowed_query.all()}
+    else:
+        allowed_file_ids = set(resolved_file_ids)
+
+    def candidate_search() -> list[dict]:
+        shadow_db = SessionLocal()
+        try:
+            resolver = _get_index_runtime_resolver()
+            candidate_runtime = resolver.get_runtime(
+                resolver.get_generation_snapshot(shadow_db, candidate.id)
+            )
+            shadow_response = _execute_search(
+                shadow_db,
+                user_id,
+                request,
+                endpoint=endpoint,
+                rerank_hierarchical_boost=rerank_hierarchical_boost,
+                runtime=candidate_runtime,
+                allow_shadow=False,
+            )
+            return [item.model_dump() for item in shadow_response.results]
+        finally:
+            shadow_db.close()
+
+    service.run_candidate_shadow(
+        request_key=request_key,
+        query_hash=hashlib.sha256(request.query.encode("utf-8")).hexdigest(),
+        active_results=active_results,
+        candidate_search=candidate_search,
+        allowed_file_ids=allowed_file_ids,
+    )
 @router.post("/semantic", response_model=SearchResponse)
 @router.post("", response_model=SearchResponse)
 async def semantic_search(
@@ -684,6 +793,7 @@ def _prepare_retrieval_trace(
     user_id: int,
     request: SearchRequest,
     endpoint: str,
+    runtime_snapshot: IndexRuntimeSnapshot | None = None,
 ) -> tuple[TraceService, bool]:
     trace_service = TraceService(db)
     query_hash = _query_hash(request.query)
@@ -702,6 +812,25 @@ def _prepare_retrieval_trace(
     if trace_type == "retrieval":
         existing = db.query(TraceRun).filter(TraceRun.trace_id == trace_id).first()
         if existing is None:
+            search_config_snapshot = {
+                "endpoint": endpoint,
+                "top_k": request.top_k,
+                "use_rerank": request.use_rerank,
+                "use_contextual_retrieval": request.use_contextual_retrieval,
+                "retrieval_strategy": request.retrieval_strategy,
+                "vector_similarity_weight": request.vector_similarity_weight,
+            }
+            if runtime_snapshot is not None:
+                search_config_snapshot.update(
+                    {
+                        "index_generation_id": runtime_snapshot.generation_id,
+                        "route_version": runtime_snapshot.route_version,
+                        "embedding_fingerprint": runtime_snapshot.embedding_fingerprint,
+                        "embedding_revision": runtime_snapshot.embedding_revision,
+                        "chunk_collection_name": runtime_snapshot.chunk_collection_name,
+                        "layer_collection_name": runtime_snapshot.layer_collection_name,
+                    }
+                )
             trace_service.start_run(
                 trace_type="retrieval",
                 trace_id=trace_id,
@@ -710,14 +839,7 @@ def _prepare_retrieval_trace(
                 query_hash=query_hash,
                 query_preview=query_preview,
                 sampling_reason=ctx["sampling_reason"] or "search_api",
-                search_config_snapshot={
-                    "endpoint": endpoint,
-                    "top_k": request.top_k,
-                    "use_rerank": request.use_rerank,
-                    "use_contextual_retrieval": request.use_contextual_retrieval,
-                    "retrieval_strategy": request.retrieval_strategy,
-                    "vector_similarity_weight": request.vector_similarity_weight,
-                },
+                search_config_snapshot=search_config_snapshot,
             )
             started_run = True
 

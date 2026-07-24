@@ -67,8 +67,16 @@ spec:
 
 1. 先起有状态组件并等待健康（PostgreSQL → Milvus 依赖链 → Milvus → ES）。
 2. 运行 **Alembic**：在 API Job 或 init 容器中执行 `alembic upgrade head`。
-3. 启动 `api`，就绪后启动 `task-worker`（Worker 依赖 Broker/API 与向量/ES 可用性）。
-4. 最后启动 `web` / 配置 `Ingress`。
+3. 首次引入 R-05 registry 时，使用与 API 相同的镜像显式注册 legacy Collection。命令默认只做 dry-run：
+
+   ```bash
+   python -m openrag.cli.index_generation bootstrap-legacy --operator <变更单或操作者>
+   python -m openrag.cli.index_generation bootstrap-legacy --operator <变更单或操作者> --execute
+   ```
+
+   执行前必须把 `EMBEDDING_REVISION` 和 `EMBEDDING_MODEL_IDENTITY` 配成当前线上模型的不可变 revision/digest。该命令不重命名、复制、创建或删除 Collection，也不修改 Alias；重复执行幂等。不要把 `--execute` 放进 API startup 或每次部署的 initContainer。
+4. 启动 `api`，就绪后启动 `task-worker`（Worker 依赖 Broker/API 与向量/ES 可用性）。
+5. 最后启动 `web` / 配置 `Ingress`。
 
 ## 6. 离线 K8s 集群部署流程
 

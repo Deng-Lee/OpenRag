@@ -2,9 +2,12 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from src.openrag.chunking.chunk_models import Chunk
 from src.openrag.config import EmbeddingConfig
 from src.openrag.embedding.embedding_engine import EmbeddingEngine
+from src.openrag.embedding.errors import EmbeddingConfigurationError
 
 
 class FakeEmbeddings:
@@ -130,3 +133,48 @@ def test_probe_bypasses_embedding_cache():
     engine.probe()
 
     assert len(client.embeddings.calls) == 2
+
+
+def test_engine_exposes_safe_manifest_and_fingerprint():
+    engine = make_engine(
+        config_overrides={
+            "revision": "revision-1",
+            "model_identity": "digest-1",
+            "api_key": "do-not-expose",
+            "base_url": "https://private-gateway.internal/v1",
+        }
+    )
+
+    manifest = engine.get_manifest()
+    health = engine.health_snapshot()
+
+    assert manifest["model_revision"] == "revision-1"
+    assert manifest["model_identity"] == "digest-1"
+    assert len(engine.get_fingerprint()) == 64
+    assert health["embedding_fingerprint"] == engine.get_fingerprint()
+    assert "do-not-expose" not in str(health)
+    assert "private-gateway" not in str(health)
+
+
+def test_assert_fingerprint_fails_before_provider_request():
+    client = FakeClient()
+    engine = make_engine(client=client)
+
+    with pytest.raises(EmbeddingConfigurationError) as exc_info:
+        engine.assert_fingerprint("b" * 64)
+
+    assert exc_info.value.code == "EMBEDDING_FINGERPRINT_MISMATCH"
+    assert client.embeddings.calls == []
+
+
+def test_probe_returns_verified_model_identity_and_dimension():
+    engine = make_engine(
+        config_overrides={"revision": "revision-1", "model_identity": "digest-1"}
+    )
+
+    snapshot = engine.probe()
+
+    assert snapshot["model_identity"] == "digest-1"
+    assert snapshot["model_revision"] == "revision-1"
+    assert snapshot["dimension"] == 3
+    assert snapshot["fingerprint_verified"] is True

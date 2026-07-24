@@ -6,6 +6,7 @@ import hashlib
 import logging
 import math
 import random
+import secrets
 import time
 from datetime import datetime, timezone
 from numbers import Real
@@ -20,6 +21,10 @@ from .errors import (
     EmbeddingInputError,
     EmbeddingProviderError,
     EmbeddingResponseError,
+)
+from ..indexing.fingerprint import (
+    build_embedding_manifest,
+    compute_embedding_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,13 +53,31 @@ def validate_embedding_config(
         raise EmbeddingConfigurationError(
             "EMBEDDING_CONFIG_INVALID", "Embedding dimension must be greater than zero"
         )
+    if config.normalization.strip().lower() not in {"none", "l2"}:
+        raise EmbeddingConfigurationError(
+            "EMBEDDING_CONFIG_INVALID", "Embedding normalization is invalid"
+        )
+    if not config.input_type.strip():
+        raise EmbeddingConfigurationError(
+            "EMBEDDING_CONFIG_INVALID", "Embedding input type is not configured"
+        )
+    if not config.encoding_format.strip():
+        raise EmbeddingConfigurationError(
+            "EMBEDDING_CONFIG_INVALID", "Embedding encoding format is not configured"
+        )
+    if not config.distance_metric.strip():
+        raise EmbeddingConfigurationError(
+            "EMBEDDING_CONFIG_INVALID", "Embedding distance metric is not configured"
+        )
     if not 1 <= config.batch_size <= 2048:
         raise EmbeddingConfigurationError(
-            "EMBEDDING_CONFIG_INVALID", "Embedding batch size must be between 1 and 2048"
+            "EMBEDDING_CONFIG_INVALID",
+            "Embedding batch size must be between 1 and 2048",
         )
     if not 1 <= config.request_timeout_seconds <= 600:
         raise EmbeddingConfigurationError(
-            "EMBEDDING_CONFIG_INVALID", "Embedding timeout must be between 1 and 600 seconds"
+            "EMBEDDING_CONFIG_INVALID",
+            "Embedding timeout must be between 1 and 600 seconds",
         )
     if not 1 <= config.max_attempts <= 5:
         raise EmbeddingConfigurationError(
@@ -62,7 +85,8 @@ def validate_embedding_config(
         )
     if not 5 <= config.probe_interval_seconds <= 300:
         raise EmbeddingConfigurationError(
-            "EMBEDDING_CONFIG_INVALID", "Embedding probe interval must be between 5 and 300 seconds"
+            "EMBEDDING_CONFIG_INVALID",
+            "Embedding probe interval must be between 5 and 300 seconds",
         )
 
 
@@ -214,7 +238,8 @@ class EmbeddingEngine:
         self.batch_size = resolved.batch_size
         self.cache_enabled = cache_enabled
         self._dimension = resolved.dimension
-        self._base_url = (resolved.base_url or "").rstrip("/")
+        self._manifest = build_embedding_manifest(resolved)
+        self._fingerprint = compute_embedding_fingerprint(self._manifest)
         self._cache: dict[str, tuple[float, ...]] = {}
         self._sleep = sleep_fn
         self._random = random_fn
@@ -224,6 +249,13 @@ class EmbeddingEngine:
             "last_probe_at": None,
             "last_error_code": None,
             "ready": False,
+            "provider": self.provider,
+            "model": self.model,
+            "model_revision": resolved.revision,
+            "model_identity": self._manifest["model_identity"],
+            "dimension": self.dimension,
+            "embedding_fingerprint": self._fingerprint,
+            "fingerprint_verified": False,
         }
 
         if client is not None:
@@ -263,7 +295,9 @@ class EmbeddingEngine:
         results: list[Optional[list[float]]] = [None] * len(texts)
         misses: list[tuple[int, str]] = []
         for index, text in enumerate(texts):
-            cached = self._cache.get(self._cache_key(text)) if self.cache_enabled else None
+            cached = (
+                self._cache.get(self._cache_key(text)) if self.cache_enabled else None
+            )
             if cached is None:
                 misses.append((index, text))
             else:
@@ -306,7 +340,9 @@ class EmbeddingEngine:
             raise EmbeddingInputError(
                 "EMBEDDING_INPUT_INVALID", "Chunk IDs must be unique"
             )
-        embeddings = self.embed_batch([getattr(chunk, "text", None) for chunk in chunks])
+        embeddings = self.embed_batch(
+            [getattr(chunk, "text", None) for chunk in chunks]
+        )
         if len(embeddings) != len(chunks):
             raise EmbeddingResponseError(
                 "EMBEDDING_RESPONSE_INVALID",
@@ -328,6 +364,7 @@ class EmbeddingEngine:
             )
             raise
         self._record_success()
+        self._health["fingerprint_verified"] = True
         logger.info(
             "embedding_probe_success provider=%s model=%s dimension=%d",
             self.provider,
@@ -338,6 +375,22 @@ class EmbeddingEngine:
 
     def health_snapshot(self) -> dict[str, Any]:
         return dict(self._health)
+
+    def get_manifest(self) -> dict[str, Any]:
+        return dict(self._manifest)
+
+    def get_fingerprint(self) -> str:
+        return self._fingerprint
+
+    def assert_fingerprint(self, expected_fingerprint: str) -> None:
+        expected = str(expected_fingerprint or "").strip().lower()
+        if not secrets.compare_digest(self._fingerprint, expected):
+            self._health["fingerprint_verified"] = False
+            raise EmbeddingConfigurationError(
+                "EMBEDDING_FINGERPRINT_MISMATCH",
+                "Embedding runtime does not match the target index generation",
+            )
+        self._health["fingerprint_verified"] = True
 
     def clear_cache(self) -> None:
         self._cache.clear()
@@ -379,12 +432,15 @@ class EmbeddingEngine:
             )
         return values
 
-    def _validate_response(self, response_data: Any, expected_count: int) -> list[list[float]]:
+    def _validate_response(
+        self, response_data: Any, expected_count: int
+    ) -> list[list[float]]:
         try:
             items = list(response_data)
         except TypeError as exc:
             raise EmbeddingResponseError(
-                "EMBEDDING_RESPONSE_INVALID", "Embedding service returned an invalid response"
+                "EMBEDDING_RESPONSE_INVALID",
+                "Embedding service returned an invalid response",
             ) from exc
         if len(items) != expected_count:
             raise EmbeddingResponseError(
@@ -415,7 +471,9 @@ class EmbeddingEngine:
             started = time.monotonic()
             try:
                 response = self._client.embeddings.create(input=texts, model=self.model)
-                vectors = self._validate_response(_read_attr(response, "data"), len(texts))
+                vectors = self._validate_response(
+                    _read_attr(response, "data"), len(texts)
+                )
                 self._record_success()
                 logger.info(
                     "embedding_request_success provider=%s model=%s input_count=%d attempt=%d latency_ms=%d",
@@ -472,7 +530,7 @@ class EmbeddingEngine:
         return min(30.0, (2 ** (attempt - 1)) + self._random())
 
     def _cache_key(self, text: str) -> str:
-        raw = f"{self.provider}:{self._base_url}:{self.model}:{self.dimension}:{text}"
+        raw = f"{self._fingerprint}:{text}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _record_success(self) -> None:

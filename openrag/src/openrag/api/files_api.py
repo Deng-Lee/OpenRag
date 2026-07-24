@@ -24,7 +24,7 @@ from openrag.models.task import Task, TaskStatus, TaskType
 from openrag.services.file_deletion import (
     delete_file_with_storage,
     delete_files_under_uri_prefix,
-    delete_milvus_vectors_for_file,
+    delete_vectors_for_file_across_generations,
 )
 from openrag.services.file_preview import build_file_preview
 from openrag.services.file_ingest import (
@@ -326,7 +326,7 @@ def cleanup_file_processing_data(
     except Exception as e:
         logger.warning(f"Failed to cleanup document_chunks: {e}")
 
-    delete_milvus_vectors_for_file(file.id)
+    delete_vectors_for_file_across_generations(db, file.id)
 
     # Cleanup vector data if exists
     if file.l0_vector_id:

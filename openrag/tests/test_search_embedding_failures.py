@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 from openrag.api import search_api
 from openrag.api.search_api import (
@@ -86,6 +87,23 @@ def configure_execute_search(monkeypatch):
     monkeypatch.setattr(search_api, "_get_embedding_engine", lambda: object())
     monkeypatch.setattr(search_api, "_get_vector_store", lambda: object())
     monkeypatch.setattr(search_api, "_get_fulltext_store", lambda: None)
+    monkeypatch.setattr(
+        search_api,
+        "_resolve_search_runtime",
+        lambda _db: SimpleNamespace(
+            snapshot=SimpleNamespace(
+                generation_id="generation-test",
+                route_version=1,
+                embedding_fingerprint="a" * 64,
+                embedding_revision="revision-test",
+                chunk_collection_name="chunks_test",
+                layer_collection_name="layers_test",
+            ),
+            embedding_engine=object(),
+            vector_store=object(),
+            layer_store=object(),
+        ),
+    )
 
 
 def test_flat_search_does_not_initialize_layer_store(monkeypatch):

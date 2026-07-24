@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -12,6 +13,7 @@ from openrag.models.base import Base
 from openrag.models.file import File
 from openrag.models.user import User
 from openrag.models.workspace import Workspace
+from openrag.indexing.runtime import IndexRuntime
 from openrag.parsers.base import DocumentBlock
 from openrag.processors.document_processor import DocumentProcessor
 from openrag.worker import task_worker
@@ -100,7 +102,7 @@ class FakeVectorStore:
     def delete_by_file_id(self, file_id):
         pass
 
-    def insert_chunks(self, file_id, chunk_embeddings):
+    def insert_chunks(self, file_id, chunk_embeddings, workspace_id=None):
         return len(chunk_embeddings)
 
 
@@ -228,7 +230,9 @@ def test_semantic_direct_call_preserves_chunks_and_sets_document_type_metadata()
         document_type="manual",
     )
 
-    assert [chunk.text for chunk in manual_chunks] == [chunk.text for chunk in general_chunks]
+    assert [chunk.text for chunk in manual_chunks] == [
+        chunk.text for chunk in general_chunks
+    ]
     assert len(manual_chunks) == len(general_chunks)
     assert all(chunk.metadata["document_type"] == "manual" for chunk in manual_chunks)
 
@@ -284,7 +288,6 @@ def test_worker_reads_file_document_type_and_returns_it(monkeypatch):
         monkeypatch.setattr(task_worker, "MinioStorage", lambda: FakeDownloadMinio())
         monkeypatch.setattr(task_worker, "ParserRegistry", lambda: object())
         monkeypatch.setattr(task_worker, "ChunkEngine", lambda: object())
-        monkeypatch.setattr(task_worker, "EmbeddingEngine", lambda: object())
         monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
         monkeypatch.setattr(task_worker, "DocumentProcessor", CapturingProcessor)
 
@@ -297,13 +300,27 @@ def test_worker_reads_file_document_type_and_returns_it(monkeypatch):
         worker.layer_store = None
         worker.chunk_fulltext_store = None
         worker.require_layer_vectors = False
+        runtime = IndexRuntime(
+            snapshot=SimpleNamespace(
+                generation_id="generation-test",
+                state="active",
+                embedding_fingerprint="a" * 64,
+                chunk_collection_name="fake_chunks",
+                layer_collection_name=None,
+            ),
+            embedding_engine=SimpleNamespace(assert_fingerprint=lambda _: None),
+            vector_store=SimpleNamespace(collection_name="fake_chunks"),
+            layer_store=None,
+        )
         result = worker._process_document(
             {
                 "file_id": file_id,
                 "workspace_id": workspace_id,
                 "user_id": user_id,
+                "index_generation_id": "generation-test",
             },
             task_id=88,
+            runtime=runtime,
         )
 
         assert CapturingProcessor.document_type == "laws"

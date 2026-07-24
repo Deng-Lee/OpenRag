@@ -8,27 +8,29 @@ Environment variables:
 import logging
 import math
 import os
+from uuid import uuid4
 from numbers import Real
 from typing import Optional
 
 from pymilvus import (
     Collection,
-    CollectionSchema,
     DataType,
-    FieldSchema,
     MilvusException,
     connections,
     utility,
 )
+from openrag.indexing.milvus_schema import read_collection_metadata
 
 logger = logging.getLogger(__name__)
 
 from .errors import (
+    VectorCollectionUnavailableError,
     VectorSchemaMismatchError,
     VectorWriteIncompleteError,
 )
 
 _COLLECTION = "openrag_chunks"
+LEGACY_CHUNK_COLLECTION = _COLLECTION
 _TEXT_MAX_LEN = 65535
 # Milvus 布尔表达式过长或边界情况可能触发服务端异常；超过则不在 expr 里过滤，改为内存过滤
 _MAX_FILE_IDS_IN_EXPR = 512
@@ -76,72 +78,130 @@ class MilvusStore:
 
     def __init__(
         self,
+        collection_name: str,
+        dimension: int,
         host: str | None = None,
         port: str | int | None = None,
-        collection_name: str = _COLLECTION,
-        dimension: int = 1536,
+        expected_schema_version: int = 1,
+        expected_embedding_fingerprint: str | None = None,
+        connection_role: str = "runtime",
+        user: str | None = None,
+        password: str | None = None,
+        secure: bool = False,
+        connection_timeout_seconds: int = 10,
     ):
         self.host = host or os.environ.get("MILVUS_HOST", "localhost")
         self.port = int(port or os.environ.get("MILVUS_PORT", "19530"))
         self.collection_name = collection_name
         self.dimension = dimension
+        self.expected_schema_version = expected_schema_version
+        self.expected_embedding_fingerprint = expected_embedding_fingerprint
+        self.connection_role = connection_role
+        self.user = user or os.environ.get("MILVUS_RUNTIME_USER")
+        self.password = password or os.environ.get("MILVUS_RUNTIME_PASSWORD")
+        self.secure = secure
+        self.connection_timeout_seconds = connection_timeout_seconds
+        self._connection_alias = f"openrag_runtime_{uuid4().hex}"
         self._collection: Optional[Collection] = None
 
         self._connect()
-        self._ensure_collection()
+        self._load_and_validate_collection()
 
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
 
     def _connect(self) -> None:
-        alias = "default"
         try:
-            connections.connect(alias=alias, host=self.host, port=self.port)
+            kwargs = {
+                "alias": self._connection_alias,
+                "host": self.host,
+                "port": self.port,
+                "secure": self.secure,
+                "timeout": self.connection_timeout_seconds,
+            }
+            if self.user:
+                kwargs.update(user=self.user, password=self.password or "")
+            connections.connect(**kwargs)
             logger.info("Connected to Milvus at %s:%s", self.host, self.port)
         except MilvusException as exc:
             logger.error("Failed to connect to Milvus: %s", exc)
             raise
 
-    def _ensure_collection(self) -> None:
-        if utility.has_collection(self.collection_name):
-            existing = Collection(self.collection_name)
-            existing_dim = None
-            for field in existing.schema.fields:
-                if field.dtype == DataType.FLOAT_VECTOR:
-                    existing_dim = field.params.get("dim")
-                    break
-            if existing_dim is None or int(existing_dim) != self.dimension:
-                raise VectorSchemaMismatchError(
-                    f"Collection {self.collection_name!r} dimension {existing_dim} "
-                    f"does not match configured dimension {self.dimension}"
-                )
-            else:
-                self._collection = existing
-                self._collection.load()
-                logger.info("Loaded existing collection '%s'", self.collection_name)
-                return
-
-        fields = [
-            FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, is_primary=True, max_length=64),
-            FieldSchema(name="file_id", dtype=DataType.INT64),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=_TEXT_MAX_LEN),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dimension),
-            FieldSchema(name="page", dtype=DataType.INT64),
-            FieldSchema(name="level", dtype=DataType.INT64),
-            FieldSchema(name="block_type", dtype=DataType.VARCHAR, max_length=32),
-        ]
-        schema = CollectionSchema(fields=fields, description="OpenRag document chunks")
-        self._collection = Collection(name=self.collection_name, schema=schema)
-
-        index_params = {
-            "metric_type": "COSINE",
-            "index_type": "IVF_FLAT",
-            "params": {"nlist": 128},
-        }
-        self._collection.create_index(field_name="embedding", index_params=index_params)
+    def _load_and_validate_collection(self) -> None:
+        if not utility.has_collection(
+            self.collection_name, using=self._connection_alias
+        ):
+            raise VectorCollectionUnavailableError(
+                f"Runtime Collection {self.collection_name!r} does not exist"
+            )
+        self._collection = Collection(
+            self.collection_name, using=self._connection_alias
+        )
+        self.validate_manifest()
         self._collection.load()
-        logger.info("Created and loaded new collection '%s'", self.collection_name)
+
+    def describe_schema(self) -> dict:
+        fields = {field.name: field for field in self._collection.schema.fields}
+        indexes = [
+            dict(index.params or {})
+            for index in self._collection.indexes
+            if index.field_name == "embedding"
+        ]
+        return {
+            "fields": fields,
+            "indexes": indexes,
+            "metadata": read_collection_metadata(self._collection),
+        }
+
+    def validate_manifest(self) -> None:
+        description = self.describe_schema()
+        fields = description["fields"]
+        required = {
+            "chunk_id",
+            "file_id",
+            "text",
+            "embedding",
+            "page",
+            "level",
+            "block_type",
+        }
+        if self.expected_schema_version >= 2:
+            required.add("workspace_id")
+        vector = fields.get("embedding")
+        metrics = {
+            str(index.get("metric_type", "")).upper()
+            for index in description["indexes"]
+        }
+        fingerprint = str(description["metadata"].get("embedding_fingerprint", ""))
+        observed_version = str(description["metadata"].get("schema_version", ""))
+        types_valid = all(
+            fields.get(name) is not None and fields[name].dtype == dtype
+            for name, dtype in {
+                "file_id": DataType.INT64,
+                "text": DataType.VARCHAR,
+                "embedding": DataType.FLOAT_VECTOR,
+            }.items()
+        )
+        if (
+            not required.issubset(fields)
+            or vector is None
+            or vector.dtype != DataType.FLOAT_VECTOR
+            or not types_valid
+            or int(vector.params.get("dim") or 0) != self.dimension
+            or "COSINE" not in metrics
+            or (
+                observed_version
+                and observed_version != str(self.expected_schema_version)
+            )
+            or (
+                self.expected_embedding_fingerprint
+                and fingerprint != self.expected_embedding_fingerprint
+            )
+        ):
+            raise VectorSchemaMismatchError(
+                f"Collection {self.collection_name!r} does not match runtime manifest"
+            )
 
     # ------------------------------------------------------------------
     # Insert
@@ -151,6 +211,7 @@ class MilvusStore:
         self,
         file_id: int,
         chunk_embeddings: list[tuple],
+        workspace_id: int | None = None,
     ) -> int:
         """Insert chunk-embedding pairs into Milvus.
 
@@ -181,7 +242,14 @@ class MilvusStore:
             levels.append(getattr(chunk, "level", 0))
             block_types.append(str(getattr(chunk, "block_type", "text"))[:32])
 
-        data = [chunk_ids, file_ids, texts, embeddings, pages, levels, block_types]
+        data = [chunk_ids, file_ids]
+        if getattr(self, "expected_schema_version", 1) >= 2:
+            if workspace_id is None:
+                raise VectorWriteIncompleteError(
+                    "Schema v2 chunk writes require workspace_id"
+                )
+            data.append([int(workspace_id)] * len(chunk_ids))
+        data.extend([texts, embeddings, pages, levels, block_types])
         try:
             mutation_result = self._collection.insert(data)
             self._assert_insert_count(len(chunk_ids), mutation_result)
@@ -203,17 +271,26 @@ class MilvusStore:
             chunk, embedding = pair
             chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
             if not chunk_id:
-                raise VectorWriteIncompleteError("Every chunk vector must have a chunk ID")
+                raise VectorWriteIncompleteError(
+                    "Every chunk vector must have a chunk ID"
+                )
             chunk_ids.append(chunk_id[:64])
-            if not isinstance(embedding, (list, tuple)) or len(embedding) != self.dimension:
+            if (
+                not isinstance(embedding, (list, tuple))
+                or len(embedding) != self.dimension
+            ):
                 raise VectorWriteIncompleteError("Chunk vector dimension is invalid")
             values = []
             for value in embedding:
                 if isinstance(value, bool) or not isinstance(value, Real):
-                    raise VectorWriteIncompleteError("Chunk vector contains invalid values")
+                    raise VectorWriteIncompleteError(
+                        "Chunk vector contains invalid values"
+                    )
                 number = float(value)
                 if not math.isfinite(number):
-                    raise VectorWriteIncompleteError("Chunk vector contains invalid values")
+                    raise VectorWriteIncompleteError(
+                        "Chunk vector contains invalid values"
+                    )
                 values.append(number)
             if math.sqrt(sum(value * value for value in values)) <= 1e-12:
                 raise VectorWriteIncompleteError("Chunk vector must not be zero")
@@ -230,21 +307,12 @@ class MilvusStore:
             )
 
     def probe(self) -> None:
-        if not utility.has_collection(self.collection_name):
+        if not utility.has_collection(
+            self.collection_name, using=self._connection_alias
+        ):
             raise RuntimeError("Milvus chunk collection is unavailable")
+        self.validate_manifest()
         self._collection.load()
-        for field in self._collection.schema.fields:
-            if field.dtype == DataType.FLOAT_VECTOR:
-                existing_dim = field.params.get("dim")
-                if existing_dim is None or int(existing_dim) != self.dimension:
-                    raise VectorSchemaMismatchError(
-                        f"Collection {self.collection_name!r} dimension {existing_dim} "
-                        f"does not match configured dimension {self.dimension}"
-                    )
-                return
-        raise VectorSchemaMismatchError(
-            f"Collection {self.collection_name!r} has no float vector field"
-        )
 
     # ------------------------------------------------------------------
     # Search
@@ -297,7 +365,9 @@ class MilvusStore:
         schema_names = {f.name for f in self._collection.schema.fields}
         output_fields = [f for f in wanted_outputs if f in schema_names]
         if not output_fields:
-            output_fields = non_vector_output_field_names(self._collection.schema.fields)
+            output_fields = non_vector_output_field_names(
+                self._collection.schema.fields
+            )
         if not output_fields:
             raise RuntimeError(
                 f"Milvus collection {self.collection_name!r} has no scalar fields for search "
@@ -323,15 +393,23 @@ class MilvusStore:
                         continue
                 except (TypeError, ValueError):
                     continue
-            hits.append({
-                "chunk_id": hit.entity.get("chunk_id"),
-                "file_id": fid,
-                "text": hit.entity.get("text"),
-                "score": hit.score,
-                "page": hit.entity.get("page", 0) if "page" in schema_names else 0,
-                "level": hit.entity.get("level", 0) if "level" in schema_names else 0,
-                "block_type": hit.entity.get("block_type", "text") if "block_type" in schema_names else "text",
-            })
+            hits.append(
+                {
+                    "chunk_id": hit.entity.get("chunk_id"),
+                    "file_id": fid,
+                    "text": hit.entity.get("text"),
+                    "score": hit.score,
+                    "page": hit.entity.get("page", 0) if "page" in schema_names else 0,
+                    "level": (
+                        hit.entity.get("level", 0) if "level" in schema_names else 0
+                    ),
+                    "block_type": (
+                        hit.entity.get("block_type", "text")
+                        if "block_type" in schema_names
+                        else "text"
+                    ),
+                }
+            )
             if post_filter is not None and expr is None and len(hits) >= top_k:
                 break
         return hits
