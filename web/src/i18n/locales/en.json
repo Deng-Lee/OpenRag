@@ -232,6 +232,7 @@
       "no_workspace": "Please select a workspace first",
       "empty_folder": "Empty folders cannot be uploaded",
       "no_uploadable": "No uploadable files (all filtered out)",
+      "pdf_paddleocr_only": "PaddleOCR folder upload only supports PDF files",
       "skip_junk": "Hidden/system file, skipped",
       "skip_unsupported": "Unsupported type {{ext}}, skipped",
       "skip_too_large": "Exceeds 100MB, skipped",
@@ -253,8 +254,9 @@
       "pdf_error": "Failed to render PDF"
     },
     "parser_types": {
-      "auto": "Auto Detect",
-      "pdf": "PDF Parser",
+      "auto": "Auto Detect (PaddleOCR for PDF)",
+      "pdf": "PDF (PaddleOCR)",
+      "deepdoc": "PDF (DeepDoc)",
       "docx": "Word Document Parser",
       "xlsx": "Excel Parser",
       "pptx": "PowerPoint Parser",

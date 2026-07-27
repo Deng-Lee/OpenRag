@@ -17,6 +17,8 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as FileModel, ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace
+from openrag.parsers.selection import resolve_pdf_default_parser_type
+from openrag.services.document_retry_status import document_conflict_detail
 from openrag.services.file_deletion import delete_vectors_for_file_across_generations
 from openrag.services.task_service import TaskService
 from openrag.services.trace_service import TraceService
@@ -78,6 +80,7 @@ ALLOWED_MIME_TYPES = [
 SUPPORTED_PARSER_TYPES = [
     "auto",
     "pdf",
+    "deepdoc",
     "docx",
     "xlsx",
     "pptx",
@@ -113,12 +116,31 @@ _PARSER_TYPE_MIME_MAP = {
     "html": "text/html",
     "csv": "text/csv",
     "pdf": "application/pdf",
+    "deepdoc": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "json": "application/json",
     "epub": "application/epub+zip",
 }
+_PDF_MAGIC = b"%PDF-"
+
+
+def _is_pdf_filename(filename: str) -> bool:
+    return posixpath.splitext((filename or "").lower())[1] == ".pdf"
+
+
+def _has_pdf_magic(file_content: bytes) -> bool:
+    return bool(file_content) and file_content.startswith(_PDF_MAGIC)
+
+
+def _assert_paddleocr_pdf_content(file_content: bytes) -> None:
+    if _has_pdf_magic(file_content):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="PaddleOCR parser only supports PDF files",
+    )
 
 
 def resolve_effective_mime_type(
@@ -147,10 +169,11 @@ def is_processing_supported(
     content_type: Optional[str], filename: str, parser_type: Optional[str] = None
 ) -> bool:
     """Check whether a file can enter processing pipeline."""
-    return (
-        resolve_effective_mime_type(content_type, filename, parser_type)
-        in ALLOWED_MIME_TYPES
-    )
+    effective_mime = resolve_effective_mime_type(content_type, filename, parser_type)
+    parser_hint = (parser_type or "").strip().lower()
+    if parser_hint in {"pdf", "deepdoc"}:
+        return _is_pdf_filename(filename)
+    return effective_mime in ALLOWED_MIME_TYPES
 
 
 def validate_path(path: str) -> str:
@@ -469,6 +492,8 @@ def ingest_new_file(
                 detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
             )
 
+        parser_type = resolve_pdf_default_parser_type(upload_filename, parser_type)
+
         normalized_tag = _normalize_tag(tag)
 
         # Reject over-long file names up front (before MinIO/DB writes) so the
@@ -566,12 +591,24 @@ def ingest_new_file(
                 },
                 error_message="duplicate_file",
             )
+            detail = f"File already exists at {file_uri}"
+            if duplicate_status_code == status.HTTP_409_CONFLICT:
+                detail = document_conflict_detail(db, existing_file, file_uri)
             raise HTTPException(
                 status_code=duplicate_status_code,
-                detail=f"File already exists at {file_uri}",
+                detail=detail,
             )
 
+        parser_hint = (parser_type or "").strip().lower()
         ct = resolve_effective_mime_type(content_type, upload_filename, parser_type)
+        if parser_hint == "pdf":
+            _assert_paddleocr_pdf_content(file_content)
+            ct = "application/pdf"
+            processing_supported = True
+        else:
+            processing_supported = is_processing_supported(
+                content_type, upload_filename, parser_type
+            )
         _safe_span(
             trace_service,
             "upload.validate",
@@ -586,7 +623,7 @@ def ingest_new_file(
                 "target_uri": file_uri,
                 "mime_type": ct,
                 "file_size": file_size,
-                "supported_for_processing": ct in ALLOWED_MIME_TYPES,
+                "supported_for_processing": processing_supported,
             },
         )
         minio_storage = MinioStorage()
@@ -632,15 +669,27 @@ def ingest_new_file(
                     detail="Tag already in use",
                 ) from exc
             if kind == "uri":
+                detail = f"File already exists at {file_uri}"
+                if duplicate_status_code == status.HTTP_409_CONFLICT:
+                    existing_file = (
+                        db.query(FileModel)
+                        .filter(
+                            FileModel.uri == file_uri,
+                            FileModel.workspace_id == workspace.id,
+                        )
+                        .first()
+                    )
+                    if existing_file is not None:
+                        detail = document_conflict_detail(db, existing_file, file_uri)
                 raise HTTPException(
                     status_code=duplicate_status_code,
-                    detail=f"File already exists at {file_uri}",
+                    detail=detail,
                 ) from exc
             raise
         db.refresh(file_record)
 
         task_record: Optional[Task] = None
-        if ct in ALLOWED_MIME_TYPES:
+        if processing_supported:
             task_service = TaskService(db)
             task_record = task_service.create_task(
                 workspace_id=workspace.id,
@@ -660,7 +709,7 @@ def ingest_new_file(
                 "workspace_id": workspace.id,
                 "file_uri": file_uri,
                 "document_type": normalized_document_type,
-                "processing_supported": ct in ALLOWED_MIME_TYPES,
+                "processing_supported": processing_supported,
             },
             output_summary={
                 "file_id": file_record.id,
@@ -716,6 +765,8 @@ def replace_file_content(
             detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
         )
 
+    parser_type = resolve_pdf_default_parser_type(file.name, parser_type)
+
     file_size = len(new_content)
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(
@@ -723,10 +774,14 @@ def replace_file_content(
             detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
         )
 
+    parser_hint = (parser_type or "").strip().lower()
     effective_mime = resolve_effective_mime_type(
         content_type or file.mime_type, file.name, parser_type
     )
-    if effective_mime not in ALLOWED_MIME_TYPES:
+    if parser_hint == "pdf":
+        _assert_paddleocr_pdf_content(new_content)
+        effective_mime = "application/pdf"
+    elif not is_processing_supported(content_type or file.mime_type, file.name, parser_type):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File type {effective_mime} is not supported for processing",
@@ -739,7 +794,7 @@ def replace_file_content(
     cleanup_file_processing_data(file, workspace.slug, db)
     db.commit()
 
-    ct = resolve_effective_mime_type(content_type or file.mime_type, file.name, parser_type)
+    ct = effective_mime
     minio_storage = MinioStorage()
     minio_storage.put_file(workspace.slug, file.uri, new_content, content_type=ct)
 
@@ -807,16 +862,24 @@ def _move_replace_no_intermediate_commit(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
         )
+    parser_type = resolve_pdf_default_parser_type(target_uri, parser_type)
     file_size = len(new_content)
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
         )
+    target_name = posixpath.basename(target_uri)
+    parser_hint = (parser_type or "").strip().lower()
     effective_mime = resolve_effective_mime_type(
-        content_type or file.mime_type, posixpath.basename(target_uri), parser_type
+        content_type or file.mime_type, target_name, parser_type
     )
-    if effective_mime not in ALLOWED_MIME_TYPES:
+    if parser_hint == "pdf":
+        _assert_paddleocr_pdf_content(new_content)
+        effective_mime = "application/pdf"
+    elif not is_processing_supported(
+        content_type or file.mime_type, target_name, parser_type
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File type {effective_mime} is not supported for processing",
@@ -929,13 +992,18 @@ def upsert_file_by_tag(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
         )
+    parser_type = resolve_pdf_default_parser_type(basename, parser_type)
     if len(file_content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
         )
+    parser_hint = (parser_type or "").strip().lower()
     effective_mime = resolve_effective_mime_type(content_type, basename, parser_type)
-    if effective_mime not in ALLOWED_MIME_TYPES:
+    if parser_hint == "pdf":
+        _assert_paddleocr_pdf_content(file_content)
+        effective_mime = "application/pdf"
+    elif not is_processing_supported(content_type, basename, parser_type):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File type {effective_mime} is not supported for processing",

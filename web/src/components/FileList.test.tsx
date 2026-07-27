@@ -35,8 +35,9 @@ vi.mock('react-i18next', () => ({
         'files.fields.parser_type': 'Parser',
         'files.fields.document_type': 'Document Type',
         'files.messages.reprocess_hint': 'Hint',
-        'files.parser_types.auto': 'auto',
-        'files.parser_types.pdf': 'pdf',
+        'files.parser_types.auto': 'Auto (PaddleOCR for PDF)',
+        'files.parser_types.pdf': 'PDF (PaddleOCR)',
+        'files.parser_types.deepdoc': 'PDF (DeepDoc)',
         'files.parser_types.docx': 'docx',
         'files.parser_types.xlsx': 'xlsx',
         'files.parser_types.pptx': 'pptx',
@@ -271,7 +272,65 @@ describe('FileList', () => {
     fireEvent.click(screen.getByRole('button', { name: 'OK' }));
 
     await waitFor(() => {
-      expect(reprocessMock).toHaveBeenCalledWith(4, undefined, 'manual');
+      expect(reprocessMock).toHaveBeenCalledWith(4, 'auto', 'manual');
+    });
+  });
+
+  it('shows PaddleOCR and DeepDoc PDF choices in the reprocess parser dropdown', async () => {
+    renderFileList(
+      <FileList
+        files={[
+          {
+            id: 6,
+            uri: '/ocr.pdf',
+            name: 'ocr.pdf',
+            owner_id: 1,
+            is_directory: false,
+            size: 10,
+            mime_type: 'application/pdf',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+          },
+        ]}
+        onFileDeleted={vi.fn()}
+        canWrite
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('Reprocess'));
+    fireEvent.mouseDown(await screen.findByLabelText('Parser'));
+
+    expect(await screen.findByText('PDF (PaddleOCR)')).toBeInTheDocument();
+    expect(screen.getByText('PDF (DeepDoc)')).toBeInTheDocument();
+  });
+
+  it('defaults reprocess parser to the record parser_type', async () => {
+    renderFileList(
+      <FileList
+        files={[
+          {
+            id: 7,
+            uri: '/ocr.pdf',
+            name: 'ocr.pdf',
+            owner_id: 1,
+            is_directory: false,
+            size: 10,
+            mime_type: 'application/pdf',
+            created_at: '2024-01-01T00:00:00Z',
+            updated_at: '2024-01-01T00:00:00Z',
+            parser_type: 'deepdoc',
+          },
+        ]}
+        onFileDeleted={vi.fn()}
+        canWrite
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('Reprocess'));
+    fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
+
+    await waitFor(() => {
+      expect(reprocessMock).toHaveBeenCalledWith(7, 'deepdoc', 'general');
     });
   });
 
@@ -300,7 +359,7 @@ describe('FileList', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'OK' }));
 
     await waitFor(() => {
-      expect(reprocessMock).toHaveBeenCalledWith(5, undefined, 'general');
+      expect(reprocessMock).toHaveBeenCalledWith(5, 'auto', 'general');
     });
   });
 

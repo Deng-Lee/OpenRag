@@ -41,6 +41,7 @@ export interface File {
   is_directory: boolean;
   size: number;
   mime_type?: string;
+  parser_type?: string | null;
   created_at: string;
   updated_at: string;
   processing_status?: string | null;

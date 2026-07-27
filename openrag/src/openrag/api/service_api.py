@@ -21,6 +21,7 @@ from openrag.api.search_api import (
 from openrag.config import get_preview_public_web_base_url
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as DbFile
+from openrag.models.task import Task
 from openrag.models.workspace import Workspace
 from openrag.services.file_deletion import (
     _release_tag_and_soft_delete,
@@ -33,6 +34,11 @@ from openrag.services.file_ingest import (
     validate_path,
 )
 from openrag.services.preview_token_service import create_preview_token, decode_preview_token
+from openrag.services.document_retry_status import (
+    document_processing_fields,
+    retry_failed_document_processing,
+    task_retry_fields,
+)
 from openrag.services.service_token_service import (
     ServiceTokenContext,
     assert_token_workspace_permission,
@@ -174,21 +180,40 @@ def _file_summary(f: DbFile) -> dict[str, Any]:
     }
 
 
-def _document_summary(f: DbFile) -> dict[str, Any]:
-    return {
+def _document_summary(db: Session, f: DbFile) -> dict[str, Any]:
+    payload = {
         "id": f.id,
         "path": f.uri,
         "name": f.name,
         "size": f.size,
         "mime_type": f.mime_type,
         "tag": f.tag,
-        "processing_status": f.processing_status.value if f.processing_status else None,
         "updated_at": f.updated_at.isoformat() if f.updated_at else None,
     }
+    payload.update(document_processing_fields(db, f))
+    return payload
 
 
-def _upload_response_dict(file_record: DbFile, task_id: int | None) -> dict[str, Any]:
-    return {
+def _get_service_document_by_id(db: Session, workspace_id: int, document_id: int) -> DbFile:
+    row = (
+        db.query(DbFile)
+        .filter(
+            DbFile.id == document_id,
+            DbFile.workspace_id == workspace_id,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    return row
+
+
+def _upload_response_dict(
+    db: Session, file_record: DbFile, task_record: Task | None
+) -> dict[str, Any]:
+    payload = {
         "id": file_record.id,
         "path": file_record.uri,
         "name": file_record.name,
@@ -200,8 +225,11 @@ def _upload_response_dict(file_record: DbFile, task_id: int | None) -> dict[str,
         "tag": file_record.tag,
         "created_at": file_record.created_at.isoformat() if file_record.created_at else None,
         "updated_at": file_record.updated_at.isoformat() if file_record.updated_at else None,
-        "task_id": task_id,
     }
+    payload.update(document_processing_fields(db, file_record))
+    if task_record is not None:
+        payload.update(task_retry_fields(task_record))
+    return payload
 
 
 def _resolve_url_prefix(url_prefix: Optional[str], path_prefix: Optional[str]) -> str:
@@ -335,7 +363,7 @@ async def service_upload_document(
         duplicate_status_code=status.HTTP_409_CONFLICT,
         tag=tag,
     )
-    return _upload_response_dict(file_record, task_record.id if task_record else None)
+    return _upload_response_dict(db, file_record, task_record)
 
 
 @router.put("/workspaces/{workspace_name}/documents/by-path")
@@ -373,7 +401,7 @@ async def service_replace_document(
         parser_type=parser_type,
     )
     db.refresh(row)
-    return _upload_response_dict(row, task.id if task else None)
+    return _upload_response_dict(db, row, task)
 
 
 @router.put("/workspaces/{workspace_name}/documents/upsert-by-tag")
@@ -410,7 +438,7 @@ async def service_upsert_document_by_tag(
         create_dirs=create_dirs,
     )
     status_code = status.HTTP_201_CREATED if action == "created" else status.HTTP_200_OK
-    payload = _upload_response_dict(file_record, task_record.id if task_record else None)
+    payload = _upload_response_dict(db, file_record, task_record)
     payload["action"] = action
     return JSONResponse(status_code=status_code, content=payload)
 
@@ -446,6 +474,48 @@ async def service_delete_document_by_path(
         )
     delete_file_with_storage(db, row, ws)
     return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "File deleted", "async": False})
+
+
+@router.post("/workspaces/{workspace_name}/documents/by-path/retry")
+async def service_retry_document_by_path(
+    workspace_name: str,
+    path: str = Query(..., description="Full file logical path"),
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    p = validate_path(path)
+    file_record = (
+        db.query(DbFile)
+        .filter(
+            DbFile.workspace_id == ws.id,
+            DbFile.uri == p,
+            DbFile.is_directory.is_(False),
+            DbFile.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if file_record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    retry_failed_document_processing(db, file_record)
+    db.refresh(file_record)
+    return _document_summary(db, file_record)
+
+
+@router.post("/workspaces/{workspace_name}/documents/{document_id}/retry")
+async def service_retry_document_by_id(
+    workspace_name: str,
+    document_id: int,
+    ctx: ServiceTokenContext = Depends(get_service_token_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    ws = require_workspace_for_name(db, workspace_name)
+    assert_token_workspace_permission(ctx, ws.id, "write")
+    file_record = _get_service_document_by_id(db, ws.id, document_id)
+    retry_failed_document_processing(db, file_record)
+    db.refresh(file_record)
+    return _document_summary(db, file_record)
 
 
 @router.post("/workspaces/multi_space/search", response_model=MultiWorkspaceSearchResponse)
@@ -692,18 +762,15 @@ async def service_document_by_path(
     ws = require_workspace_for_name(db, workspace_name)
     assert_token_workspace_permission(ctx, ws.id, "read")
     f = get_file_document_by_path(db, ws.id, path)
-    return {
-        "id": f.id,
-        "path": f.uri,
-        "name": f.name,
-        "size": f.size,
-        "mime_type": f.mime_type,
-        "owner_id": f.owner_id,
-        "processing_status": f.processing_status.value if f.processing_status else None,
-        "parser_type": f.parser_type,
-        "created_at": f.created_at.isoformat() if f.created_at else None,
-        "updated_at": f.updated_at.isoformat() if f.updated_at else None,
-    }
+    payload = _document_summary(db, f)
+    payload.update(
+        {
+            "owner_id": f.owner_id,
+            "parser_type": f.parser_type,
+            "created_at": f.created_at.isoformat() if f.created_at else None,
+        }
+    )
+    return payload
 
 
 @router.get("/workspaces/{workspace_name}/documents/by-tag")
@@ -727,7 +794,7 @@ async def service_document_by_tag(
     )
     if f is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No document with this tag")
-    return _document_summary(f)
+    return _document_summary(db, f)
 
 
 @router.get("/workspaces/{workspace_name}/documents/search-by-name")
@@ -744,7 +811,7 @@ async def service_search_documents_by_name(
     assert_token_workspace_permission(ctx, ws.id, "read")
     rows, total = search_documents_by_name(db, ws.id, filename, path_prefix, skip, limit)
     return {
-        "items": [_document_summary(f) for f in rows],
+        "items": [_document_summary(db, f) for f in rows],
         "total": total,
         "skip": skip,
         "limit": limit,

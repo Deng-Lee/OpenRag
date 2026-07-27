@@ -28,6 +28,7 @@ from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File, ProcessingStatus
 from openrag.models.workspace import Workspace
 from openrag.parsers.parser_registry import ParserRegistry
+from openrag.parsers.selection import resolve_pdf_default_parser_type
 from openrag.services.canonical_chunk_source import (
     build_canonical_chunk_source,
     canonical_source_metadata,
@@ -194,13 +195,17 @@ def _parse_span_profile(parser) -> Optional[dict]:
     stages = profile.get("stages")
     if not stages:
         return None
-    return {
+    out = {
         "total_ms": profile.get("total_ms"),
         "page_count": profile.get("page_count"),
         "n_tables": profile.get("n_tables"),
         "status": profile.get("status"),
         "stages": stages,
     }
+    for key in ("block_count", "poll_count"):
+        if key in profile:
+            out[key] = profile.get(key)
+    return out
 
 
 class DocumentProcessor:
@@ -381,21 +386,32 @@ class DocumentProcessor:
         normalized_document_type = normalize_document_type(document_type)
         file_record.document_type = normalized_document_type
         trace_service = TraceService(self.db)
+        requested_parser_type = parser_type
+        parser_type = resolve_pdf_default_parser_type(file_path, parser_type)
 
         # Step 1: Parse（策略仅在 ParserRegistry / Factory；此处只编排）
         file_record.processing_status = ProcessingStatus.parsing
         self.db.commit()
+        if progress_callback:
+            progress_callback(5)
         parser = self.parser_registry.get_parser(file_path, parser_type)
-        print(
-            "  [PIPELINE] Step 1 — "
-            f"selected_parser={parser.__class__.__module__}.{parser.__class__.__name__}, "
-            f"parser_type={parser_type}, file_path={file_path}"
-        )
+        parser_label = f"{parser.__class__.__module__}.{parser.__class__.__name__}"
+        if parser_type == "pdf":
+            print(
+                "  [PIPELINE] Step 1 — "
+                f"selected_parser={parser_label}, parser_type={parser_type}"
+            )
+        else:
+            print(
+                "  [PIPELINE] Step 1 — "
+                f"selected_parser={parser_label}, parser_type={parser_type}, file_path={file_path}"
+            )
         parse_span = _safe_start_span(
             trace_service,
             "parse.document",
             input_summary={
                 "file_id": file_id,
+                "requested_parser_type": requested_parser_type,
                 "parser_type": parser_type,
                 "parser_name": _parser_name(parser),
                 "parser_version": _parser_version(parser),
@@ -455,9 +471,10 @@ class DocumentProcessor:
         )
         print(f"  [PIPELINE] Step 1 — Parsed {len(text_blocks)} text blocks")
         for i, b in enumerate(text_blocks[:3]):
-            print(
-                f"    block[{i}]: level={b.level}, type={b.block_type}, text={b.text[:80]!r}"
-            )
+            if parser_type == "pdf":
+                print(f"    block[{i}]: level={b.level}, type={b.block_type}")
+            else:
+                print(f"    block[{i}]: level={b.level}, type={b.block_type}, text={b.text[:80]!r}")
         if progress_callback:
             progress_callback(20)
 
@@ -612,9 +629,10 @@ class DocumentProcessor:
             f"min_chunk_tokens={min_chunk_tokens}, chunks={len(chunks)}"
         )
         for i, c in enumerate(chunks[:3]):
-            print(
-                f"    chunk[{i}]: level={c.level}, type={c.block_type}, text={c.text[:80]!r}"
-            )
+            if parser_type == "pdf":
+                print(f"    chunk[{i}]: level={c.level}, type={c.block_type}")
+            else:
+                print(f"    chunk[{i}]: level={c.level}, type={c.block_type}, text={c.text[:80]!r}")
         if progress_callback:
             progress_callback(35)
 

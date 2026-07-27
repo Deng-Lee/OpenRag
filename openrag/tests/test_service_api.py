@@ -16,6 +16,8 @@ from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
 from openrag.api.service_api import _resolve_scope_paths
 from openrag.models import Base, DocumentChunk, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
+from openrag.models.file import ProcessingStatus
+from openrag.models.task import Task, TaskStatus
 from openrag.security import hash_password
 from openrag.services.file_ingest import ensure_directory_path
 from openrag.services.preview_token_service import decode_preview_token
@@ -29,6 +31,19 @@ engine = create_engine(
     poolclass=StaticPool,
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def _assert_initial_task_quota(body: dict) -> None:
+    assert body["processing_status"] == "pending"
+    assert body["processing_error"] is None
+    assert body["task_id"] is not None
+    assert body["task_uuid"] is not None
+    assert body["task_status"] == "pending"
+    assert body["task_progress"] == 0
+    assert body["retry_count"] == 0
+    assert body["max_retries"] == 3
+    assert body["remaining_retries"] == 3
+    assert body["can_retry"] is False
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +195,49 @@ def _chunk(
     db.commit()
     db.refresh(c)
     return c
+
+
+def _failed_process_task(
+    db: Session,
+    ws: Workspace,
+    owner: User,
+    file: File,
+    *,
+    task_id: str,
+    retry_count: int,
+    max_retries: int,
+) -> Task:
+    task = Task(
+        task_id=task_id,
+        workspace_id=ws.id,
+        user_id=owner.id,
+        file_id=file.id,
+        task_type="process_document",
+        status=TaskStatus.FAILURE,
+        progress=65,
+        retry_count=retry_count,
+        max_retries=max_retries,
+        error="milvus timeout",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _assert_retry_requeued(body: dict, file: File, task: Task) -> None:
+    assert body["id"] == file.id
+    assert body["path"] == file.uri
+    assert body["processing_status"] == "pending"
+    assert body["processing_error"] is None
+    assert body["task_id"] == task.id
+    assert body["task_uuid"] == task.task_id
+    assert body["task_status"] == "pending"
+    assert body["task_progress"] == 0
+    assert body["retry_count"] == 1
+    assert body["max_retries"] == 3
+    assert body["remaining_retries"] == 2
+    assert body["can_retry"] is False
 
 
 def test_service_list_workspaces_requires_token(client: TestClient, workspace: Workspace) -> None:
@@ -357,6 +415,316 @@ def test_service_document_by_path_ok(
     assert r.status_code == 200
     assert r.json()["path"] == "/readme.md"
     assert r.json()["name"] == "readme.md"
+
+
+def test_service_document_by_path_includes_retry_budget(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = _failed_process_task(
+        db,
+        workspace,
+        owner,
+        file,
+        task_id="by-path-failed-task",
+        retry_count=1,
+        max_retries=3,
+    )
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-path",
+        params={"path": "/docs/fail.txt"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == file.id
+    assert body["path"] == "/docs/fail.txt"
+    assert body["name"] == "fail.txt"
+    assert body["size"] == 3
+    assert body["mime_type"] == "text/plain"
+    assert body["owner_id"] == owner.id
+    assert body["parser_type"] == file.parser_type
+    assert body["created_at"] == file.created_at.isoformat()
+    assert body["processing_status"] == "failed"
+    assert body["processing_error"] == "milvus timeout"
+    assert body["task_id"] == task.id
+    assert body["task_uuid"] == "by-path-failed-task"
+    assert body["task_status"] == "failure"
+    assert body["task_progress"] == 65
+    assert body["retry_count"] == 1
+    assert body["max_retries"] == 3
+    assert body["remaining_retries"] == 2
+    assert body["can_retry"] is True
+
+
+def test_service_document_by_tag_includes_retry_budget(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.tag = "retry-tag"
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = _failed_process_task(
+        db,
+        workspace,
+        owner,
+        file,
+        task_id="by-tag-failed-task",
+        retry_count=2,
+        max_retries=3,
+    )
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-tag",
+        params={"tag": "retry-tag"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tag"] == "retry-tag"
+    assert body["processing_error"] == "milvus timeout"
+    assert body["task_id"] == task.id
+    assert body["task_uuid"] == "by-tag-failed-task"
+    assert body["task_status"] == "failure"
+    assert body["task_progress"] == 65
+    assert body["retry_count"] == 2
+    assert body["max_retries"] == 3
+    assert body["remaining_retries"] == 1
+    assert body["can_retry"] is True
+
+
+def test_service_search_by_name_includes_retry_budget_for_failed_document(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.tag = "failed-doc"
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = Task(
+        task_id="failed-task",
+        workspace_id=workspace.id,
+        user_id=owner.id,
+        file_id=file.id,
+        task_type="process_document",
+        status=TaskStatus.FAILURE,
+        progress=65,
+        retry_count=1,
+        max_retries=3,
+    )
+    db.add(task)
+    db.commit()
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/search-by-name",
+        params={"path_prefix": "/docs"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["id"] == file.id
+    assert item["path"] == "/docs/fail.txt"
+    assert item["name"] == "fail.txt"
+    assert item["size"] == 3
+    assert item["mime_type"] == "text/plain"
+    assert item["tag"] == "failed-doc"
+    assert item["processing_status"] == "failed"
+    assert item["updated_at"] == file.updated_at.isoformat()
+    assert item["processing_error"] == "milvus timeout"
+    assert item["task_id"] == task.id
+    assert item["task_uuid"] == "failed-task"
+    assert item["task_status"] == "failure"
+    assert item["task_progress"] == 65
+    assert item["retry_count"] == 1
+    assert item["max_retries"] == 3
+    assert item["remaining_retries"] == 2
+    assert item["can_retry"] is True
+
+
+def test_service_search_by_name_exhausted_retry_budget_cannot_retry(
+    client: TestClient, db: Session, workspace: Workspace, owner: User, service_token_headers
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = Task(
+        task_id="exhausted-task",
+        workspace_id=workspace.id,
+        user_id=owner.id,
+        file_id=file.id,
+        task_type="process_document",
+        status=TaskStatus.FAILURE,
+        progress=65,
+        retry_count=3,
+        max_retries=3,
+    )
+    db.add(task)
+    db.commit()
+
+    r = client.get(
+        f"/service/v1/workspaces/{workspace.name}/documents/search-by-name",
+        params={"path_prefix": "/docs"},
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["processing_status"] == "failed"
+    assert item["processing_error"] == "milvus timeout"
+    assert item["task_id"] == task.id
+    assert item["task_uuid"] == "exhausted-task"
+    assert item["task_status"] == "failure"
+    assert item["task_progress"] == 65
+    assert item["retry_count"] == 3
+    assert item["max_retries"] == 3
+    assert item["remaining_retries"] == 0
+    assert item["can_retry"] is False
+
+
+def test_service_retry_document_by_id_resets_file_and_requeues_task(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = _failed_process_task(
+        db,
+        workspace,
+        owner,
+        file,
+        task_id="retry-by-id-task",
+        retry_count=0,
+        max_retries=3,
+    )
+    db.commit()
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/documents/{file.id}/retry",
+        headers=service_token_write_headers,
+    )
+
+    assert r.status_code == 200
+    _assert_retry_requeued(r.json(), file, task)
+    db.refresh(file)
+    db.refresh(task)
+    assert file.processing_status == ProcessingStatus.pending
+    assert file.processing_error is None
+    assert task.status == TaskStatus.PENDING
+    assert task.retry_count == 1
+    assert task.progress == 0
+    assert task.error is None
+
+
+def test_service_retry_document_by_id_exhausted_returns_409(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = _failed_process_task(
+        db,
+        workspace,
+        owner,
+        file,
+        task_id="retry-exhausted-task",
+        retry_count=3,
+        max_retries=3,
+    )
+    db.commit()
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/documents/{file.id}/retry",
+        headers=service_token_write_headers,
+    )
+
+    assert r.status_code == 409
+    db.refresh(file)
+    db.refresh(task)
+    assert file.processing_status == ProcessingStatus.failed
+    assert file.processing_error == "milvus timeout"
+    assert task.status == TaskStatus.FAILURE
+    assert task.retry_count == 3
+
+
+def test_service_retry_document_by_id_requires_write_permission(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_headers,
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    _failed_process_task(
+        db,
+        workspace,
+        owner,
+        file,
+        task_id="retry-readonly-task",
+        retry_count=0,
+        max_retries=3,
+    )
+    db.commit()
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/documents/{file.id}/retry",
+        headers=service_token_headers,
+    )
+
+    assert r.status_code == 403
+
+
+def test_service_retry_document_by_path_resets_file_and_requeues_task(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    file = _file(db, workspace, owner, "/docs/fail.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = _failed_process_task(
+        db,
+        workspace,
+        owner,
+        file,
+        task_id="retry-by-path-task",
+        retry_count=0,
+        max_retries=3,
+    )
+    db.commit()
+
+    r = client.post(
+        f"/service/v1/workspaces/{workspace.name}/documents/by-path/retry",
+        params={"path": "/docs/fail.txt"},
+        headers=service_token_write_headers,
+    )
+
+    assert r.status_code == 200
+    _assert_retry_requeued(r.json(), file, task)
+    db.refresh(file)
+    db.refresh(task)
+    assert file.processing_status == ProcessingStatus.pending
+    assert file.processing_error is None
+    assert task.status == TaskStatus.PENDING
+    assert task.retry_count == 1
+    assert task.progress == 0
+    assert task.error is None
 
 
 def test_service_wrong_workspace_name_404(
@@ -951,7 +1319,7 @@ def test_service_upload_document_201(
     body = r.json()
     assert body["path"] == "/in/n.txt"
     assert body["mime_type"] == "text/plain"
-    assert body.get("task_id") is not None
+    _assert_initial_task_quota(body)
 
 
 def test_service_upload_duplicate_409(
@@ -997,6 +1365,111 @@ def test_service_upload_duplicate_409(
     assert r.status_code == 409
 
 
+def test_service_upload_duplicate_failed_file_409_returns_retry_document(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/in",
+            name="in",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    file = _file(db, workspace, owner, "/in/dup.txt")
+    file.processing_status = ProcessingStatus.failed
+    file.processing_error = "milvus timeout"
+    task = Task(
+        task_id="failed-duplicate-task",
+        workspace_id=workspace.id,
+        user_id=owner.id,
+        file_id=file.id,
+        task_type="process_document",
+        status=TaskStatus.FAILURE,
+        retry_count=0,
+        max_retries=3,
+    )
+    db.add(task)
+    db.commit()
+
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("dup.txt", b"x", "text/plain")}
+        data = {"path": "/in"}
+        r = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "file_already_exists_processing_failed"
+    assert detail["document"]["path"] == "/in/dup.txt"
+    assert detail["document"]["processing_status"] == "failed"
+    assert detail["document"]["processing_error"] == "milvus timeout"
+    assert detail["document"]["remaining_retries"] == 3
+    assert detail["document"]["can_retry"] is True
+
+
+def test_service_upload_duplicate_completed_file_409_returns_non_retryable_document(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    _root(db, workspace, owner)
+    db.add(
+        File(
+            uri="/in",
+            name="in",
+            owner_id=owner.id,
+            workspace_id=workspace.id,
+            is_directory=True,
+            size=0,
+        )
+    )
+    file = _file(db, workspace, owner, "/in/dup.txt")
+    file.processing_status = ProcessingStatus.completed
+    task = Task(
+        task_id="stale-failed-duplicate-task",
+        workspace_id=workspace.id,
+        user_id=owner.id,
+        file_id=file.id,
+        task_type="process_document",
+        status=TaskStatus.FAILURE,
+        retry_count=0,
+        max_retries=3,
+    )
+    db.add(task)
+    db.commit()
+
+    with patch.object(MinioStorage, "put_file", return_value=None):
+        files = {"file": ("dup.txt", b"x", "text/plain")}
+        data = {"path": "/in"}
+        r = client.post(
+            f"/service/v1/workspaces/{workspace.name}/documents",
+            files=files,
+            data=data,
+            headers=service_token_write_headers,
+        )
+
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "file_already_exists"
+    assert detail["document"]["processing_status"] == "completed"
+    assert detail["document"]["remaining_retries"] == 3
+    assert detail["document"]["can_retry"] is False
+
+
 def test_service_replace_document_200(
     client: TestClient,
     db: Session,
@@ -1033,8 +1506,9 @@ def test_service_replace_document_200(
                 headers=service_token_write_headers,
             )
     assert r.status_code == 200
-    assert r.json()["path"] == "/rep.txt"
-    assert r.json().get("task_id") is not None
+    body = r.json()
+    assert body["path"] == "/rep.txt"
+    _assert_initial_task_quota(body)
 
 
 def test_ensure_directory_path_creates_nested_dirs(db: Session, workspace: Workspace, owner: User) -> None:

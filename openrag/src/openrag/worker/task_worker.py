@@ -255,10 +255,12 @@ class TaskWorker:
         heartbeat_proc.start()
 
         try:
-            # Update task to started status
-            self._update_task_status(task_id, "started", progress=0)
-
             task_type = task.get("task_type") or "process_document"
+
+            # Update task to started status
+            initial_progress = 5 if task_type == "process_document" else 0
+            self._update_task_status(task_id, "started", progress=initial_progress)
+
             if task_type == "delete_file":
                 result = self._delete_file_task(task)
             elif task_type == "delete_path_prefix":

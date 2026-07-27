@@ -55,7 +55,7 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
   const handleReprocess = (record: File) => {
     setReprocessingFile(record);
     reprocessForm.setFieldsValue({
-      parser_type: 'auto',
+      parser_type: record.parser_type || 'auto',
       document_type: record.document_type || 'general',
     });
     setIsReprocessModalOpen(true);
@@ -66,8 +66,7 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
 
     setReprocessing(true);
     try {
-      const parserType = values.parser_type === 'auto' ? undefined : values.parser_type;
-      await filesAPI.reprocess(reprocessingFile.id, parserType, values.document_type || 'general');
+      await filesAPI.reprocess(reprocessingFile.id, values.parser_type, values.document_type || 'general');
       message.success(t('files.messages.reprocess_success'));
       setIsReprocessModalOpen(false);
       reprocessForm.resetFields();
@@ -281,6 +280,7 @@ export default function FileList({ files, onFileDeleted, onFileReprocessed, load
               options={[
                 { value: 'auto', label: t('files.parser_types.auto') },
                 { value: 'pdf', label: t('files.parser_types.pdf') },
+                { value: 'deepdoc', label: t('files.parser_types.deepdoc') },
                 { value: 'docx', label: t('files.parser_types.docx') },
                 { value: 'xlsx', label: t('files.parser_types.xlsx') },
                 { value: 'pptx', label: t('files.parser_types.pptx') },

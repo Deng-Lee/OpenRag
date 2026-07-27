@@ -9,7 +9,7 @@ def test_factory_initialization():
     """测试工厂初始化"""
     factory = ParserFactory()
     assert factory._parsers == {}
-    assert len(factory._parser_classes) == 15  # 9种格式，15个扩展名
+    assert len(factory._parser_classes) == 20  # 11种格式，20个扩展名
 
 
 def test_get_parser_unsupported_format():

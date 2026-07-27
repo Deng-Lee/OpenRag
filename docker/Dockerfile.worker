@@ -67,7 +67,25 @@ COPY openrag/setup.py .
 COPY openrag/scripts/verify_worker_ragflow_bundle.py ./scripts/
 COPY openrag/scripts/prepare_ragflow_models.py ./scripts/
 
+ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
+COPY docker/tiktoken-cache/cl100k_base.tiktoken /app/tiktoken-cache/9b5ad71b2ce5302211f9c61530b329a4922fc6a4
+
 RUN pip install --no-cache-dir -e .
+
+# Fail at build time instead of silently falling back to whitespace token counts.
+RUN python - <<'PY'
+from common.token_utils import _get_encoder, num_tokens_from_string
+
+encoder = _get_encoder()
+if encoder is None:
+    raise SystemExit("cl100k_base encoding is unavailable")
+
+sample = "银行间黄金询价业务交易确认细则"
+token_count = num_tokens_from_string(sample)
+if token_count <= len(sample.split()):
+    raise SystemExit("cl100k_base Chinese token check failed")
+print(f"cl100k_base offline cache OK: {token_count} tokens")
+PY
 
 # Fail fast at build time if offline model bundle is incomplete.
 RUN python - <<'PY'

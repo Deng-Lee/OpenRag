@@ -7,7 +7,7 @@ from openrag.models import File, Task
 from openrag.storage.minio_storage import MinioStorage
 
 from tests.test_service_api import (  # noqa: F401
-    _root, _stub_app_startup, client, db, owner, workspace,
+    _assert_initial_task_quota, _root, _stub_app_startup, client, db, owner, workspace,
     service_token_headers, service_token_write_headers,
 )
 
@@ -44,6 +44,7 @@ def test_upsert_creates_returns_201(client, db, workspace, owner, service_token_
     body = r.json()
     assert body["tag"] == "t1" and body["path"] == "/a.txt"
     assert body["action"] == "created"
+    _assert_initial_task_quota(body)
     assert db.query(File).filter(File.tag == "t1", File.deleted_at.is_(None)).count() == 1
 
 
@@ -54,7 +55,9 @@ def test_upsert_update_in_place_returns_200(client, db, workspace, owner, servic
     r = _put_upsert(client, workspace, service_token_write_headers,
                     tag="t1", target_path="/a.txt", content=b"v2-longer")
     assert r.status_code == 200
-    assert r.json()["path"] == "/a.txt" and r.json()["action"] == "updated"
+    body = r.json()
+    assert body["path"] == "/a.txt" and body["action"] == "updated"
+    _assert_initial_task_quota(body)
     assert db.query(File).filter(File.tag == "t1", File.deleted_at.is_(None)).count() == 1
 
 

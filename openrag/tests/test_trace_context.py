@@ -98,11 +98,12 @@ def test_api_middleware_sets_response_header_and_clears_context():
     assert get_trace_context()["trace_id"] is None
 
 
-def test_task_worker_sets_document_processing_context(monkeypatch):
+def test_task_worker_sets_context_and_starts_document_at_five_percent(monkeypatch):
     from openrag.worker import task_worker
     from openrag.worker.task_worker import TaskWorker
 
     observed = {}
+    status_updates = []
 
     class FakeProcess:
         def __init__(self, *args, **kwargs):
@@ -122,7 +123,13 @@ def test_task_worker_sets_document_processing_context(monkeypatch):
         return {"status": "success"}
 
     monkeypatch.setattr(task_worker.multiprocessing, "Process", FakeProcess)
-    monkeypatch.setattr(TaskWorker, "_update_task_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        TaskWorker,
+        "_update_task_status",
+        lambda self, task_id, status, **kwargs: status_updates.append(
+            (task_id, status, kwargs.get("progress"))
+        ),
+    )
     monkeypatch.setattr(TaskWorker, "_process_document", fake_process_document)
 
     worker = TaskWorker(api_base_url="http://testserver")
@@ -142,4 +149,5 @@ def test_task_worker_sets_document_processing_context(monkeypatch):
     assert observed["workspace_id"] == 202
     assert observed["user_id"] == 303
     assert observed["trace_id"]
+    assert status_updates[0] == ("task-42", "started", 5)
     assert get_trace_context()["trace_id"] is None
