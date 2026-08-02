@@ -58,8 +58,12 @@ def _delete_elasticsearch_chunks_for_file_best_effort(file_id: int) -> bool:
         from openrag.database import SessionLocal
         from openrag.models.file import File as FileModel
         from openrag.models.workspace import Workspace
+        from openrag.config import get_config
         from openrag.search.es_chunk_store import create_es_chunk_store_from_config
-        from openrag.search.workspace_es_slug import build_workspace_chunks_index_name
+        from openrag.search.workspace_es_slug import (
+            build_workspace_chunks_index_name,
+            build_workspace_chunks_write_alias,
+        )
 
         store = create_es_chunk_store_from_config()
         if store is None:
@@ -72,8 +76,14 @@ def _delete_elasticsearch_chunks_for_file_best_effort(file_id: int) -> bool:
             ws = db.query(Workspace).filter(Workspace.id == f.workspace_id).first()
             if ws is None:
                 return True
-            index_name = build_workspace_chunks_index_name(ws.slug, ws.id)
-            store.delete_by_file_id(index_name, file_id)
+            legacy_index = build_workspace_chunks_index_name(ws.slug, ws.id)
+            write_alias = build_workspace_chunks_write_alias(ws.slug, ws.id)
+            target = store.resolve_write_target(
+                legacy_index=legacy_index,
+                write_alias=write_alias,
+                chunk_index_mode=get_config().elasticsearch.chunk_index_mode,
+            )
+            store.delete_by_file_id(target, file_id)
             return True
         finally:
             db.close()

@@ -7,7 +7,11 @@ import pytest
 from fastapi import HTTPException
 
 import openrag.api.search_api as sapi
-from openrag.retrieval.retrieval_service import RetrievalService
+from openrag.retrieval.retrieval_service import (
+    PermissionScopeResolutionError,
+    ResolvedFileScope,
+    RetrievalService,
+)
 
 
 class _FakeEmbeddingEngine:
@@ -41,23 +45,48 @@ def _service(vector_store):
 def _bypass_active_file_filtering(svc):
     svc._filter_to_active_file_ids = lambda file_ids: file_ids
     svc._filter_hits_to_active_files = lambda hits: hits
+    svc._validate_and_enrich_hits = (
+        lambda hits, **kwargs: (hits, {"valid_hit_count": len(hits)})
+    )
 
 
-def test_effective_file_ids_intersects_and_handles_none():
+def test_effective_file_scope_intersects_and_distinguishes_verified_global():
     svc = _service(_FakeVectorStore())
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
-    assert sorted(svc._effective_file_ids(1, 7, {2, 3, 9})) == [2, 3]
-    assert svc._effective_file_ids(1, 7, None) == [1, 2, 3]
-    assert svc._effective_file_ids(1, 7, set()) == []
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: None
-    assert sorted(svc._effective_file_ids(1, None, {5, 6})) == [5, 6]
-    assert svc._effective_file_ids(1, None, None) is None
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite(
+        [1, 2, 3]
+    )
+    assert svc._effective_file_scope(1, 7, {2, 3, 9}).allowed_file_ids == (2, 3)
+    assert svc._effective_file_scope(1, 7, None).allowed_file_ids == (1, 2, 3)
+    assert svc._effective_file_scope(1, 7, set()).is_empty
+    svc._accessible_file_ids = (
+        lambda user_id, workspace_id=None: ResolvedFileScope.verified_global()
+    )
+    assert svc._effective_file_scope(1, None, {5, 6}).allowed_file_ids == (5, 6)
+    global_scope = svc._effective_file_scope(1, None, None)
+    assert global_scope.is_verified_global
+    assert global_scope.allowed_file_ids is None
+
+
+def test_permission_resolution_failure_calls_neither_backend():
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FailingEmbeddingEngine(),
+        vector_store=_FailingVectorStore(),
+        layer_store=None,
+        fulltext_store=Mock(),
+    )
+    svc._accessible_file_ids = Mock(
+        side_effect=PermissionScopeResolutionError("permission service unavailable")
+    )
+
+    with pytest.raises(PermissionScopeResolutionError):
+        svc.search("q", user_id=1, workspace_id=7, top_k=5)
 
 
 def test_search_passes_scope_intersection_to_vector_store():
     vs = _FakeVectorStore()
     svc = _service(vs)
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite([1, 2, 3])
     svc.search("q", user_id=1, workspace_id=7, top_k=5, scope_file_ids={2, 3, 99})
     assert sorted(vs.calls[0]["file_ids"]) == [2, 3]
 
@@ -65,7 +94,7 @@ def test_search_passes_scope_intersection_to_vector_store():
 def test_empty_scope_returns_empty_without_calling_store():
     vs = _FakeVectorStore()
     svc = _service(vs)
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite([1, 2, 3])
     results = svc.search("q", user_id=1, workspace_id=7, top_k=5, scope_file_ids=set())
     assert results == []
     assert vs.calls == []
@@ -74,7 +103,7 @@ def test_empty_scope_returns_empty_without_calling_store():
 def test_no_scope_keeps_existing_behavior():
     vs = _FakeVectorStore()
     svc = _service(vs)
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: None
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.verified_global()
     svc.search("q", user_id=1, top_k=5)
     assert vs.calls[0]["file_ids"] is None
 
@@ -102,6 +131,30 @@ class _FakeFulltext:
         return {}
 
 
+class _ForbiddenFulltext:
+    def search_chunks(self, **kwargs):
+        raise AssertionError("Sparse must not run when dense weight is 1")
+
+
+class _IndependentFulltext:
+    def __init__(self, *, error=None):
+        self.calls = []
+        self.error = error
+
+    def search_chunks(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return [
+            {
+                "chunk_id": "sparse-outside-l0",
+                "file_id": 3,
+                "text": "exact identifier",
+                "sparse_score": 10.0,
+            }
+        ]
+
+
 def test_contextual_scope_limits_l0_l1_l2():
     vs = _FakeVectorStore()
     ls = _FakeLayerStore()
@@ -109,7 +162,7 @@ def test_contextual_scope_limits_l0_l1_l2():
         db=Mock(), embedding_engine=_FakeEmbeddingEngine(),
         vector_store=vs, layer_store=ls,
     )
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite([1, 2, 3])
     svc._enrich_hits = lambda hits: None
     _bypass_active_file_filtering(svc)
     svc.search(
@@ -129,7 +182,7 @@ def test_contextual_fallback_to_flat_carries_scope():
         db=Mock(), embedding_engine=_FakeEmbeddingEngine(),
         vector_store=vs, layer_store=_EmptyL0LayerStore(),
     )
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite([1, 2, 3])
     svc._enrich_hits = lambda hits: None
     _bypass_active_file_filtering(svc)
     svc.search(
@@ -146,7 +199,7 @@ def test_es_blend_filter_ids_within_scope():
         db=Mock(), embedding_engine=_FakeEmbeddingEngine(),
         vector_store=vs, layer_store=None, fulltext_store=ft,
     )
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite([1, 2, 3])
     svc._enrich_hits = lambda hits: None
     svc._resolve_es_index_names = lambda workspace_id, file_ids: ["idx"]
     _bypass_active_file_filtering(svc)
@@ -155,6 +208,84 @@ def test_es_blend_filter_ids_within_scope():
         scope_file_ids={2, 3}, vector_similarity_weight=0.7,
     )
     assert ft.calls and set(ft.calls[0]["file_ids"]) <= {2, 3}
+
+
+def test_independent_mode_weight_one_skips_sparse():
+    vs = _FakeVectorStore()
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FakeEmbeddingEngine(),
+        vector_store=vs,
+        fulltext_store=_ForbiddenFulltext(),
+        hybrid_recall_mode="independent_rrf",
+    )
+    svc._accessible_file_ids = lambda *args, **kwargs: ResolvedFileScope.finite([2])
+    _bypass_active_file_filtering(svc)
+
+    results = svc.search("q", user_id=1, top_k=5, vector_similarity_weight=1.0)
+
+    assert [result["chunk_id"] for result in results] == ["c1"]
+
+
+def test_contextual_sparse_uses_full_scope_not_l0_candidate_files():
+    vs = _FakeVectorStore()
+    ls = _FakeLayerStore()
+    fulltext = _IndependentFulltext()
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FakeEmbeddingEngine(),
+        vector_store=vs,
+        layer_store=ls,
+        fulltext_store=fulltext,
+        hybrid_recall_mode="independent_rrf",
+    )
+    svc._accessible_file_ids = lambda *args, **kwargs: ResolvedFileScope.finite([2, 3])
+    svc._resolve_es_index_names = lambda workspace_id, file_ids: ["idx"]
+    svc._enrich_hits = lambda hits: None
+    _bypass_active_file_filtering(svc)
+
+    results = svc.search(
+        "exact identifier",
+        user_id=1,
+        workspace_id=7,
+        top_k=5,
+        use_contextual=True,
+        retrieval_strategy="deep",
+        vector_similarity_weight=0.5,
+    )
+
+    assert {result["chunk_id"] for result in results} == {"c1", "sparse-outside-l0"}
+    assert fulltext.calls[0]["file_ids"] == [2, 3]
+    assert vs.calls[0]["file_ids"] == [2]
+
+
+def test_contextual_sparse_failure_preserves_dense_order():
+    vs = _FakeVectorStore()
+    svc = RetrievalService(
+        db=Mock(),
+        embedding_engine=_FakeEmbeddingEngine(),
+        vector_store=vs,
+        layer_store=_FakeLayerStore(),
+        fulltext_store=_IndependentFulltext(error=TimeoutError("es timeout")),
+        hybrid_recall_mode="independent_rrf",
+    )
+    svc._accessible_file_ids = lambda *args, **kwargs: ResolvedFileScope.finite([2, 3])
+    svc._resolve_es_index_names = lambda workspace_id, file_ids: ["idx"]
+    svc._enrich_hits = lambda hits: None
+    _bypass_active_file_filtering(svc)
+
+    results = svc.search(
+        "q",
+        user_id=1,
+        workspace_id=7,
+        top_k=5,
+        use_contextual=True,
+        retrieval_strategy="deep",
+        vector_similarity_weight=0.5,
+    )
+
+    assert [result["chunk_id"] for result in results] == ["c1"]
+    assert results[0]["fused_score"] == 0.5
 
 
 def test_assert_search_workspace_read_blocks_without_permission(monkeypatch):
@@ -253,7 +384,7 @@ def test_empty_scope_intersection_returns_before_embedding_and_store(use_context
         vector_store=_FailingVectorStore(),
         layer_store=_FailingLayerStore() if use_contextual else None,
     )
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: [1, 2, 3]
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite([1, 2, 3])
 
     results = svc.search(
         "q",
@@ -288,7 +419,7 @@ def test_contextual_large_scope_passes_file_ids_to_l0_layer_store():
         vector_store=vs,
         layer_store=ls,
     )
-    svc._accessible_file_ids = lambda user_id, workspace_id=None: list(range(900, 1700))
+    svc._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.finite(range(900, 1700))
     svc._enrich_hits = lambda hits: None
     _bypass_active_file_filtering(svc)
 

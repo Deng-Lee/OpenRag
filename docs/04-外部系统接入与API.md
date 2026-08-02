@@ -725,6 +725,8 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 
 > 工作区由 URL 路径决定，**body 中不要传 `workspace_id`**。`ServiceSearchRequest` 不包含 `vector_similarity_weight`（内部默认 1.0）。
 
+JWT `/search` 接口保留 `vector_similarity_weight` 字段兼容性；在独立混合召回模式下，该字段表示 Dense 通道在 Weighted RRF 中的名次贡献。响应 `score` 依次取 Cross-Encoder 的 `reranked_score`、RRF 的 `fused_score` 或单通道原始 `score`；RRF 分数不是概率且不可跨查询比较。
+
 **`paths` 与 `path_prefix` 优先级规则：**
 
 1. 显式传入 `paths`（含 `paths: []`）→ 使用 `paths`，忽略 `path_prefix`。

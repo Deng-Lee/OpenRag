@@ -280,7 +280,9 @@ def test_worker_reads_file_document_type_and_returns_it(monkeypatch):
         monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
         monkeypatch.setattr(task_worker, "_create_vector_store", lambda: None)
         monkeypatch.setattr(task_worker, "_create_layer_store", lambda: None)
-        monkeypatch.setattr(task_worker, "_create_es_chunk_store", lambda: None)
+        monkeypatch.setattr(
+            task_worker, "_create_es_chunk_store", lambda **_kwargs: None
+        )
         monkeypatch.setattr(task_worker, "DocumentProcessor", CapturingProcessor)
 
         result = task_worker.TaskWorker()._process_document(

@@ -249,6 +249,47 @@ docker-compose -f docker-compose.prod.yml logs milvus
 curl http://localhost:9091/healthz
 ```
 
+## A02 中文全文索引迁移与回滚
+
+迁移以单个 workspace 为最小单位。执行期间必须暂停该 workspace 的文件处理和删除；默认配置保持
+`ELASTICSEARCH__CHUNK_INDEX_MODE=legacy`，审计全部通过前不得切换。
+
+在 `openrag` 目录依次执行：
+
+```powershell
+python scripts/reindex_es_content_exact_v2.py --workspace-id <ID> --dry-run `
+  --output ../docs/a02-migration-local/workspace-<ID>-dry-run.json
+python scripts/reindex_es_content_exact_v2.py --workspace-id <ID> --apply `
+  --output ../docs/a02-migration-local/workspace-<ID>-apply.json
+python scripts/audit_es_chunk_consistency.py --workspace-id <ID> --index-version v2 `
+  --output ../docs/a02-migration-local/workspace-<ID>-v2-audit.json
+python scripts/reindex_es_content_exact_v2.py --workspace-id <ID> --switch-aliases `
+  --output ../docs/a02-migration-local/workspace-<ID>-alias-state.json
+python scripts/audit_es_chunk_consistency.py --workspace-id <ID> --index-version alias `
+  --output ../docs/a02-migration-local/workspace-<ID>-alias-audit.json
+```
+
+任一报告出现 L2 缺失、DB/ES 数量或归属不一致、Mapping/Schema/Hash 不一致、必填字段缺失、
+未知字段、token 字段或部分 bulk 失败时必须停止。切换成功并完成 smoke query 后，API 与 Worker
+同时设置：
+
+```text
+ELASTICSEARCH__HYBRID_RECALL_MODE=independent_rrf
+ELASTICSEARCH__CHUNK_INDEX_MODE=v2_alias
+```
+
+回滚必须使用切换时保存的同一份 alias 状态；命令会在恢复后执行 legacy smoke query，失败时恢复
+回滚前状态：
+
+```powershell
+python scripts/reindex_es_content_exact_v2.py --workspace-id <ID> `
+  --restore-aliases-from ../docs/a02-migration-local/workspace-<ID>-alias-state.json `
+  --output ../docs/a02-migration-local/workspace-<ID>-rollback.json
+```
+
+随后将 API 与 Worker 的 `ELASTICSEARCH__CHUNK_INDEX_MODE` 恢复为 `legacy`。迁移和回滚流程均不
+删除 v1 索引，也不重新切块。
+
 ## Production Recommendations
 
 ### Security

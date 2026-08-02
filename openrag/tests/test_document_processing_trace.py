@@ -9,10 +9,11 @@ import openrag.models  # noqa: F401 - register models
 from openrag.chunking.chunk_models import Chunk
 from openrag.models import DocumentChunk, DocumentParseArtifact, File, TraceRun, TraceSpan
 from openrag.models.base import Base
+from openrag.models.file import ProcessingStatus
 from openrag.models.user import User
 from openrag.models.workspace import Workspace
 from openrag.parsers.base import DocumentBlock
-from openrag.processors.document_processor import DocumentProcessor
+from openrag.processors.document_processor import DocumentProcessor, FulltextIndexingError
 from openrag.processors.document_processor import (
     _coerce_int_list,
     _coerce_position_int,
@@ -96,7 +97,7 @@ class FakeChunkEngine:
     def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
         return [
             Chunk(
-                text="Heading body",
+                text="Heading body GB/T 35273-2020",
                 chunk_id="chunk-1",
                 page=1,
                 level=1,
@@ -108,11 +109,19 @@ class FakeChunkEngine:
                         [1, 10, 100, 45, 65],
                     ],
                     "top_int": [20, 45],
+                    "content_ltks": "forbidden old token",
+                    "content_sm_ltks": "forbidden old token",
+                    "mom_with_weight": "parent compatibility text",
                 },
             ),
             Chunk(text="tiny", chunk_id="chunk-2", page=2, block_type="text"),
             Chunk(text="", chunk_id="chunk-3", page=2, block_type="text"),
         ]
+
+
+class EmptyChunkEngine:
+    def chunk(self, text_blocks, chunk_size, chunk_overlap, chunk_method=None, min_chunk_tokens=0):
+        return []
 
 
 class FakeEmbeddingEngine:
@@ -137,12 +146,34 @@ class FakeVectorStore:
 
 
 class FakeEsStore:
+    def __init__(self, *, upsert_count=None):
+        self.operations = []
+        self.upsert_count = upsert_count
+
     def ensure_index(self, index_name):
         self.index_name = index_name
 
+    def delete_by_file_id(self, index_name, file_id, *, required=False):
+        self.operations.append(("delete", index_name, file_id))
+
     def bulk_upsert_chunks(self, index_name, docs):
+        self.operations.append(("bulk", index_name, [doc["chunk_id"] for doc in docs]))
         self.docs = docs
-        return len(docs)
+        return len(docs) if self.upsert_count is None else self.upsert_count
+
+
+class FakeV2EsStore(FakeEsStore):
+    def resolve_write_target(
+        self, *, legacy_index, write_alias, chunk_index_mode
+    ):
+        assert chunk_index_mode == "v2_alias"
+        return write_alias
+
+    def get_alias_state(self, aliases):
+        return {
+            alias: {"workspace-chunks-v2": {"is_write_index": True}}
+            for alias in aliases
+        }
 
 
 class TxtParserAdapter:
@@ -318,6 +349,74 @@ def test_document_processor_uses_canonical_source_for_text_like_parsers(tmp_path
         Base.metadata.drop_all(bind=engine)
 
 
+def test_v2_document_processing_fails_when_fulltext_store_is_unavailable(tmp_path):
+    engine, db = _new_db()
+    try:
+        user, _workspace, file = _seed_file(db)
+        source_path = tmp_path / "report.pdf"
+        source_path.write_bytes(b"source document bytes")
+        processor = DocumentProcessor(
+            db=db,
+            parser_registry=FakeParserRegistry(),
+            chunk_engine=FakeChunkEngine(),
+            embedding_engine=FakeEmbeddingEngine(),
+            minio_storage=FakeProcessingMinio(),
+            vector_store=FakeVectorStore(),
+            layer_store=None,
+            chunk_fulltext_store=None,
+            chunk_index_mode="v2_alias",
+        )
+
+        with pytest.raises(FulltextIndexingError, match="not_enabled"):
+            processor.process_document(
+                file_path=str(source_path),
+                file_id=file.id,
+                user_id=user.id,
+                parser_type="pdf",
+            )
+
+        db.refresh(file)
+        assert file.processing_status != ProcessingStatus.completed
+        assert db.query(DocumentChunk).count() == 0
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_v2_document_processing_fails_on_partial_fulltext_write(tmp_path):
+    engine, db = _new_db()
+    try:
+        user, _workspace, file = _seed_file(db)
+        source_path = tmp_path / "report.pdf"
+        source_path.write_bytes(b"source document bytes")
+        processor = DocumentProcessor(
+            db=db,
+            parser_registry=FakeParserRegistry(),
+            chunk_engine=FakeChunkEngine(),
+            embedding_engine=FakeEmbeddingEngine(),
+            minio_storage=FakeProcessingMinio(),
+            vector_store=FakeVectorStore(),
+            layer_store=None,
+            chunk_fulltext_store=FakeV2EsStore(upsert_count=2),
+            chunk_index_mode="v2_alias",
+        )
+
+        with pytest.raises(FulltextIndexingError, match="partial_write:2/3"):
+            processor.process_document(
+                file_path=str(source_path),
+                file_id=file.id,
+                user_id=user.id,
+                parser_type="pdf",
+            )
+
+        db.refresh(file)
+        assert file.processing_status != ProcessingStatus.completed
+        assert db.query(DocumentChunk).count() == 0
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+
+
 def test_upload_ingest_records_upload_trace_spans(monkeypatch):
     engine, db = _new_db()
     try:
@@ -400,7 +499,10 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
         monkeypatch.setattr(task_worker, "_create_vector_store", lambda: FakeVectorStore())
         monkeypatch.setattr(task_worker, "_create_layer_store", lambda: None)
-        monkeypatch.setattr(task_worker, "_create_es_chunk_store", lambda: FakeEsStore())
+        es_store = FakeEsStore()
+        monkeypatch.setattr(
+            task_worker, "_create_es_chunk_store", lambda **_kwargs: es_store
+        )
         monkeypatch.setenv("OPENRAG_CHUNK_SIZE", "600")
         monkeypatch.setenv("OPENRAG_CHUNK_OVERLAP", "80")
         monkeypatch.setenv("OPENRAG_MIN_CHUNK_TOKENS", "2")
@@ -474,6 +576,22 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             }
             assert stages["fulltext.es_index"].output_summary["doc_count"] == 3
             assert stages["fulltext.es_index"].output_summary["upsert_count"] == 3
+            assert stages["fulltext.es_index"].output_summary["es_delete_performed"] is True
+            assert stages["fulltext.es_index"].output_summary["es_write_complete"] is True
+            assert [operation[0] for operation in es_store.operations] == ["delete", "bulk"]
+            first_es_doc = es_store.docs[0]
+            assert first_es_doc["content"] == "Heading body GB/T 35273-2020"
+            assert first_es_doc["content_with_weight"] == first_es_doc["content"]
+            assert first_es_doc["exact_terms"] == ["gb/t 35273-2020"]
+            assert first_es_doc["mom_with_weight"] == "parent compatibility text"
+            assert "content_ltks" not in first_es_doc
+            assert "content_sm_ltks" not in first_es_doc
+            assert stages["fulltext.es_index"].output_summary["schema_version"] == (
+                "a02-content-exact-v2"
+            )
+            assert len(
+                stages["fulltext.es_index"].output_summary["mapping_hash"]
+            ) == 64
             assert stages["metadata.persist_chunks"].output_summary["document_chunks_written"] == 3
             assert db2.query(DocumentChunk).count() == 3
             first_chunk = db2.query(DocumentChunk).filter_by(chunk_id="chunk-1").one()
@@ -489,6 +607,73 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             assert any(key.endswith("/canonical.md") for key in keys)
             assert not any("blocks" in json.dumps(span.output_summary or {}).lower() for span in stages.values())
             assert not any("embedding" in json.dumps(span.output_summary or {}).lower() and "[0.1" in json.dumps(span.output_summary or {}) for span in stages.values())
+        finally:
+            db2.close()
+    finally:
+        Base.metadata.drop_all(bind=engine)
+
+
+@pytest.mark.parametrize(
+    ("chunk_engine", "es_store", "expected"),
+    [
+        (
+            FakeChunkEngine,
+            FakeEsStore(upsert_count=2),
+            {"doc_count": 3, "upsert_count": 2, "complete": False, "reason": "partial_write:2/3"},
+        ),
+        (
+            EmptyChunkEngine,
+            FakeEsStore(),
+            {"doc_count": 0, "upsert_count": 0, "complete": True, "reason": None},
+        ),
+    ],
+)
+def test_document_processing_es_sync_is_complete_or_explicitly_degraded(
+    monkeypatch, chunk_engine, es_store, expected
+):
+    engine, db = _new_db()
+    try:
+        user, workspace, file = _seed_file(db)
+        ids = (user.id, workspace.id, file.id)
+        db.close()
+        task_worker.SessionLocal.configure(bind=engine)
+        monkeypatch.setattr(task_worker, "MinioStorage", FakeProcessingMinio)
+        monkeypatch.setattr(task_worker, "ParserRegistry", FakeParserRegistry)
+        monkeypatch.setattr(task_worker, "ChunkEngine", chunk_engine)
+        monkeypatch.setattr(task_worker, "EmbeddingEngine", FakeEmbeddingEngine)
+        monkeypatch.setattr(task_worker, "HierarchyStorage", lambda: object())
+        monkeypatch.setattr(task_worker, "_create_vector_store", FakeVectorStore)
+        monkeypatch.setattr(task_worker, "_create_layer_store", lambda: None)
+        monkeypatch.setattr(
+            task_worker, "_create_es_chunk_store", lambda **_kwargs: es_store
+        )
+
+        trace_id = f"es-sync-{expected['doc_count']}"
+        set_trace_context(
+            trace_id=trace_id,
+            trace_type="document_processing",
+            workspace_id=ids[1],
+            user_id=ids[0],
+            file_id=ids[2],
+            task_id="a01",
+            sampling_reason="unit-test",
+        )
+        result = task_worker.TaskWorker()._process_document(
+            {"file_id": ids[2], "workspace_id": ids[1], "user_id": ids[0]},
+            task_id=78,
+        )
+
+        db2 = sessionmaker(bind=engine)()
+        try:
+            span = db2.query(TraceSpan).filter_by(
+                trace_id=trace_id, stage="fulltext.es_index"
+            ).one()
+            assert result["status"] == "success"
+            assert span.output_summary["doc_count"] == expected["doc_count"]
+            assert span.output_summary["upsert_count"] == expected["upsert_count"]
+            assert span.output_summary["es_write_complete"] is expected["complete"]
+            assert span.output_summary["failure_reason"] == expected["reason"]
+            assert [operation[0] for operation in es_store.operations] == ["delete", "bulk"]
         finally:
             db2.close()
     finally:

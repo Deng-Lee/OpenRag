@@ -17,6 +17,7 @@ from openrag.models.file import File as FileModel
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.retrieval.reranker import Reranker
 from openrag.retrieval.retrieval_service import (
+    PermissionScopeResolutionError,
     RetrievalService,
     l0_l1_retrieval_enabled,
 )
@@ -130,7 +131,7 @@ class SearchRequest(BaseModel):
         0.7,
         ge=0.0,
         le=1.0,
-        description="向量融合分权重；全文 BM25 权重为 1-该值。默认 0.7；1 表示仅向量侧。",
+        description="Dense 通道在 Weighted RRF 名次融合中的权重；Sparse 权重为 1-该值。默认 0.7；1 表示仅 Dense。",
     )
     paths: Optional[list[str]] = Field(
         None,
@@ -421,6 +422,18 @@ def _execute_search(
             l1_llm_applied=l1_llm_applied,
             l1_llm_skip_reason=l1_llm_skip_reason,
         )
+    except PermissionScopeResolutionError as exc:
+        if started_trace_run:
+            trace_service.fail_run(
+                error_stage="permission_scope", error_message=str(exc)
+            )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "permission_scope_resolution_failed",
+                "message": "Unable to verify search permissions",
+            },
+        ) from exc
     except Exception as exc:
         if started_trace_run:
             trace_service.fail_run(error_stage="retrieval", error_message=str(exc))
@@ -482,7 +495,7 @@ async def hierarchical_search(
 def _format(results: list[dict], reranked: bool = False) -> list[SearchResult]:
     out = []
     for r in results:
-        score = r.get("reranked_score", r.get("score", 0.0))
+        score = r.get("reranked_score", r.get("fused_score", r.get("score", 0.0)))
         out.append(
             SearchResult(
                 text=r.get("text", ""),
@@ -590,6 +603,11 @@ def _record_response_trace(
         ),
         "fusion_overlap": _chunk_overlap(pre_top50, final_top50),
         "rerank_overlap": _chunk_overlap(pre_top50, final_top50),
+        "sparse_rescued_final_count": sum(
+            1
+            for result in final_top50
+            if result.get("recall_sources") == ["sparse"]
+        ),
     }
     trace_service.start_span("retrieval.response")
     trace_service.finish_span(output_summary=output_summary)

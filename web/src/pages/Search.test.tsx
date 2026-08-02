@@ -132,7 +132,8 @@ describe('SearchPage', () => {
   it('submits the default vector similarity weight', async () => {
     await renderSearchPage();
 
-    expect(screen.getByLabelText('Vector weight')).toBeInTheDocument();
+    expect(screen.getByLabelText('Dense channel weight')).toBeInTheDocument();
+    expect(screen.getByText(/Weighted RRF rank contribution/)).toBeInTheDocument();
     const payload = await submitSearch();
 
     expect(payload).toEqual(expect.objectContaining({
@@ -145,10 +146,10 @@ describe('SearchPage', () => {
   it('submits the user-entered vector similarity weight', async () => {
     await renderSearchPage();
 
-    fireEvent.change(screen.getByLabelText('Vector weight'), {
+    fireEvent.change(screen.getByLabelText('Dense channel weight'), {
       target: { value: '0.3' },
     });
-    fireEvent.blur(screen.getByLabelText('Vector weight'));
+    fireEvent.blur(screen.getByLabelText('Dense channel weight'));
     const payload = await submitSearch('weighted search');
 
     expect(payload).toEqual(expect.objectContaining({

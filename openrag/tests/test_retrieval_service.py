@@ -1,349 +1,160 @@
-"""Tests for retrieval service with permission filtering"""
+from datetime import datetime, timezone
 
 import pytest
-from unittest.mock import Mock, MagicMock
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
 
-from openrag.models.file import File
-from openrag.models.permission import EntityType, FilePermission, Permission
-from openrag.models.team import Team, TeamMember, TeamRole
-from openrag.models.user import User
-from openrag.retrieval.filters import PermissionFilter
-from openrag.retrieval.retrieval_service import RetrievalService
+from openrag.models import Base, DocumentChunk, File, TraceSpan, User, Workspace
+from openrag.retrieval.retrieval_service import ResolvedFileScope, RetrievalService
+from openrag.tracing.context import reset_trace_context, set_trace_context
+
+
+class FakeEmbeddingEngine:
+    model_name = "fake"
+
+    def embed_text(self, query):
+        return [0.1, 0.2]
+
+
+class FakeVectorStore:
+    def __init__(self, hits):
+        self.hits = hits
+
+    def search(self, *, query_embedding, top_k, file_ids=None):
+        return [dict(hit) for hit in self.hits[:top_k]]
 
 
 @pytest.fixture
-def db_session(tmp_path):
-    """Create in-memory SQLite database for testing"""
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    from openrag.models.base import Base
-
+def retrieval_db():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    SessionLocal = sessionmaker(bind=engine)
-    session = SessionLocal()
-
-    yield session
-
-    session.close()
-
-
-@pytest.fixture
-def test_users(db_session):
-    """Create test users"""
-    user1 = User(username="alice", email="alice@example.com", password_hash="hash1", full_name="Alice")
-    user2 = User(username="bob", email="bob@example.com", password_hash="hash2", full_name="Bob")
-    user3 = User(username="charlie", email="charlie@example.com", password_hash="hash3", full_name="Charlie")
-
-    db_session.add_all([user1, user2, user3])
-    db_session.commit()
-
-    return {"alice": user1, "bob": user2, "charlie": user3}
-
-
-@pytest.fixture
-def test_team(db_session, test_users):
-    """Create test team with members"""
-    team = Team(name="Engineering", description="Engineering team", owner_id=test_users["alice"].id)
-    db_session.add(team)
-    db_session.commit()
-
-    # Add bob as team member
-    member = TeamMember(team_id=team.id, user_id=test_users["bob"].id, role=TeamRole.MEMBER)
-    db_session.add(member)
-    db_session.commit()
-
-    return team
-
-
-@pytest.fixture
-def test_files(db_session, test_users):
-    """Create test files with different owners"""
-    file1 = File(
-        uri="viking://bucket/file1.pdf",
-        name="file1.pdf",
-        owner_id=test_users["alice"].id,
-        size=1024,
-        mime_type="application/pdf"
+    db = sessionmaker(bind=engine)()
+    user = User(
+        username="retrieval-user",
+        email="retrieval@example.com",
+        password_hash="x",
+        full_name="Retrieval User",
     )
-    file2 = File(
-        uri="viking://bucket/file2.pdf",
-        name="file2.pdf",
-        owner_id=test_users["bob"].id,
-        size=2048,
-        mime_type="application/pdf"
-    )
-    file3 = File(
-        uri="viking://bucket/file3.pdf",
-        name="file3.pdf",
-        owner_id=test_users["charlie"].id,
-        size=3072,
-        mime_type="application/pdf"
-    )
-
-    db_session.add_all([file1, file2, file3])
-    db_session.commit()
-
-    return {"file1": file1, "file2": file2, "file3": file3}
-
-
-@pytest.fixture
-def test_permissions(db_session, test_users, test_team, test_files):
-    """Create test permissions"""
-    # Alice shares file1 with bob (read)
-    perm1 = FilePermission(
-        file_id=test_files["file1"].id,
-        entity_type=EntityType.USER,
-        entity_id=test_users["bob"].id,
-        permission=Permission.READ
-    )
-
-    # Charlie shares file3 with Engineering team (write)
-    perm2 = FilePermission(
-        file_id=test_files["file3"].id,
-        entity_type=EntityType.TEAM,
-        entity_id=test_team.id,
-        permission=Permission.WRITE
-    )
-
-    db_session.add_all([perm1, perm2])
-    db_session.commit()
-
-    return [perm1, perm2]
-
-
-class TestPermissionFilter:
-    """Test PermissionFilter class"""
-
-    def test_get_accessible_uris_owner(self, db_session, test_users, test_files):
-        """Test getting accessible URIs for file owner"""
-        filter = PermissionFilter(db_session)
-        uris = filter.get_accessible_uris(test_users["alice"].id)
-
-        assert "viking://bucket/file1.pdf" in uris
-        assert "viking://bucket/file2.pdf" not in uris
-        assert "viking://bucket/file3.pdf" not in uris
-
-    def test_get_accessible_uris_with_direct_permission(
-        self, db_session, test_users, test_files, test_permissions
+    db.add(user)
+    db.commit()
+    ws = Workspace(name="WS", slug="ws", owner_id=user.id)
+    other_ws = Workspace(name="Other", slug="other", owner_id=user.id)
+    db.add_all([ws, other_ws])
+    db.commit()
+    files = {
+        "allowed": File(uri="/allowed", name="allowed", owner_id=user.id, workspace_id=ws.id),
+        "forbidden": File(uri="/forbidden", name="forbidden", owner_id=user.id, workspace_id=ws.id),
+        "deleted": File(
+            uri="/deleted",
+            name="deleted",
+            owner_id=user.id,
+            workspace_id=ws.id,
+            deleted_at=datetime.now(timezone.utc),
+        ),
+        "other": File(uri="/other", name="other", owner_id=user.id, workspace_id=other_ws.id),
+    }
+    db.add_all(files.values())
+    db.commit()
+    for index, (chunk_id, file_key, workspace_id) in enumerate(
+        [
+            ("valid", "allowed", ws.id),
+            ("forged", "forbidden", ws.id),
+            ("deleted", "deleted", ws.id),
+            ("wrong-workspace", "other", other_ws.id),
+            ("unauthorized", "forbidden", ws.id),
+        ],
+        start=1,
     ):
-        """Test getting accessible URIs with direct user permission"""
-        filter = PermissionFilter(db_session)
-        uris = filter.get_accessible_uris(test_users["bob"].id)
-
-        # Bob owns file2 and has read permission on file1
-        assert "viking://bucket/file1.pdf" in uris
-        assert "viking://bucket/file2.pdf" in uris
-        assert "viking://bucket/file3.pdf" in uris  # Through team permission
-
-    def test_get_accessible_uris_with_team_permission(
-        self, db_session, test_users, test_team, test_files, test_permissions
-    ):
-        """Test getting accessible URIs through team membership"""
-        filter = PermissionFilter(db_session)
-        uris = filter.get_accessible_uris(test_users["bob"].id)
-
-        # Bob is in Engineering team which has access to file3
-        assert "viking://bucket/file3.pdf" in uris
-
-    def test_get_accessible_uris_no_permissions(self, db_session, test_users, test_files):
-        """Test getting accessible URIs for user with no permissions"""
-        filter = PermissionFilter(db_session)
-        uris = filter.get_accessible_uris(test_users["charlie"].id)
-
-        # Charlie only owns file3
-        assert "viking://bucket/file1.pdf" not in uris
-        assert "viking://bucket/file2.pdf" not in uris
-        assert "viking://bucket/file3.pdf" in uris
-
-    def test_filter_results(self, db_session):
-        """Test filtering results by accessible URIs"""
-        filter = PermissionFilter(db_session)
-
-        results = [
-            {"uri": "viking://bucket/file1.pdf", "text": "content1", "score": 0.9},
-            {"uri": "viking://bucket/file2.pdf", "text": "content2", "score": 0.8},
-            {"uri": "viking://bucket/file3.pdf", "text": "content3", "score": 0.7},
-        ]
-
-        accessible_uris = {"viking://bucket/file1.pdf", "viking://bucket/file3.pdf"}
-        filtered = filter.filter_results(results, accessible_uris)
-
-        assert len(filtered) == 2
-        assert filtered[0]["uri"] == "viking://bucket/file1.pdf"
-        assert filtered[1]["uri"] == "viking://bucket/file3.pdf"
-
-    def test_filter_results_empty_accessible(self, db_session):
-        """Test filtering with no accessible URIs"""
-        filter = PermissionFilter(db_session)
-
-        results = [
-            {"uri": "viking://bucket/file1.pdf", "text": "content1", "score": 0.9},
-        ]
-
-        filtered = filter.filter_results(results, set())
-        assert len(filtered) == 0
-
-
-class TestRetrievalService:
-    """Test RetrievalService class"""
-
-    def test_init_without_agfs_client(self, db_session):
-        """Test initialization without AGFS client"""
-        service = RetrievalService(db_session)
-        assert service.db == db_session
-        assert service.agfs_client is None
-
-    def test_init_with_agfs_client(self, db_session):
-        """Test initialization with AGFS client"""
-        mock_client = Mock()
-        service = RetrievalService(db_session, agfs_client=mock_client)
-        assert service.agfs_client == mock_client
-
-    def test_search_without_agfs_raises_error(self, db_session, test_users):
-        """Test search without AGFS client raises error"""
-        service = RetrievalService(db_session)
-
-        with pytest.raises(RuntimeError, match="AGFS client not initialized"):
-            service.search("test query", test_users["alice"].id)
-
-    def test_search_semantic(
-        self, db_session, test_users, test_files, test_permissions
-    ):
-        """Test semantic search with permission filtering"""
-        # Mock AGFS client
-        mock_client = Mock()
-        mock_client.semantic_search.return_value = [
-            {
-                "text": "content from file1",
-                "score": 0.9,
-                "uri": "viking://bucket/file1.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": [0, 0, 100, 100],
-                "level": 0
-            },
-            {
-                "text": "content from file2",
-                "score": 0.8,
-                "uri": "viking://bucket/file2.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": [0, 0, 100, 100],
-                "level": 0
-            },
-            {
-                "text": "content from file3",
-                "score": 0.7,
-                "uri": "viking://bucket/file3.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": [0, 0, 100, 100],
-                "level": 0
-            }
-        ]
-
-        service = RetrievalService(db_session, agfs_client=mock_client)
-        results = service.search("test query", test_users["bob"].id, top_k=10)
-
-        # Bob should see file1 (shared), file2 (owned), file3 (team)
-        assert len(results) == 3
-        assert mock_client.semantic_search.called
-
-    def test_search_hierarchical(
-        self, db_session, test_users, test_files, test_permissions
-    ):
-        """Test hierarchical search with permission filtering"""
-        # Mock AGFS client
-        mock_client = Mock()
-        mock_client.hierarchical_search.return_value = [
-            {
-                "text": "heading from file1",
-                "score": 0.95,
-                "uri": "viking://bucket/file1.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": [0, 0, 100, 100],
-                "level": 1
-            }
-        ]
-
-        service = RetrievalService(db_session, agfs_client=mock_client)
-        results = service.search(
-            "test query",
-            test_users["alice"].id,
-            top_k=10,
-            use_hierarchical=True
+        db.add(
+            DocumentChunk(
+                id=index,
+                file_id=files[file_key].id,
+                workspace_id=workspace_id,
+                chunk_id=chunk_id,
+                chunk_index=index,
+                object_key=f"chunks/{chunk_id}.md",
+                text_preview=f"preview-{chunk_id}",
+                page=index,
+            )
         )
+    db.commit()
+    try:
+        yield engine, db, user, ws, files
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        reset_trace_context()
 
-        assert len(results) == 1
-        assert results[0]["level"] == 1
-        assert mock_client.hierarchical_search.called
 
-    def test_search_filters_by_permission(
-        self, db_session, test_users, test_files
-    ):
-        """Test that search properly filters results by user permissions"""
-        # Mock AGFS client returning results from all files
-        mock_client = Mock()
-        mock_client.semantic_search.return_value = [
-            {
-                "text": "content from file1",
-                "score": 0.9,
-                "uri": "viking://bucket/file1.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": None,
-                "level": 0
-            },
-            {
-                "text": "content from file2",
-                "score": 0.8,
-                "uri": "viking://bucket/file2.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": None,
-                "level": 0
-            }
-        ]
+def test_search_validates_hits_against_authoritative_db_and_records_counts(retrieval_db):
+    _engine, db, user, ws, files = retrieval_db
+    hits = [
+        {"chunk_id": "valid", "file_id": files["allowed"].id, "text": "valid", "score": 0.9},
+        {"chunk_id": "orphan", "file_id": files["allowed"].id, "text": "orphan", "score": 0.8},
+        {"chunk_id": "forged", "file_id": files["allowed"].id, "text": "forged", "score": 0.7},
+        {"chunk_id": "deleted", "file_id": files["deleted"].id, "text": "deleted", "score": 0.6},
+        {"chunk_id": "wrong-workspace", "file_id": files["other"].id, "text": "other", "score": 0.5},
+        {"chunk_id": "unauthorized", "file_id": files["forbidden"].id, "text": "forbidden", "score": 0.4},
+    ]
+    service = RetrievalService(db, FakeEmbeddingEngine(), FakeVectorStore(hits))
+    service._accessible_file_ids = lambda *args, **kwargs: ResolvedFileScope.finite(
+        [files["allowed"].id, files["deleted"].id, files["other"].id]
+    )
+    set_trace_context(trace_id="db-validation", trace_type="retrieval")
+    service.trace_service.start_run(trace_id="db-validation", trace_type="retrieval")
 
-        service = RetrievalService(db_session, agfs_client=mock_client)
-        # Charlie should only see file3 (owned), not file1 or file2
-        results = service.search("test query", test_users["charlie"].id, top_k=10)
+    results = service.search(
+        "q", user_id=user.id, workspace_id=ws.id, top_k=10, vector_similarity_weight=1.0
+    )
 
-        assert len(results) == 0  # No accessible files in results
+    assert [result["chunk_id"] for result in results] == ["valid"]
+    assert results[0]["filename"] == "allowed"
+    assert results[0]["text_preview"] == "preview-valid"
+    assert results[0]["page"] == 1
+    span = db.query(TraceSpan).filter_by(
+        trace_id="db-validation", stage="retrieval.db_validation"
+    ).one()
+    assert span.output_summary["stale_hit_count"] == 2
+    assert span.output_summary["unauthorized_hit_count"] == 1
+    assert span.output_summary["ownership_mismatch_count"] == 2
 
-    def test_search_with_file_id_mapping(
-        self, db_session, test_users, test_files, test_permissions
-    ):
-        """Test that search includes file_id in results"""
-        mock_client = Mock()
-        mock_client.semantic_search.return_value = [
-            {
-                "text": "content from file1",
-                "score": 0.9,
-                "uri": "viking://bucket/file1.pdf",
-                "page": 1,
-                "offset": 0,
-                "bbox": [0, 0, 100, 100],
-                "level": 0
-            }
-        ]
 
-        service = RetrievalService(db_session, agfs_client=mock_client)
-        results = service.search("test query", test_users["alice"].id, top_k=10)
+def test_validation_uses_constant_number_of_chunk_and_file_queries(retrieval_db):
+    engine, db, user, ws, files = retrieval_db
+    allowed = files["allowed"]
+    for index in range(10, 30):
+        db.add(
+            DocumentChunk(
+                id=index,
+                file_id=allowed.id,
+                workspace_id=ws.id,
+                chunk_id=f"batch-{index}",
+                chunk_index=index,
+                object_key=f"chunks/batch-{index}.md",
+            )
+        )
+    db.commit()
+    hits = [
+        {"chunk_id": f"batch-{index}", "file_id": allowed.id, "text": "x", "score": 1.0}
+        for index in range(10, 30)
+    ]
+    service = RetrievalService(db, FakeEmbeddingEngine(), FakeVectorStore(hits))
+    service._accessible_file_ids = lambda *args, **kwargs: ResolvedFileScope.finite([allowed.id])
+    selects = {"document_chunks": 0, "files": 0}
 
-        assert len(results) == 1
-        assert "file_id" in results[0]
-        assert results[0]["file_id"] == test_files["file1"].id
+    def count_selects(_conn, _cursor, statement, _parameters, _context, _executemany):
+        lowered = statement.lower()
+        if lowered.lstrip().startswith("select"):
+            if "from document_chunks" in lowered:
+                selects["document_chunks"] += 1
+            elif "from files" in lowered:
+                selects["files"] += 1
 
-    def test_search_empty_results(self, db_session, test_users):
-        """Test search with no results from AGFS"""
-        mock_client = Mock()
-        mock_client.semantic_search.return_value = []
+    event.listen(engine, "before_cursor_execute", count_selects)
+    try:
+        results = service.search("q", user_id=user.id, workspace_id=ws.id, top_k=20)
+    finally:
+        event.remove(engine, "before_cursor_execute", count_selects)
 
-        service = RetrievalService(db_session, agfs_client=mock_client)
-        results = service.search("test query", test_users["alice"].id, top_k=10)
-
-        assert len(results) == 0
+    assert len(results) == 20
+    assert selects == {"document_chunks": 1, "files": 1}

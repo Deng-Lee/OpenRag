@@ -23,6 +23,7 @@ from openrag.processors.document_processor import DocumentProcessor
 from openrag.parsers.parser_registry import ParserRegistry
 from openrag.chunking.chunk_engine import ChunkEngine
 from openrag.chunking.document_type import normalize_document_type
+from openrag.config import get_config
 from openrag.embedding.embedding_engine import EmbeddingEngine
 from openrag.hierarchy.hierarchy_storage import HierarchyStorage
 from openrag.storage.minio_storage import MinioStorage
@@ -62,13 +63,23 @@ def _create_layer_store():
         return None
 
 
-def _create_es_chunk_store():
-    """Elasticsearch chunk fulltext; None if disabled or unreachable."""
+def _create_es_chunk_store(*, required: bool = False):
+    """Create the chunk full-text store, failing closed when it is required."""
     try:
-        from openrag.search.es_chunk_store import create_es_chunk_store_from_config
+        from openrag.search.es_chunk_store import (
+            create_es_chunk_store_from_config,
+            require_es_chunk_store_from_config,
+        )
 
-        return create_es_chunk_store_from_config()
+        factory = (
+            require_es_chunk_store_from_config
+            if required
+            else create_es_chunk_store_from_config
+        )
+        return factory()
     except Exception as exc:
+        if required:
+            raise
         _logger.warning("Elasticsearch chunk store unavailable: %s", exc)
         return None
 
@@ -342,7 +353,10 @@ class TaskWorker:
             hierarchy_storage = HierarchyStorage()
             vector_store = _create_vector_store()
             layer_store = _create_layer_store()
-            es_chunk_store = _create_es_chunk_store()
+            chunk_index_mode = get_config().elasticsearch.chunk_index_mode
+            es_chunk_store = _create_es_chunk_store(
+                required=chunk_index_mode == "v2_alias"
+            )
 
             # Create processor
             processor = DocumentProcessor(
@@ -355,6 +369,7 @@ class TaskWorker:
                 vector_store=vector_store,
                 layer_store=layer_store,
                 chunk_fulltext_store=es_chunk_store,
+                chunk_index_mode=chunk_index_mode,
             )
 
             # Process document

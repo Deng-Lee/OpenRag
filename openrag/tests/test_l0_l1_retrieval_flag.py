@@ -1,6 +1,6 @@
 from unittest.mock import Mock
 
-from openrag.retrieval.retrieval_service import RetrievalService
+from openrag.retrieval.retrieval_service import ResolvedFileScope, RetrievalService
 
 
 class _FakeEmbeddingEngine:
@@ -46,8 +46,9 @@ def test_retrieval_service_disables_l0_l1_when_flag_false(monkeypatch):
         vector_store=vector_store,
         layer_store=_FailingLayerStore(),
     )
-    service._accessible_file_ids = lambda user_id, workspace_id=None: None
+    service._accessible_file_ids = lambda user_id, workspace_id=None: ResolvedFileScope.verified_global()
     service._enrich_hits = lambda hits: None
+    service._validate_and_enrich_hits = lambda hits, **kwargs: (hits, {})
 
     results = service.search(
         "query",

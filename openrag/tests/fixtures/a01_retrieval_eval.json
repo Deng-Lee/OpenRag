@@ -1,0 +1,48 @@
+[
+  {
+    "query_text": "错误码 ORAG-A01-404 的处理方法",
+    "query_type": "exact_identifier",
+    "metadata": {"expected_channel": "sparse", "case": "exact_code"},
+    "judgments": [
+      {"chunk_id": "a01-exact-code", "file_id": 101, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "系统如何避免把已经删除的资料返回给用户",
+    "query_type": "semantic_paraphrase",
+    "metadata": {"expected_channel": "dense", "case": "semantic_only"},
+    "judgments": [
+      {"chunk_id": "a01-semantic", "file_id": 102, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "Weighted RRF 独立混合召回",
+    "query_type": "hybrid_overlap",
+    "metadata": {"expected_channel": "dense+sparse", "case": "overlap"},
+    "judgments": [
+      {"chunk_id": "a01-overlap", "file_id": 103, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "产品型号 XQ-9917-B",
+    "query_type": "sparse_rescue",
+    "metadata": {"expected_channel": "sparse", "case": "dense_miss_sparse_hit"},
+    "judgments": [
+      {"chunk_id": "a01-sparse-only", "file_id": 104, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "已删除文档中的孤儿关键词 GHOST-A01",
+    "query_type": "lifecycle_boundary",
+    "metadata": {"expected_result": "filtered", "case": "orphan_or_soft_deleted"},
+    "judgments": []
+  },
+  {
+    "query_text": "目录内外都存在的编号 SCOPE-A01",
+    "query_type": "permission_boundary",
+    "metadata": {"expected_result": "authorized_only", "case": "same_keyword_cross_scope"},
+    "judgments": [
+      {"chunk_id": "a01-scope-allowed", "file_id": 105, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  }
+]

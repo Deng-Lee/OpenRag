@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from openrag.retrieval.l1_llm_navigator import (
     filter_chunk_hits_by_indices,
     llm_select_chunk_indices,
 )
+from openrag.retrieval.hybrid_fusion import weighted_rrf
 from openrag.retrieval.query_intent import infer_retrieval_strategy, normalize_strategy
 from openrag.services.trace_service import TraceService
 
@@ -35,6 +37,45 @@ _LIGHT_CHUNK_MULT = 2
 
 _L1_LLM_META_APPLIED = "_l1_llm_applied"
 _L1_LLM_META_SKIP_REASON = "_l1_llm_skip_reason"
+
+
+class PermissionScopeResolutionError(RuntimeError):
+    """Raised when the caller's readable file scope cannot be verified."""
+
+
+@dataclass(frozen=True)
+class ResolvedFileScope:
+    """Explicit result of permission and requested-scope resolution."""
+
+    allowed_file_ids: Optional[tuple[int, ...]]
+    is_verified_global: bool
+    resolution_status: str
+
+    @classmethod
+    def finite(cls, file_ids) -> "ResolvedFileScope":
+        ids = tuple(dict.fromkeys(int(file_id) for file_id in file_ids))
+        return cls(
+            allowed_file_ids=ids,
+            is_verified_global=False,
+            resolution_status="empty" if not ids else "finite",
+        )
+
+    @classmethod
+    def verified_global(cls) -> "ResolvedFileScope":
+        return cls(
+            allowed_file_ids=None,
+            is_verified_global=True,
+            resolution_status="verified_global",
+        )
+
+    @property
+    def is_empty(self) -> bool:
+        return self.allowed_file_ids == ()
+
+    def backend_file_ids(self) -> Optional[list[int]]:
+        if self.allowed_file_ids is None:
+            return None
+        return list(self.allowed_file_ids)
 
 
 def l0_l1_retrieval_enabled() -> bool:
@@ -117,12 +158,24 @@ class RetrievalService:
         vector_store,
         layer_store: Optional["MilvusLayerStore"] = None,
         fulltext_store: Optional["EsChunkStore"] = None,
+        hybrid_recall_mode: Optional[str] = None,
+        chunk_index_mode: Optional[str] = None,
     ):
         self.db = db
         self.embedding_engine = embedding_engine
         self.vector_store = vector_store
         self.layer_store = layer_store
         self.fulltext_store = fulltext_store
+        if hybrid_recall_mode is None or chunk_index_mode is None:
+            from openrag.config import get_config
+
+            es_config = get_config().elasticsearch
+            if hybrid_recall_mode is None:
+                hybrid_recall_mode = es_config.hybrid_recall_mode
+            if chunk_index_mode is None:
+                chunk_index_mode = getattr(es_config, "chunk_index_mode", "legacy")
+        self.hybrid_recall_mode = hybrid_recall_mode
+        self.chunk_index_mode = chunk_index_mode or "legacy"
         self.trace_service = TraceService(db)
 
     def search(
@@ -153,6 +206,12 @@ class RetrievalService:
             use_contextual = False
             use_l1_llm_navigation = False
 
+        resolved_scope = self._effective_file_scope(
+            user_id, workspace_id, scope_file_ids
+        )
+        if resolved_scope.is_empty:
+            return []
+
         setting = normalize_strategy(retrieval_strategy)
         strat = infer_retrieval_strategy(query) if setting == "auto" else setting
         flat_top_k = min(top_k * 2, 100) if strat == "precise" else top_k
@@ -180,6 +239,7 @@ class RetrievalService:
                     flat_top_k,
                     vector_similarity_weight=vector_similarity_weight,
                     scope_file_ids=scope_file_ids,
+                    resolved_scope=resolved_scope,
                 )
             )
             hits = _annotate_l1_llm_meta(hits, l1_llm_applied, l1_llm_skip_reason)
@@ -196,6 +256,7 @@ class RetrievalService:
                     flat_top_k,
                     vector_similarity_weight=vector_similarity_weight,
                     scope_file_ids=scope_file_ids,
+                    resolved_scope=resolved_scope,
                 )
             )
             hits = _annotate_l1_llm_meta(hits, l1_llm_applied, l1_llm_skip_reason)
@@ -220,6 +281,7 @@ class RetrievalService:
                 use_l1_llm_navigation=use_l1_llm_navigation,
                 vector_similarity_weight=vector_similarity_weight,
                 scope_file_ids=scope_file_ids,
+                resolved_scope=resolved_scope,
             )
         )
         # _search_contextual sets _l1_llm_applied / _l1_llm_skip_reason on first hit
@@ -234,14 +296,23 @@ class RetrievalService:
         *,
         vector_similarity_weight: float = 1.0,
         scope_file_ids: Optional[set[int]] = None,
+        resolved_scope: Optional[ResolvedFileScope] = None,
     ) -> list[dict]:
-        accessible_file_ids = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
-        if accessible_file_ids is not None and len(accessible_file_ids) == 0:
+        scope = resolved_scope or self._effective_file_scope(
+            user_id, workspace_id, scope_file_ids
+        )
+        if scope.is_empty:
             return []
+        accessible_file_ids = scope.backend_file_ids()
         query_vec = self._embed_query(query)
 
+        dense_stage = (
+            "retrieval.dense_recall"
+            if self.hybrid_recall_mode == "independent_rrf"
+            else "retrieval.chunk_search"
+        )
         self.trace_service.start_span(
-            "retrieval.chunk_search",
+            dense_stage,
             input_summary={
                 "top_k": top_k,
                 "file_filter_count": (
@@ -255,15 +326,14 @@ class RetrievalService:
                 top_k=top_k,
                 file_ids=accessible_file_ids,
             )
-            self._record_chunk_search_snapshots(hits)
+            self._record_chunk_search_snapshots(hits, stage=dense_stage)
             self.trace_service.finish_span(output_summary={"hit_count": len(hits)})
         except Exception as exc:
             self.trace_service.fail_span(error_message=str(exc))
             raise
-        self._enrich_hits(hits)
-        hits = self._filter_hits_to_active_files(hits)  # round-3 #3 backstop
         for h in hits:
             h["retrieval_mode"] = "flat"
+            h["dense_score"] = h.get("score")
 
         mn, mx, av = _milvus_score_stats(hits)
         filt = len(accessible_file_ids) if accessible_file_ids is not None else "all"
@@ -284,7 +354,31 @@ class RetrievalService:
 
         wvec = float(vector_similarity_weight)
         if wvec >= 1.0 - 1e-12:
+            hits, _stats = self._validate_and_enrich_hits(
+                hits, workspace_id=workspace_id, resolved_scope=scope
+            )
             return hits
+
+        if self.hybrid_recall_mode == "independent_rrf":
+            sparse_hits, sparse_state = self._recall_sparse(
+                query=query,
+                workspace_id=workspace_id,
+                resolved_scope=scope,
+                top_k=top_k,
+            )
+            if sparse_state["degraded"] or sparse_state["skip_reason"] is not None:
+                combined = hits
+            else:
+                combined = self._merge_independent_recalls(
+                    hits,
+                    sparse_hits,
+                    dense_weight=wvec,
+                    retrieval_mode="flat",
+                )
+            combined, _stats = self._validate_and_enrich_hits(
+                combined, workspace_id=workspace_id, resolved_scope=scope
+            )
+            return combined[:top_k]
 
         scores = [float(h.get("score", 0)) for h in hits]
         if scores:
@@ -294,15 +388,12 @@ class RetrievalService:
                     s = float(h.get("score", 0))
                     nv = (s - smin) / (smax - smin)
                     h["fused_score"] = nv
-                    h["reranked_score"] = nv
             else:
                 for h in hits:
                     h["fused_score"] = 0.5
-                    h["reranked_score"] = 0.5
         else:
             for h in hits:
                 h["fused_score"] = 0.0
-                h["reranked_score"] = 0.0
 
         if accessible_file_ids is not None:
             es_file_ids = list(accessible_file_ids)
@@ -318,14 +409,188 @@ class RetrievalService:
             vector_similarity_weight,
         )
         hits.sort(
-            key=lambda x: float(x.get("reranked_score", x.get("score", 0.0))),
+            key=lambda x: float(x.get("fused_score", x.get("score", 0.0))),
             reverse=True,
+        )
+        hits, _stats = self._validate_and_enrich_hits(
+            hits, workspace_id=workspace_id, resolved_scope=scope
         )
         logger.info(
             "retrieval_flat_after_fusion top3=[%s]",
             _top_hits_line(hits, n=3, score_key="reranked_score"),
         )
         return hits
+
+    def _recall_sparse(
+        self,
+        *,
+        query: str,
+        workspace_id: Optional[int],
+        resolved_scope: ResolvedFileScope,
+        top_k: int,
+    ) -> tuple[list[dict], dict[str, object]]:
+        from openrag.search.es_chunk_contract import (
+            QUERY_PROFILE_VERSION,
+            SCHEMA_VERSION,
+            compute_mapping_hash,
+            extract_exact_terms,
+        )
+
+        is_v2 = self.chunk_index_mode == "v2_alias"
+        state: dict[str, object] = {
+            "degraded": False,
+            "skip_reason": None,
+            "chunk_index_mode": self.chunk_index_mode,
+            "physical_index_names": [],
+            "schema_version": SCHEMA_VERSION if is_v2 else None,
+            "mapping_hash": compute_mapping_hash() if is_v2 else None,
+            "query_profile_version": (
+                QUERY_PROFILE_VERSION if is_v2 else "legacy-content"
+            ),
+            "query_exact_term_count": (
+                len(extract_exact_terms(query)) if is_v2 else 0
+            ),
+        }
+        self.trace_service.start_span(
+            "retrieval.sparse_recall",
+            input_summary={
+                "top_k": top_k,
+                "file_filter_count": (
+                    len(resolved_scope.allowed_file_ids or ())
+                    if not resolved_scope.is_verified_global
+                    else None
+                ),
+            },
+        )
+        if self.fulltext_store is None:
+            state.update(degraded=True, skip_reason="no_fulltext_store")
+            self.trace_service.finish_span(output_summary={"hit_count": 0, **state})
+            return [], state
+        if resolved_scope.is_verified_global:
+            state.update(degraded=False, skip_reason="verified_global_scope")
+            self.trace_service.finish_span(output_summary={"hit_count": 0, **state})
+            return [], state
+        file_ids = list(resolved_scope.allowed_file_ids or ())
+        if not file_ids:
+            state.update(degraded=False, skip_reason="empty_scope")
+            self.trace_service.finish_span(output_summary={"hit_count": 0, **state})
+            return [], state
+        index_names = self._resolve_es_index_names(workspace_id, file_ids)
+        if not index_names:
+            state.update(degraded=True, skip_reason="no_index_names")
+            self.trace_service.finish_span(output_summary={"hit_count": 0, **state})
+            return [], state
+        if is_v2:
+            alias_state = self.fulltext_store.get_alias_state(index_names)
+            state["physical_index_names"] = sorted(
+                {
+                    physical
+                    for targets in alias_state.values()
+                    for physical in targets
+                }
+            )
+        else:
+            state["physical_index_names"] = list(index_names)
+        started = time.perf_counter()
+        try:
+            search_kwargs = dict(
+                index_names=index_names,
+                query_text=query,
+                file_ids=file_ids,
+                top_k=top_k,
+            )
+            if is_v2:
+                search_kwargs["chunk_index_mode"] = self.chunk_index_mode
+            hits = self.fulltext_store.search_chunks(**search_kwargs)
+        except Exception as exc:
+            state.update(degraded=True, skip_reason="sparse_error")
+            self.trace_service.finish_span(
+                output_summary={"hit_count": 0, "error": str(exc), **state},
+                metrics={"latency_ms": (time.perf_counter() - started) * 1000.0},
+            )
+            logger.warning("Independent sparse recall failed: %s", exc)
+            return [], state
+        self.trace_service.finish_span(
+            output_summary={"hit_count": len(hits), **state},
+            metrics={"latency_ms": (time.perf_counter() - started) * 1000.0},
+        )
+        for rank, hit in enumerate(hits[:50], start=1):
+            self.trace_service.record_snapshot(
+                stage="retrieval.sparse_recall",
+                rank=rank,
+                chunk_id=_safe_chunk_id(hit),
+                file_id=_safe_int(hit.get("file_id")),
+                score=_safe_float(hit.get("sparse_score")),
+                score_parts={"sparse_score": _safe_float(hit.get("sparse_score"))},
+                metadata={
+                    "phase": "output",
+                    "matched_queries": list(hit.get("matched_queries") or []),
+                    "exact_term_match": bool(hit.get("exact_term_match")),
+                    "schema_version": state["schema_version"],
+                    "mapping_hash": state["mapping_hash"],
+                    "query_profile_version": state["query_profile_version"],
+                },
+            )
+        return hits, state
+
+    def _merge_independent_recalls(
+        self,
+        dense_hits: list[dict],
+        sparse_hits: list[dict],
+        *,
+        dense_weight: float,
+        retrieval_mode: str,
+    ) -> list[dict]:
+        dense_ids = {
+            str(hit.get("chunk_id")) for hit in dense_hits if hit.get("chunk_id")
+        }
+        sparse_ids = {
+            str(hit.get("chunk_id")) for hit in sparse_hits if hit.get("chunk_id")
+        }
+        self.trace_service.start_span(
+            "retrieval.hybrid_fusion",
+            input_summary={
+                "dense_count": len(dense_ids),
+                "sparse_count": len(sparse_ids),
+                "dense_weight": dense_weight,
+                "rrf_k": 60,
+            },
+        )
+        fused = weighted_rrf(
+            dense_hits, sparse_hits, dense_weight=dense_weight, rrf_k=60
+        )
+        for hit in fused:
+            hit["retrieval_mode"] = retrieval_mode
+        for rank, hit in enumerate(fused[:50], start=1):
+            self.trace_service.record_snapshot(
+                stage="retrieval.hybrid_fusion",
+                rank=rank,
+                chunk_id=_safe_chunk_id(hit),
+                file_id=_safe_int(hit.get("file_id")),
+                score=_safe_float(hit.get("fused_score")),
+                score_parts={
+                    "dense_score": _safe_float(hit.get("dense_score")),
+                    "sparse_score": _safe_float(hit.get("sparse_score")),
+                    "dense_rank": hit.get("dense_rank"),
+                    "sparse_rank": hit.get("sparse_rank"),
+                    "fused_score": _safe_float(hit.get("fused_score")),
+                },
+                metadata={
+                    "phase": "output",
+                    "recall_sources": hit.get("recall_sources") or [],
+                },
+            )
+        self.trace_service.finish_span(
+            output_summary={
+                "dense_count": len(dense_ids),
+                "sparse_count": len(sparse_ids),
+                "overlap_count": len(dense_ids & sparse_ids),
+                "dense_only_count": len(dense_ids - sparse_ids),
+                "sparse_only_count": len(sparse_ids - dense_ids),
+                "union_count": len(fused),
+            }
+        )
+        return fused
 
     def _search_contextual(
         self,
@@ -339,10 +604,14 @@ class RetrievalService:
         use_l1_llm_navigation: bool = False,
         vector_similarity_weight: float = 1.0,
         scope_file_ids: Optional[set[int]] = None,
+        resolved_scope: Optional[ResolvedFileScope] = None,
     ) -> list[dict]:
-        accessible = self._effective_file_ids(user_id, workspace_id, scope_file_ids)
-        if accessible is not None and len(accessible) == 0:
+        scope = resolved_scope or self._effective_file_scope(
+            user_id, workspace_id, scope_file_ids
+        )
+        if scope.is_empty:
             return []
+        accessible = scope.backend_file_ids()
         query_vec = self._embed_query(query)
 
         # Always hand the effective file ids to the layer store so a large scope
@@ -373,6 +642,7 @@ class RetrievalService:
                 top_k,
                 vector_similarity_weight=vector_similarity_weight,
                 scope_file_ids=scope_file_ids,
+                resolved_scope=scope,
             )
 
         l1_hits = self.layer_store.search_layers(
@@ -406,8 +676,13 @@ class RetrievalService:
         l1_llm_skip_reason = l1_llm_result.skip_reason
 
         fetch_k = min(200, max(top_k * chunk_fetch_multiplier, top_k))
+        dense_stage = (
+            "retrieval.dense_recall"
+            if self.hybrid_recall_mode == "independent_rrf"
+            else "retrieval.chunk_search"
+        )
         self.trace_service.start_span(
-            "retrieval.chunk_search",
+            dense_stage,
             input_summary={"top_k": fetch_k, "file_filter_count": len(candidate_files)},
         )
         try:
@@ -416,13 +691,12 @@ class RetrievalService:
                 top_k=fetch_k,
                 file_ids=candidate_files,
             )
-            self._record_chunk_search_snapshots(chunk_hits)
+            self._record_chunk_search_snapshots(chunk_hits, stage=dense_stage)
             self.trace_service.finish_span(output_summary={"hit_count": len(chunk_hits)})
         except Exception as exc:
             self.trace_service.fail_span(error_message=str(exc))
             raise
         self._enrich_hits(chunk_hits)
-        chunk_hits = self._filter_hits_to_active_files(chunk_hits)  # round-3 #3 backstop
 
         if restrictions:
             chunk_hits = filter_chunk_hits_by_indices(chunk_hits, restrictions)
@@ -450,8 +724,9 @@ class RetrievalService:
             s1 = norm_l1.get(fid, 0.0)
             s2 = norm_chunk[i] if i < len(norm_chunk) else 0.0
             fused = w0 * s0 + w1 * s1 + w2 * s2
+            hit["dense_score"] = hit.get("score")
+            hit["context_score"] = fused
             hit["fused_score"] = fused
-            hit["reranked_score"] = fused
             hit["retrieval_mode"] = "contextual"
 
         l2_mn, l2_mx, l2_av = _milvus_score_stats(chunk_hits)
@@ -472,6 +747,40 @@ class RetrievalService:
             _top_hits_line(chunk_hits, n=3, score_key="fused_score"),
         )
 
+        chunk_hits.sort(key=lambda x: float(x.get("context_score", 0)), reverse=True)
+        if self.hybrid_recall_mode == "independent_rrf":
+            wvec = float(vector_similarity_weight)
+            if wvec >= 1.0 - 1e-12:
+                chunk_hits, _stats = self._validate_and_enrich_hits(
+                    chunk_hits, workspace_id=workspace_id, resolved_scope=scope
+                )
+                result = chunk_hits[:top_k]
+                return _annotate_l1_llm_meta(
+                    result, l1_llm_applied, l1_llm_skip_reason
+                )
+            sparse_hits, sparse_state = self._recall_sparse(
+                query=query,
+                workspace_id=workspace_id,
+                resolved_scope=scope,
+                top_k=fetch_k,
+            )
+            if sparse_state["degraded"] or sparse_state["skip_reason"] is not None:
+                combined = chunk_hits
+            else:
+                combined = self._merge_independent_recalls(
+                    chunk_hits,
+                    sparse_hits,
+                    dense_weight=wvec,
+                    retrieval_mode="contextual",
+                )
+            combined, _stats = self._validate_and_enrich_hits(
+                combined, workspace_id=workspace_id, resolved_scope=scope
+            )
+            result = combined[:top_k]
+            return _annotate_l1_llm_meta(
+                result, l1_llm_applied, l1_llm_skip_reason
+            )
+
         self._blend_elasticsearch_scores(
             query,
             chunk_hits,
@@ -480,6 +789,9 @@ class RetrievalService:
             vector_similarity_weight,
         )
         chunk_hits.sort(key=lambda x: float(x.get("fused_score", 0)), reverse=True)
+        chunk_hits, _stats = self._validate_and_enrich_hits(
+            chunk_hits, workspace_id=workspace_id, resolved_scope=scope
+        )
         logger.info(
             "retrieval_contextual_after_fusion top_k_return=%d top3=[%s]",
             top_k,
@@ -491,12 +803,32 @@ class RetrievalService:
     def _resolve_es_index_names(
         self, workspace_id: Optional[int], file_ids: list[int]
     ) -> list[str]:
-        from openrag.search.workspace_es_slug import build_workspace_chunks_index_name
+        from openrag.search.workspace_es_slug import (
+            build_workspace_chunks_index_name,
+            build_workspace_chunks_read_alias,
+        )
+
+        def target_for(slug: str, workspace_id_value: int) -> str:
+            legacy_index = build_workspace_chunks_index_name(
+                slug, workspace_id_value
+            )
+            read_alias = build_workspace_chunks_read_alias(
+                slug, workspace_id_value
+            )
+            if self.chunk_index_mode == "legacy":
+                return legacy_index
+            if self.fulltext_store is None:
+                raise RuntimeError("Elasticsearch store unavailable")
+            return self.fulltext_store.resolve_read_target(
+                legacy_index=legacy_index,
+                read_alias=read_alias,
+                chunk_index_mode=self.chunk_index_mode,
+            )
 
         if workspace_id is not None:
             ws = self.db.query(Workspace).filter(Workspace.id == workspace_id).first()
             if ws:
-                return [build_workspace_chunks_index_name(ws.slug, ws.id)]
+                return [target_for(ws.slug, ws.id)]
             return []
         if not file_ids:
             return []
@@ -509,7 +841,7 @@ class RetrievalService:
         seen: set[str] = set()
         out: list[str] = []
         for slug, wid in rows:
-            name = build_workspace_chunks_index_name(str(slug), int(wid))
+            name = target_for(str(slug), int(wid))
             if name not in seen:
                 seen.add(name)
                 out.append(name)
@@ -616,7 +948,6 @@ class RetrievalService:
             fused = w * s_v + (1.0 - w) * s_t
             hit["bm25_score"] = s_t
             hit["fused_score"] = fused
-            hit["reranked_score"] = fused
             cid = str(hit.get("chunk_id") or "")
             fusion_rows.append((fused, s_v, s_t, cid, hit.get("file_id")))
 
@@ -663,6 +994,7 @@ class RetrievalService:
         )
 
     def _enrich_hits(self, hits: list[dict]) -> None:
+        """Batch-enrich trusted hits; final filtering belongs to DB validation."""
         chunk_ids = [h.get("chunk_id") for h in hits if h.get("chunk_id")]
         chunk_rows: dict[str, DocumentChunk] = {}
         if chunk_ids:
@@ -673,47 +1005,151 @@ class RetrievalService:
             )
             chunk_rows = {r.chunk_id: r for r in rows}
 
+        file_ids = {row.file_id for row in chunk_rows.values()}
+        file_rows = {
+            row.id: row
+            for row in self.db.query(File).filter(File.id.in_(file_ids)).all()
+        } if file_ids else {}
         for hit in hits:
-            fid = hit.get("file_id")
-            if fid:
-                f = self.db.query(File).filter(File.id == fid).first()
-                if f:
-                    hit["filename"] = f.name
-                    hit["uri"] = f.uri
-            row = chunk_rows.get(hit.get("chunk_id") or "")
+            row = chunk_rows.get(str(hit.get("chunk_id") or ""))
             if row:
-                hit["object_key"] = row.object_key
-                hit["object_url"] = row.object_url
-                hit["local_chunk_path"] = row.local_chunk_path
-                hit["chunk_index"] = row.chunk_index
-                if row.text_preview:
-                    hit["text_preview"] = row.text_preview
-                hit["page"] = row.page
-                hit["level"] = row.level
-                hit["block_type"] = row.block_type
-                hit["start_offset"] = row.start_offset
-                hit["end_offset"] = row.end_offset
-                if row.bbox_x0 is not None:
-                    hit["bbox_x0"] = row.bbox_x0
-                    hit["bbox_y0"] = row.bbox_y0
-                    hit["bbox_x1"] = row.bbox_x1
-                    hit["bbox_y1"] = row.bbox_y1
-                if row.source_block_id:
-                    hit["source_block_id"] = row.source_block_id
-                if row.source_char_start is not None:
-                    hit["source_char_start"] = row.source_char_start
-                if row.source_char_end is not None:
-                    hit["source_char_end"] = row.source_char_end
+                self._apply_enrichment(hit, row, file_rows.get(row.file_id))
+
+    def _validate_and_enrich_hits(
+        self,
+        hits: list[dict],
+        *,
+        workspace_id: Optional[int],
+        resolved_scope: ResolvedFileScope,
+    ) -> tuple[list[dict], dict[str, int]]:
+        """Validate candidates against authoritative chunk, file, and scope state."""
+        stats = {
+            "stale_hit_count": 0,
+            "unauthorized_hit_count": 0,
+            "ownership_mismatch_count": 0,
+            "stale_sparse_hit_count": 0,
+            "unauthorized_sparse_hit_count": 0,
+        }
+        self.trace_service.start_span(
+            "retrieval.db_validation", input_summary={"candidate_count": len(hits)}
+        )
+        chunk_ids = list(
+            dict.fromkeys(
+                str(hit.get("chunk_id"))
+                for hit in hits
+                if hit.get("chunk_id") is not None
+            )
+        )
+        chunks = {
+            row.chunk_id: row
+            for row in self.db.query(DocumentChunk)
+            .filter(DocumentChunk.chunk_id.in_(chunk_ids))
+            .all()
+        } if chunk_ids else {}
+        file_ids = {row.file_id for row in chunks.values()}
+        files = {
+            row.id: row
+            for row in self.db.query(File).filter(File.id.in_(file_ids)).all()
+        } if file_ids else {}
+        allowed = (
+            None
+            if resolved_scope.is_verified_global
+            else set(resolved_scope.allowed_file_ids or ())
+        )
+        validated: list[dict] = []
+        seen: set[str] = set()
+
+        for hit in hits:
+            chunk_id = str(hit.get("chunk_id") or "")
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            is_sparse = "sparse" in (hit.get("recall_sources") or [])
+            chunk = chunks.get(chunk_id)
+            file_row = files.get(chunk.file_id) if chunk is not None else None
+            if chunk is None or file_row is None or file_row.deleted_at is not None:
+                stats["stale_hit_count"] += 1
+                if is_sparse:
+                    stats["stale_sparse_hit_count"] += 1
+                continue
+            try:
+                claimed_file_id = int(hit.get("file_id"))
+            except (TypeError, ValueError):
+                claimed_file_id = None
+            if (
+                claimed_file_id != chunk.file_id
+                or chunk.workspace_id != file_row.workspace_id
+                or (workspace_id is not None and chunk.workspace_id != workspace_id)
+                or (workspace_id is not None and file_row.workspace_id != workspace_id)
+            ):
+                stats["ownership_mismatch_count"] += 1
+                continue
+            if allowed is not None and chunk.file_id not in allowed:
+                stats["unauthorized_hit_count"] += 1
+                if is_sparse:
+                    stats["unauthorized_sparse_hit_count"] += 1
+                continue
+            self._apply_enrichment(hit, chunk, file_row)
+            validated.append(hit)
+
+        stats["valid_hit_count"] = len(validated)
+        self.trace_service.finish_span(output_summary=stats)
+        return validated, stats
+
+    @staticmethod
+    def _apply_enrichment(
+        hit: dict, row: DocumentChunk, file_row: Optional[File]
+    ) -> None:
+        if file_row is not None:
+            hit["filename"] = file_row.name
+            hit["uri"] = file_row.uri
+        hit["object_key"] = row.object_key
+        hit["object_url"] = row.object_url
+        hit["local_chunk_path"] = row.local_chunk_path
+        hit["chunk_index"] = row.chunk_index
+        if row.text_preview:
+            hit["text_preview"] = row.text_preview
+        hit["page"] = row.page
+        hit["level"] = row.level
+        hit["block_type"] = row.block_type
+        hit["start_offset"] = row.start_offset
+        hit["end_offset"] = row.end_offset
+        if row.bbox_x0 is not None:
+            hit["bbox_x0"] = row.bbox_x0
+            hit["bbox_y0"] = row.bbox_y0
+            hit["bbox_x1"] = row.bbox_x1
+            hit["bbox_y1"] = row.bbox_y1
+        if row.source_block_id:
+            hit["source_block_id"] = row.source_block_id
+        if row.source_char_start is not None:
+            hit["source_char_start"] = row.source_char_start
+        if row.source_char_end is not None:
+            hit["source_char_end"] = row.source_char_end
 
     def _accessible_file_ids(
         self, user_id: int, workspace_id: Optional[int] = None
-    ) -> Optional[list[int]]:
-        """Return list of file IDs the user can access, or None for 'all'."""
+    ) -> ResolvedFileScope:
+        """Resolve a verified readable file scope or fail closed."""
         from openrag.models.user import User
 
-        user = self.db.query(User).filter(User.id == user_id).first()
-        if user and getattr(user, "is_admin", False):
-            if workspace_id:
+        try:
+            user = self.db.query(User).filter(User.id == user_id).first()
+            if user and getattr(user, "is_admin", False):
+                if workspace_id is not None:
+                    rows = (
+                        self.db.execute(
+                            select(File.id).where(
+                                File.workspace_id == workspace_id,
+                                File.deleted_at.is_(None),
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    return ResolvedFileScope.finite(rows)
+                return ResolvedFileScope.verified_global()
+
+            if workspace_id is not None:
                 rows = (
                     self.db.execute(
                         select(File.id).where(
@@ -724,23 +1160,8 @@ class RetrievalService:
                     .scalars()
                     .all()
                 )
-                return list(rows)  # empty -> [] (no active files), NOT None
-            return None
+                return ResolvedFileScope.finite(rows)
 
-        if workspace_id:
-            rows = (
-                self.db.execute(
-                    select(File.id).where(
-                        File.workspace_id == workspace_id,
-                        File.deleted_at.is_(None),
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            return list(rows)
-
-        try:
             from openrag.services.workspace_service import WorkspaceService
 
             ws_service = WorkspaceService(self.db)
@@ -749,7 +1170,7 @@ class RetrievalService:
             )
             ws_ids = [ws.id for ws in workspaces]
             if not ws_ids:
-                return []
+                return ResolvedFileScope.finite(())
             rows = (
                 self.db.execute(
                     select(File.id).where(
@@ -760,12 +1181,12 @@ class RetrievalService:
                 .scalars()
                 .all()
             )
-            return list(rows)
-        except Exception:
-            logger.warning(
-                "Could not resolve workspace permissions; searching all files"
-            )
-            return None
+            return ResolvedFileScope.finite(rows)
+        except Exception as exc:
+            logger.exception("Could not resolve workspace permissions; failing closed")
+            raise PermissionScopeResolutionError(
+                "Unable to verify readable file scope"
+            ) from exc
 
     def _filter_to_active_file_ids(self, file_ids: list[int]) -> list[int]:
         """Keep only file_ids whose row is active (deleted_at IS NULL), order preserved.
@@ -808,20 +1229,37 @@ class RetrievalService:
         )
         return [h for h in hits if h.get("file_id") in active]
 
+    def _effective_file_scope(
+        self,
+        user_id: int,
+        workspace_id: Optional[int],
+        scope_file_ids: Optional[set[int]] = None,
+    ) -> ResolvedFileScope:
+        """Return verified permissions intersected with the requested scope."""
+        accessible = self._accessible_file_ids(user_id, workspace_id)
+        if not isinstance(accessible, ResolvedFileScope):
+            raise PermissionScopeResolutionError(
+                "Permission resolver returned an unverified scope"
+            )
+        if scope_file_ids is None:
+            return accessible
+        if accessible.is_verified_global:
+            return ResolvedFileScope.finite(sorted(scope_file_ids))
+        scope = set(scope_file_ids)
+        return ResolvedFileScope.finite(
+            fid for fid in (accessible.allowed_file_ids or ()) if fid in scope
+        )
+
     def _effective_file_ids(
         self,
         user_id: int,
         workspace_id: Optional[int],
         scope_file_ids: Optional[set[int]] = None,
     ) -> Optional[list[int]]:
-        """Return accessible ids intersected with the requested scope."""
-        accessible = self._accessible_file_ids(user_id, workspace_id)
-        if scope_file_ids is None:
-            return accessible
-        if accessible is None:
-            return list(scope_file_ids)
-        scope = set(scope_file_ids)
-        return [fid for fid in accessible if fid in scope]
+        """Compatibility accessor backed by explicit scope resolution."""
+        return self._effective_file_scope(
+            user_id, workspace_id, scope_file_ids
+        ).backend_file_ids()
 
     def _embed_query(self, query: str) -> list[float]:
         model_name = (
@@ -854,10 +1292,12 @@ class RetrievalService:
             )
             raise
 
-    def _record_chunk_search_snapshots(self, hits: list[dict]) -> None:
+    def _record_chunk_search_snapshots(
+        self, hits: list[dict], *, stage: str = "retrieval.chunk_search"
+    ) -> None:
         for rank, hit in enumerate(hits[:50], start=1):
             self.trace_service.record_snapshot(
-                stage="retrieval.chunk_search",
+                stage=stage,
                 rank=rank,
                 chunk_id=_safe_chunk_id(hit),
                 file_id=_safe_int(hit.get("file_id")),

@@ -3,7 +3,7 @@
 import os
 import secrets
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -91,6 +91,28 @@ class ElasticsearchConfig(BaseSettings):
     hosts: str = "http://localhost:9200"
     request_timeout: int = 30
     verify_certs: bool = True
+    hybrid_recall_mode: Literal["legacy", "independent_rrf"] = "legacy"
+    chunk_index_mode: Literal["legacy", "v2_alias"] = "legacy"
+
+    @model_validator(mode="after")
+    def validate_mode_combination(self) -> "ElasticsearchConfig":
+        if self.chunk_index_mode == "v2_alias":
+            if self.hybrid_recall_mode != "independent_rrf":
+                raise ValueError(
+                    "ELASTICSEARCH__CHUNK_INDEX_MODE=v2_alias requires "
+                    "ELASTICSEARCH__HYBRID_RECALL_MODE=independent_rrf"
+                )
+            if not self.enabled:
+                raise ValueError(
+                    "ELASTICSEARCH__CHUNK_INDEX_MODE=v2_alias requires "
+                    "ELASTICSEARCH__ENABLED=true"
+                )
+            if not self.hosts.strip():
+                raise ValueError(
+                    "ELASTICSEARCH__CHUNK_INDEX_MODE=v2_alias requires "
+                    "non-empty ELASTICSEARCH__HOSTS"
+                )
+        return self
 
 
 class PostgresConfig(BaseSettings):

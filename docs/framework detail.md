@@ -433,10 +433,10 @@ L2 就是步骤 2 分块引擎产出的原始切片列表，不做额外处理�
 
 最简单的模式，直接把查询向量化后在向量库里找最近邻。
 
-**向量+全文融合**（`vector_similarity_weight`）：
-- 当 `vector_similarity_weight = 1.0`：只用向量
-- 当 `vector_similarity_weight = 0.7`：70% 向量 + 30% BM25 关键词
-- 公式：`最终分 = w × 向量分(归一化) + (1-w) × BM25分(归一化)`
+**Dense + Sparse 独立召回融合**（`vector_similarity_weight`）：
+- Dense 与 ES BM25 在同一有限授权文件范围内独立召回，按 `chunk_id` 求并集。
+- 使用 Weighted RRF：`w/(60+dense_rank) + (1-w)/(60+sparse_rank)`；`w=1` 为纯 Dense，`w=0` 为纯 Sparse。
+- `fused_score` 只用于当前查询内排序，不是概率、余弦相似度，也不可跨查询比较；融合后统一经过 DB 权威校验。
 
 #### 6.1.2 上下文检索（Contextual，默认推荐）
 
