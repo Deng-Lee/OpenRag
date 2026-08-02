@@ -39,9 +39,9 @@ def test_accessible_excludes_soft_deleted_for_admin_workspace(db):
     dead = File(uri="/b.txt", name="b", owner_id=u.id, workspace_id=w.id, size=0,
                 deleted_at=datetime.now(timezone.utc))
     db.add_all([live, dead]); db.commit(); db.refresh(live)
-    scope = _svc(db)._accessible_file_ids(u.id, w.id)
+    scope = _svc(db).resolve_file_scope(u.id, w.id)
     assert scope.allowed_file_ids == (live.id,)
-    assert scope.resolution_status == "finite"
+    assert not scope.is_verified_global
 
 
 def test_admin_workspace_all_deleted_returns_empty_not_all(db):
@@ -49,7 +49,7 @@ def test_admin_workspace_all_deleted_returns_empty_not_all(db):
     dead = File(uri="/b.txt", name="b", owner_id=u.id, workspace_id=w.id, size=0,
                 deleted_at=datetime.now(timezone.utc))
     db.add(dead); db.commit()
-    scope = _svc(db)._accessible_file_ids(u.id, w.id)
+    scope = _svc(db).resolve_file_scope(u.id, w.id)
     assert scope.is_empty
     assert not scope.is_verified_global
 

@@ -379,6 +379,7 @@ def test_flat_hybrid_returns_sparse_only_hit(db_session, monkeypatch):
         request=request,
         endpoint="semantic",
         rerank_hierarchical_boost=None,
+        workspace_access_prevalidated=True,
     )
 
     assert "chunk-d" in {result.chunk_id for result in response.results}
@@ -419,6 +420,7 @@ def test_flat_hybrid_union_is_reranked_before_final_top_k(db_session, monkeypatc
         request=request,
         endpoint="semantic",
         rerank_hierarchical_boost=None,
+        workspace_access_prevalidated=True,
     )
 
     assert set(captured["chunk_ids"]) == {"chunk-a", "chunk-b", "chunk-c", "chunk-d"}
@@ -505,6 +507,7 @@ def test_v2_sparse_trace_records_contract_and_exact_match_channel(
         request=request,
         endpoint="semantic",
         rerank_hierarchical_boost=None,
+        workspace_access_prevalidated=True,
     )
 
     assert "chunk-d" in {result.chunk_id for result in response.results}
