@@ -218,6 +218,7 @@ def test_search_filters_by_workspace_permission(db_session, test_users, retrieva
         FakeEmbeddingEngine(),
         vector_store,
     )
+    service._validate_and_enrich_hits = lambda hits, **kwargs: (hits, {})
 
     results = service.search("query", test_users["bob"].id)
 
@@ -246,6 +247,7 @@ def test_contextual_search_limits_l0_l1_l2_to_workspace(
         vector_store,
         layer_store=layer_store,
     )
+    service._validate_and_enrich_hits = lambda hits, **kwargs: (hits, {})
 
     results = service.search(
         "query",

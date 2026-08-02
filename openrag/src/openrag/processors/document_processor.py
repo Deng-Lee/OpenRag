@@ -36,12 +36,22 @@ from openrag.services.canonical_chunk_source import (
 )
 from openrag.services.parse_artifact_service import ParseArtifactService
 from openrag.services.trace_service import TraceService
+from openrag.search.es_chunk_contract import (
+    SCHEMA_VERSION as ES_CHUNK_SCHEMA_VERSION,
+    build_chunk_search_document,
+    compute_mapping_hash as compute_es_chunk_mapping_hash,
+)
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
 from ..vectorstore.errors import VectorWriteIncompleteError
 
 logger = logging.getLogger(__name__)
 
 _TEXT_PREVIEW_MAX = 16000
+
+
+class FulltextIndexingError(RuntimeError):
+    """Raised when required full-text indexing cannot be completed."""
+
 
 try:
     from common.token_utils import num_tokens_from_string
@@ -222,6 +232,7 @@ class DocumentProcessor:
         vector_store=None,
         layer_store: Optional["MilvusLayerStore"] = None,
         chunk_fulltext_store: Optional["EsChunkStore"] = None,
+        chunk_index_mode: str = "legacy",
         l0_max_tokens: int = 100,
         l1_max_tokens: int = 2000,
         l1_section_preview_tokens: int = 200,
@@ -246,6 +257,8 @@ class DocumentProcessor:
         self.layer_store = layer_store
         self.require_layer_vectors = require_layer_vectors
         self.chunk_fulltext_store = chunk_fulltext_store
+        self.chunk_index_mode = chunk_index_mode
+        self.fulltext_required = chunk_index_mode == "v2_alias"
         self.generation_context = generation_context
         self._assert_generation_consistency(
             generation_context,
@@ -761,9 +774,9 @@ class DocumentProcessor:
             input_summary={
                 "chunk_count": len(chunk_embeddings),
                 "enabled": (
-                    vectors_stored > 0
-                    and self.chunk_fulltext_store is not None
+                    self.chunk_fulltext_store is not None
                     and self.vector_store is not None
+                    and vectors_stored == len(chunk_embeddings)
                 ),
             },
         )
@@ -771,10 +784,14 @@ class DocumentProcessor:
         es_doc_count = 0
         es_upsert_count = 0
         es_failure_reason = None
+        es_delete_performed = False
+        es_write_complete = False
+        es_physical_index_names: list[str] = []
+        es_write_alias = None
         if (
-            vectors_stored > 0
-            and self.chunk_fulltext_store is not None
+            self.chunk_fulltext_store is not None
             and self.vector_store is not None
+            and vectors_stored == len(chunk_embeddings)
         ):
             ws_row = (
                 self.db.query(Workspace)
@@ -785,15 +802,33 @@ class DocumentProcessor:
                 try:
                     from openrag.search.workspace_es_slug import (
                         build_workspace_chunks_index_name,
-                        normalize_workspace_slug_segment,
+                        build_workspace_chunks_write_alias,
                     )
 
-                    index_name = build_workspace_chunks_index_name(
+                    legacy_index = build_workspace_chunks_index_name(
                         ws_row.slug, ws_row.id
                     )
+                    chunk_index_mode = self.chunk_index_mode
+                    if chunk_index_mode == "legacy":
+                        index_name = legacy_index
+                        self.chunk_fulltext_store.ensure_index(index_name)
+                        es_physical_index_names = [legacy_index]
+                    else:
+                        es_write_alias = build_workspace_chunks_write_alias(
+                            ws_row.slug, ws_row.id
+                        )
+                        index_name = self.chunk_fulltext_store.resolve_write_target(
+                            legacy_index=legacy_index,
+                            write_alias=es_write_alias,
+                            chunk_index_mode=chunk_index_mode,
+                        )
+                        alias_state = self.chunk_fulltext_store.get_alias_state(
+                            [es_write_alias]
+                        )
+                        es_physical_index_names = sorted(
+                            alias_state[es_write_alias]
+                        )
                     es_index_name = index_name
-                    slug_kw = normalize_workspace_slug_segment(ws_row.slug, ws_row.id)
-                    self.chunk_fulltext_store.ensure_index(index_name)
                     es_docs: list[dict] = []
                     for chunk, _emb in chunk_embeddings:
                         cid = str(getattr(chunk, "chunk_id", "") or "")[:64]
@@ -802,35 +837,38 @@ class DocumentProcessor:
                         text = getattr(chunk, "text", str(chunk))
                         md = getattr(chunk, "metadata", {}) or {}
                         es_docs.append(
-                            {
-                                "chunk_id": cid,
-                                "file_id": file_id,
-                                "workspace_id": file_record.workspace_id,
-                                "workspace_slug": slug_kw,
-                                "content": text[:65000],
-                                "doc_type_kwd": str(md.get("doc_type_kwd", "text"))[
-                                    :16
-                                ],
-                                "content_with_weight": str(
-                                    md.get("content_with_weight", text)
-                                )[:65000],
-                                "content_ltks": str(md.get("content_ltks", ""))[:65000],
-                                "content_sm_ltks": str(md.get("content_sm_ltks", ""))[
-                                    :65000
-                                ],
-                                "mom_with_weight": str(md.get("mom_with_weight", ""))[
-                                    :65000
-                                ],
-                            }
+                            build_chunk_search_document(
+                                chunk_id=cid,
+                                file_id=file_id,
+                                workspace_id=file_record.workspace_id,
+                                workspace_slug=ws_row.slug,
+                                content=text,
+                                metadata=md,
+                            )
                         )
+                    if self.fulltext_required:
+                        self.chunk_fulltext_store.delete_by_file_id(
+                            index_name,
+                            file_id,
+                            required=True,
+                        )
+                    else:
+                        self.chunk_fulltext_store.delete_by_file_id(
+                            index_name,
+                            file_id,
+                        )
+                    es_delete_performed = True
                     n_es = self.chunk_fulltext_store.bulk_upsert_chunks(
                         index_name, es_docs
                     )
                     es_doc_count = len(es_docs)
                     es_upsert_count = n_es
-                    print(
-                        f"  [PIPELINE] Step 5a — Indexed {n_es} chunks in Elasticsearch"
-                    )
+                    es_write_complete = n_es == es_doc_count
+                    if not es_write_complete:
+                        es_failure_reason = (
+                            f"partial_write:{es_upsert_count}/{es_doc_count}"
+                        )
+                    print(f"  [PIPELINE] Step 5a — Indexed {n_es} chunks in Elasticsearch")
                 except Exception as exc:
                     es_failure_reason = str(exc)
                     logger.warning("Elasticsearch chunk index failed: %s", exc)
@@ -838,8 +876,9 @@ class DocumentProcessor:
                 es_failure_reason = "workspace_not_found"
         else:
             es_failure_reason = (
-                "not_enabled_or_no_vectors"
+                "not_enabled_or_incomplete_vectors"
                 if self.chunk_fulltext_store is None or self.vector_store is None
+                or vectors_stored != len(chunk_embeddings)
                 else None
             )
         _safe_finish_span(
@@ -849,9 +888,19 @@ class DocumentProcessor:
                 "index_name": es_index_name,
                 "doc_count": es_doc_count,
                 "upsert_count": es_upsert_count,
+                "es_delete_performed": es_delete_performed,
+                "es_write_complete": es_write_complete,
                 "failure_reason": es_failure_reason,
+                "physical_index_names": es_physical_index_names,
+                "write_alias": es_write_alias,
+                "schema_version": ES_CHUNK_SCHEMA_VERSION,
+                "mapping_hash": compute_es_chunk_mapping_hash(),
             },
         )
+        if self.fulltext_required and es_failure_reason is not None:
+            raise FulltextIndexingError(
+                f"Required Elasticsearch chunk indexing failed: {es_failure_reason}"
+            )
 
         # Step 5b: L0/L1 向量写入 Milvus（与 openrag_layers 集合对齐）
         n_layers = 0

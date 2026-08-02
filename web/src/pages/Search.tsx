@@ -391,7 +391,12 @@ export default function SearchPage() {
                 <Form.Item name="top_k" label={t('searchPage.top_k')} style={{ marginBottom: 0 }}>
                   <InputNumber min={1} max={100} />
                 </Form.Item>
-                <Form.Item name="vector_similarity_weight" label={t('searchPage.vector_weight')} style={{ marginBottom: 0 }}>
+                <Form.Item
+                  name="vector_similarity_weight"
+                  label={t('searchPage.vector_weight')}
+                  extra={t('searchPage.vector_weight_help')}
+                  style={{ marginBottom: 0 }}
+                >
                   <InputNumber min={0} max={1} step={0.1} precision={2} />
                 </Form.Item>
                 <Form.Item name="search_mode" label={t('searchPage.mode')} style={{ marginBottom: 0 }}>

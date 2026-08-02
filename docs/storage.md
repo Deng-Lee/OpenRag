@@ -101,7 +101,7 @@ Elasticsearch 是可选全文索引。只有在配置启用且连接可用时，
 | --- | --- | --- |
 | chunk 全文索引 | 每个工作区一个 index，例如 `openrag_ws_<slug>_chunks` | `chunk_id`、`file_id`、`workspace_id`、`workspace_slug`、`content`，以及写入时附带的 `doc_type_kwd`、`content_with_weight`、`content_ltks`、`content_sm_ltks`、`mom_with_weight` 等字段。 |
 
-检索时，Elasticsearch 主要用于给候选 chunk 计算 BM25 或全文匹配分数，再与向量分数进行融合。
+检索时，Elasticsearch 在有限授权文件范围内独立召回 BM25 候选；系统将其与 Dense 候选按 `chunk_id` 求并集，再使用 Weighted RRF 融合名次。
 
 ## 当前不会持久化的中间产物
 

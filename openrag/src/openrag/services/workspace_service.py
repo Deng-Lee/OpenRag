@@ -1,16 +1,37 @@
 """Workspace service for business logic"""
 
-from typing import List, Optional
+import logging
+from typing import TYPE_CHECKING, List, Optional
+
 from sqlalchemy.orm import Session
+
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.models.user import User
+
+if TYPE_CHECKING:
+    from openrag.search.workspace_index_lifecycle import (
+        WorkspaceIndexLifecycle,
+        WorkspaceIndexProvisionReceipt,
+    )
+
+logger = logging.getLogger(__name__)
 
 
 class WorkspaceService:
     """Service for workspace operations"""
 
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        *,
+        index_lifecycle: Optional["WorkspaceIndexLifecycle"] = None,
+        chunk_index_mode: str = "legacy",
+    ):
         self.db = db
+        self.index_lifecycle = index_lifecycle
+        self.chunk_index_mode = chunk_index_mode
+        if chunk_index_mode == "v2_alias" and index_lifecycle is None:
+            raise ValueError("v2_alias requires a workspace index lifecycle")
 
     def create_workspace(
         self,
@@ -23,6 +44,7 @@ class WorkspaceService:
         priority_strategy: str = "file_size",
     ) -> Workspace:
         """Create a new workspace and add owner as admin member"""
+        receipt: Optional["WorkspaceIndexProvisionReceipt"] = None
         workspace = Workspace(
             name=name,
             slug=slug,
@@ -32,15 +54,34 @@ class WorkspaceService:
             max_storage_bytes=max_storage_bytes,
             priority_strategy=priority_strategy,
         )
-        self.db.add(workspace)
-        self.db.flush()  # Get workspace.id
+        try:
+            self.db.add(workspace)
+            self.db.flush()  # Get workspace.id
 
-        # Add owner as admin member
-        member = WorkspaceMember(
-            workspace_id=workspace.id, user_id=owner_id, role="admin"
-        )
-        self.db.add(member)
-        self.db.commit()
+            member = WorkspaceMember(
+                workspace_id=workspace.id, user_id=owner_id, role="admin"
+            )
+            self.db.add(member)
+            self.db.flush()
+            if self.chunk_index_mode == "v2_alias":
+                receipt = self.index_lifecycle.ensure_ready(
+                    workspace_id=workspace.id,
+                    workspace_slug=workspace.slug,
+                )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            if receipt is not None:
+                try:
+                    self.index_lifecycle.rollback_provision(receipt)
+                except Exception:
+                    logger.exception(
+                        "Failed to compensate workspace index provisioning "
+                        "workspace_id=%s slug=%s",
+                        workspace.id,
+                        workspace.slug,
+                    )
+            raise
         self.db.refresh(workspace)
 
         return workspace
@@ -281,7 +322,17 @@ class WorkspaceService:
         """Delete a workspace (cascade deletes members)"""
         workspace = self.get_workspace(workspace_id)
         if workspace:
-            self.db.delete(workspace)
-            self.db.commit()
+            try:
+                self.db.delete(workspace)
+                self.db.flush()
+                if self.chunk_index_mode == "v2_alias":
+                    self.index_lifecycle.delete_workspace_indices(
+                        workspace_id=workspace.id,
+                        workspace_slug=workspace.slug,
+                    )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
             return True
         return False

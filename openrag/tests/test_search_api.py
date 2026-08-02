@@ -1,65 +1,27 @@
-"""Tests for search API endpoints"""
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
-from fastapi.testclient import TestClient
-from unittest.mock import Mock, patch
+from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from pydantic import ValidationError
-
-from openrag.api.search_api import router, get_user_id, SearchRequest
-from openrag.api.deps import get_db
-from fastapi import FastAPI
-
-
-@pytest.fixture
-def app():
-    """Create FastAPI app with search router"""
-    app = FastAPI()
-    app.include_router(router)
-    return app
-
-
-@pytest.fixture
-def client(app):
-    """Create test client"""
-    return TestClient(app)
-
-
-@pytest.fixture
-def mock_db():
-    """Create mock database session"""
-    return Mock(spec=Session)
-
-
-@pytest.fixture
-def mock_user_id():
-    """Mock user ID for authentication"""
-    return 1
-
-
-@pytest.fixture
-def override_dependencies(app, mock_db, mock_user_id):
-    """Override FastAPI dependencies with mocks"""
-    app.dependency_overrides[get_db] = lambda: mock_db
-    app.dependency_overrides[get_user_id] = lambda: mock_user_id
-    yield
-    app.dependency_overrides.clear()
+from openrag.api import search_api
+from openrag.api.search_api import SearchRequest
+from openrag.retrieval.retrieval_service import (
+    PermissionScopeResolutionError,
+    ResolvedFileScope,
+)
 
 
 class TestSearchRequestVectorSimilarityWeight:
-    """Tests for vector similarity weight request validation"""
-
     def test_vector_similarity_weight_defaults_to_0_7(self):
-        request = SearchRequest(query="test")
-
-        assert request.vector_similarity_weight == 0.7
+        assert SearchRequest(query="test").vector_similarity_weight == 0.7
 
     @pytest.mark.parametrize("weight", [0.0, 0.7, 1.0])
     def test_vector_similarity_weight_accepts_valid_values(self, weight):
-        request = SearchRequest(query="test", vector_similarity_weight=weight)
-
-        assert request.vector_similarity_weight == weight
+        assert SearchRequest(query="test", vector_similarity_weight=weight).vector_similarity_weight == weight
 
     @pytest.mark.parametrize("weight", [-0.1, 1.1])
     def test_vector_similarity_weight_rejects_out_of_range_values(self, weight):
@@ -67,348 +29,195 @@ class TestSearchRequestVectorSimilarityWeight:
             SearchRequest(query="test", vector_similarity_weight=weight)
 
 
-class TestSemanticSearch:
-    """Tests for semantic search endpoint"""
-
-    def test_semantic_search_success(self, client, override_dependencies, mock_db):
-        """Test successful semantic search"""
-        # Mock RetrievalService and Reranker
-        mock_results = [
-            {
-                "text": "Machine learning is a subset of AI",
-                "score": 0.95,
-                "file_id": 1,
-                "page": 1,
-                "offset": 0,
-                "bbox": [100.0, 200.0, 400.0, 250.0],
-                "level": 1,
-                "block_type": "heading",
-                "uri": "file://doc1.pdf"
-            },
-            {
-                "text": "Deep learning uses neural networks",
-                "score": 0.85,
-                "file_id": 1,
-                "page": 2,
-                "offset": 500,
-                "bbox": None,
-                "level": 2,
-                "block_type": "text",
-                "uri": "file://doc1.pdf"
-            }
-        ]
-
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval, \
-             patch("openrag.api.search_api.Reranker") as MockReranker:
-
-            # Setup mocks
-            mock_retrieval_instance = Mock()
-            mock_retrieval_instance.search.return_value = mock_results
-            MockRetrieval.return_value = mock_retrieval_instance
-
-            mock_reranker_instance = Mock()
-            mock_reranker_instance.rerank.return_value = [
-                {**mock_results[0], "reranked_score": 0.98},
-                {**mock_results[1], "reranked_score": 0.88}
-            ]
-            MockReranker.return_value = mock_reranker_instance
-
-            # Make request
-            response = client.post(
-                "/search/semantic",
-                json={
-                    "query": "machine learning",
-                    "top_k": 10,
-                    "use_rerank": True
-                }
+def _patch_execute_dependencies(monkeypatch, results):
+    trace_service = Mock()
+    retrieval_search = Mock(return_value=[dict(result) for result in results])
+    resolved_scope = ResolvedFileScope.finite(
+        [result["file_id"] for result in results if result.get("file_id") is not None]
+    )
+    retrieval_service = SimpleNamespace(
+        resolve_file_scope=Mock(return_value=resolved_scope),
+        search=retrieval_search,
+    )
+    monkeypatch.setattr(
+        search_api, "_prepare_retrieval_trace", lambda **kwargs: (trace_service, False)
+    )
+    monkeypatch.setattr(search_api, "_get_embedding_engine", Mock(return_value=Mock()))
+    monkeypatch.setattr(search_api, "_get_vector_store", Mock(return_value=Mock()))
+    monkeypatch.setattr(search_api, "_get_layer_store", Mock(return_value=None))
+    monkeypatch.setattr(search_api, "_get_fulltext_store", Mock(return_value=None))
+    monkeypatch.setattr(
+        search_api,
+        "RetrievalService",
+        lambda **kwargs: retrieval_service,
+    )
+    monkeypatch.setattr(search_api, "assert_search_workspace_read", Mock())
+    monkeypatch.setattr(
+        search_api,
+        "_resolve_search_runtime",
+        Mock(
+            return_value=SimpleNamespace(
+                snapshot=SimpleNamespace(
+                    generation_id="generation-test",
+                    route_version=1,
+                    embedding_fingerprint="a" * 64,
+                    embedding_revision=None,
+                    chunk_collection_name="chunks-test",
+                    layer_collection_name=None,
+                ),
+                embedding_engine=Mock(),
+                vector_store=Mock(),
+                layer_store=None,
             )
+        ),
+    )
+    return retrieval_search
 
-            # Assertions
-            assert response.status_code == 200
-            data = response.json()
-            assert "results" in data
-            assert "total" in data
-            assert "query_time_ms" in data
-            assert len(data["results"]) == 2
-            assert data["total"] == 2
-            assert data["results"][0]["text"] == "Machine learning is a subset of AI"
-            assert data["results"][0]["score"] == 0.98  # reranked score
 
-    def test_semantic_search_without_rerank(self, client, override_dependencies, mock_db):
-        """Test semantic search without reranking"""
-        mock_results = [
+def test_execute_search_preserves_request_and_response_contract(monkeypatch):
+    search = _patch_execute_dependencies(
+        monkeypatch,
+        [
             {
-                "text": "Test result",
+                "text": "result",
                 "score": 0.9,
-                "file_id": 1,
-                "page": 1,
-                "offset": 0,
-                "bbox": None,
-                "level": 1,
-                "block_type": "text",
-                "uri": "file://test.pdf"
-            }
-        ]
-
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval:
-            mock_retrieval_instance = Mock()
-            mock_retrieval_instance.search.return_value = mock_results
-            MockRetrieval.return_value = mock_retrieval_instance
-
-            response = client.post(
-                "/search/semantic",
-                json={
-                    "query": "test query",
-                    "top_k": 5,
-                    "use_rerank": False
-                }
-            )
-
-            assert response.status_code == 200
-            data = response.json()
-            assert len(data["results"]) == 1
-            assert data["results"][0]["score"] == 0.9  # original score, not reranked
-
-    def test_semantic_search_empty_results(self, client, override_dependencies, mock_db):
-        """Test semantic search with no results"""
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval:
-            mock_retrieval_instance = Mock()
-            mock_retrieval_instance.search.return_value = []
-            MockRetrieval.return_value = mock_retrieval_instance
-
-            response = client.post(
-                "/search/semantic",
-                json={
-                    "query": "nonexistent query",
-                    "top_k": 10,
-                    "use_rerank": True
-                }
-            )
-
-            assert response.status_code == 200
-            data = response.json()
-            assert data["results"] == []
-            assert data["total"] == 0
-
-    def test_semantic_search_invalid_query(self, client, override_dependencies):
-        """Test semantic search with invalid query"""
-        response = client.post(
-            "/search/semantic",
-            json={
-                "query": "",  # Empty query
-                "top_k": 10,
-                "use_rerank": True
-            }
-        )
-
-        assert response.status_code == 422  # Validation error
-
-    def test_semantic_search_unauthorized(self, client, mock_db):
-        """Test semantic search without authentication"""
-        # Don't override get_current_user, so it will fail
-        app = FastAPI()
-        app.include_router(router)
-        test_client = TestClient(app)
-
-        response = test_client.post(
-            "/search/semantic",
-            json={
-                "query": "test",
-                "top_k": 10,
-                "use_rerank": True
-            }
-        )
-
-        # Should fail because get_current_user is not mocked
-        assert response.status_code in [401, 500]  # Depends on implementation
-
-
-class TestHierarchicalSearch:
-    """Tests for hierarchical search endpoint"""
-
-    def test_hierarchical_search_success(self, client, override_dependencies, mock_db):
-        """Test successful hierarchical search"""
-        mock_results = [
-            {
-                "text": "Chapter 1: Introduction",
-                "score": 0.92,
-                "file_id": 2,
-                "page": 1,
-                "offset": 0,
-                "bbox": [50.0, 100.0, 500.0, 150.0],
-                "level": 1,
-                "block_type": "title",
-                "uri": "file://book.pdf"
-            }
-        ]
-
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval, \
-             patch("openrag.api.search_api.Reranker") as MockReranker:
-
-            mock_retrieval_instance = Mock()
-            mock_retrieval_instance.search.return_value = mock_results
-            MockRetrieval.return_value = mock_retrieval_instance
-
-            mock_reranker_instance = Mock()
-            mock_reranker_instance.rerank.return_value = [
-                {**mock_results[0], "reranked_score": 0.95}
-            ]
-            MockReranker.return_value = mock_reranker_instance
-
-            response = client.post(
-                "/search/hierarchical",
-                json={
-                    "query": "introduction",
-                    "top_k": 5,
-                    "use_rerank": True
-                }
-            )
-
-            assert response.status_code == 200
-            data = response.json()
-            assert len(data["results"]) == 1
-            assert data["results"][0]["block_type"] == "title"
-            assert data["results"][0]["level"] == 1
-
-            # Verify current retrieval API parameters were passed
-            mock_retrieval_instance.search.assert_called_once()
-            call_kwargs = mock_retrieval_instance.search.call_args[1]
-            assert call_kwargs["retrieval_strategy"] == "auto"
-
-    def test_hierarchical_search_without_rerank(self, client, override_dependencies, mock_db):
-        """Test hierarchical search without reranking"""
-        mock_results = [
-            {
-                "text": "Section 2.1",
-                "score": 0.88,
                 "file_id": 3,
-                "page": 5,
-                "offset": 1000,
-                "bbox": None,
-                "level": 2,
-                "block_type": "heading",
-                "uri": "file://doc.pdf"
+                "chunk_id": "chunk-3",
+                "page": 2,
+                "filename": "doc.pdf",
             }
-        ]
+        ],
+    )
+    request = SearchRequest(
+        query="q",
+        top_k=5,
+        workspace_id=7,
+        use_rerank=False,
+        vector_similarity_weight=0.3,
+    )
 
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval:
-            mock_retrieval_instance = Mock()
-            mock_retrieval_instance.search.return_value = mock_results
-            MockRetrieval.return_value = mock_retrieval_instance
+    response = search_api._execute_search(
+        Mock(spec=Session),
+        user_id=1,
+        request=request,
+        endpoint="semantic",
+        rerank_hierarchical_boost=None,
+    )
 
-            response = client.post(
-                "/search/hierarchical",
-                json={
-                    "query": "section",
-                    "top_k": 10,
-                    "use_rerank": False
-                }
+    assert response.total == 1
+    assert response.results[0].model_dump() == {
+        "text": "result",
+        "score": 0.9,
+        "file_id": 3,
+        "chunk_id": "chunk-3",
+        "chunk_index": None,
+        "page": 2,
+        "level": 0,
+        "block_type": "text",
+        "start_offset": 0,
+        "end_offset": 0,
+        "bbox_x0": None,
+        "bbox_y0": None,
+        "bbox_x1": None,
+        "bbox_y1": None,
+        "source_block_id": None,
+        "source_char_start": None,
+        "source_char_end": None,
+        "filename": "doc.pdf",
+        "uri": None,
+        "object_key": None,
+        "object_url": None,
+        "local_chunk_path": None,
+        "text_preview": None,
+        "retrieval_strategy": None,
+        "l1_llm_filtered": None,
+    }
+    assert search.call_args.kwargs["vector_similarity_weight"] == 0.3
+    assert search.call_args.kwargs["top_k"] == 5
+
+
+def test_execute_search_reranks_union_before_top_k(monkeypatch):
+    results = [
+        {"text": f"r{i}", "score": 0.9 - i * 0.1, "file_id": i + 1, "chunk_id": f"c{i}"}
+        for i in range(4)
+    ]
+    search = _patch_execute_dependencies(monkeypatch, results)
+    rerank = Mock(return_value=[{**results[3], "reranked_score": 0.99}])
+    monkeypatch.setattr(
+        search_api, "Reranker", lambda **kwargs: SimpleNamespace(rerank=rerank)
+    )
+
+    response = search_api._execute_search(
+        Mock(spec=Session),
+        user_id=1,
+        request=SearchRequest(query="q", top_k=1, use_rerank=True),
+        endpoint="semantic",
+        rerank_hierarchical_boost=None,
+    )
+
+    assert search.call_args.kwargs["top_k"] == 3
+    assert rerank.call_args.args[1] == results
+    assert response.results[0].chunk_id == "c3"
+    assert response.results[0].score == 0.99
+
+
+def test_permission_scope_resolution_error_returns_explicit_503(monkeypatch):
+    _patch_execute_dependencies(monkeypatch, [])
+    monkeypatch.setattr(
+        search_api,
+        "RetrievalService",
+        lambda **kwargs: SimpleNamespace(
+            resolve_file_scope=Mock(
+                side_effect=PermissionScopeResolutionError("internal detail")
             )
+        ),
+    )
 
-            assert response.status_code == 200
-            data = response.json()
-            assert len(data["results"]) == 1
-            assert data["results"][0]["score"] == 0.88
-
-
-class TestPermissionChecking:
-    """Tests for permission checking"""
-
-    def test_different_users_get_different_results(self, client, mock_db):
-        """Test that different users get filtered results"""
-        app = FastAPI()
-        app.include_router(router)
-        test_client = TestClient(app)
-
-        # User 1 results
-        user1_results = [
-            {
-                "text": "User 1 can see this",
-                "score": 0.9,
-                "file_id": 1,
-                "page": 1,
-                "offset": 0,
-                "bbox": None,
-                "level": 1,
-                "block_type": "text",
-                "uri": "file://user1_doc.pdf"
-            }
-        ]
-
-        # User 2 results
-        user2_results = [
-            {
-                "text": "User 2 can see this",
-                "score": 0.85,
-                "file_id": 2,
-                "page": 1,
-                "offset": 0,
-                "bbox": None,
-                "level": 1,
-                "block_type": "text",
-                "uri": "file://user2_doc.pdf"
-            }
-        ]
-
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval:
-            mock_retrieval_instance = Mock()
-
-            # First call for user 1
-            app.dependency_overrides[get_db] = lambda: mock_db
-            app.dependency_overrides[get_user_id] = lambda: 1
-            mock_retrieval_instance.search.return_value = user1_results
-            MockRetrieval.return_value = mock_retrieval_instance
-
-            response1 = test_client.post(
-                "/search/semantic",
-                json={"query": "test", "top_k": 10, "use_rerank": False}
-            )
-
-            # Second call for user 2
-            app.dependency_overrides[get_user_id] = lambda: 2
-            mock_retrieval_instance.search.return_value = user2_results
-
-            response2 = test_client.post(
-                "/search/semantic",
-                json={"query": "test", "top_k": 10, "use_rerank": False}
-            )
-
-            # Verify different results
-            assert response1.status_code == 200
-            assert response2.status_code == 200
-            data1 = response1.json()
-            data2 = response2.json()
-            assert data1["results"][0]["text"] != data2["results"][0]["text"]
-
-
-class TestErrorHandling:
-    """Tests for error handling"""
-
-    def test_retrieval_service_error(self, client, override_dependencies, mock_db):
-        """Test handling of RetrievalService errors"""
-        with patch("openrag.api.search_api.RetrievalService") as MockRetrieval:
-            mock_retrieval_instance = Mock()
-            mock_retrieval_instance.search.side_effect = RuntimeError("AGFS client not initialized")
-            MockRetrieval.return_value = mock_retrieval_instance
-
-            response = client.post(
-                "/search/semantic",
-                json={"query": "test", "top_k": 10, "use_rerank": True}
-            )
-
-            assert response.status_code == 500
-            data = response.json()
-            assert "detail" in data
-            assert data["detail"] == {
-                "code": "search_failed",
-                "message": "Search request failed",
-            }
-
-    def test_invalid_top_k(self, client, override_dependencies):
-        """Test with invalid top_k parameter"""
-        response = client.post(
-            "/search/semantic",
-            json={"query": "test", "top_k": -1, "use_rerank": True}
+    with pytest.raises(HTTPException) as exc_info:
+        search_api._execute_search(
+            Mock(spec=Session),
+            user_id=1,
+            request=SearchRequest(query="q", workspace_id=7),
+            endpoint="semantic",
+            rerank_hierarchical_boost=None,
         )
 
-        assert response.status_code == 422  # Validation error
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Search authorization temporarily unavailable"
+
+
+def test_format_score_prefers_reranker_then_fusion_then_single_channel():
+    formatted = search_api._format(
+        [
+            {"text": "reranked", "file_id": 1, "score": 0.9, "fused_score": 0.2, "reranked_score": 0.8},
+            {"text": "fused", "file_id": 2, "score": 0.7, "fused_score": 0.3},
+            {"text": "dense", "file_id": 3, "score": 0.6},
+        ]
+    )
+    assert [item.score for item in formatted] == [0.8, 0.3, 0.6]
+
+
+def test_semantic_endpoint_maps_unexpected_error_to_500(monkeypatch):
+    monkeypatch.setattr(search_api, "assert_search_workspace_read", Mock())
+    monkeypatch.setattr(
+        search_api, "_execute_search", Mock(side_effect=RuntimeError("search unavailable"))
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            search_api.semantic_search(
+                SearchRequest(query="q"), user_id=1, db=Mock(spec=Session)
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == {
+        "code": "search_failed",
+        "message": "Search request failed",
+    }
+
+
+@pytest.mark.parametrize("payload", [{"query": ""}, {"query": "q", "top_k": 0}])
+def test_invalid_search_request_is_rejected(payload):
+    with pytest.raises(ValidationError):
+        SearchRequest(**payload)

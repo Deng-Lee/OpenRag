@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 import hashlib
+import math
 import time
 import uuid
 from typing import Any, Optional
@@ -285,21 +286,47 @@ class EvalService:
             if result.metrics.get("status") != "failed"
         ]
         summary = _average_numeric_metrics(successful_metrics)
-        latencies = sorted(
-            float(metrics["latency_ms"])
-            for metrics in successful_metrics
-            if isinstance(metrics.get("latency_ms"), (int, float))
+        p95_latency_ms = _percentile(
+            [
+                float(metrics["latency_ms"])
+                for metrics in successful_metrics
+                if isinstance(metrics.get("latency_ms"), (int, float))
+            ],
+            0.95,
         )
-        if latencies:
-            summary["latency_p95_ms"] = latencies[
-                min(len(latencies) - 1, max(0, (95 * len(latencies) + 99) // 100 - 1))
-            ]
+        # Keep the deploy-main metric name while exposing the accuracy-fix name.
+        summary["latency_p95_ms"] = p95_latency_ms
+        summary["p95_latency_ms"] = p95_latency_ms
+        query_types = {
+            query.id: str(query.query_type or "untyped")
+            for query in self.db.query(EvalQuery)
+            .filter(EvalQuery.dataset_id == run.dataset_id)
+            .all()
+        }
+        grouped_results: dict[str, list[EvalResult]] = {}
+        for result in query_results:
+            query_type = query_types.get(result.eval_query_id, "untyped")
+            grouped_results.setdefault(query_type, []).append(result)
+        query_type_groups = {
+            query_type: _summarize_result_group(results)
+            for query_type, results in sorted(grouped_results.items())
+        }
         summary.update(
             {
                 "status": "success",
                 "query_count": len(query_results),
                 "success_count": len(successful_metrics),
                 "failed_count": failed_count,
+                "query_type_groups": query_type_groups,
+                "exact_identifier_hit_rate@10": query_type_groups.get(
+                    "exact_identifier", {}
+                ).get("hit_rate@10", 0.0),
+                "content_natural_language_recall@20": query_type_groups.get(
+                    "content_natural_language", {}
+                ).get("recall@20", 0.0),
+                "no_answer_false_positive_rate": query_type_groups.get(
+                    "no_answer", {}
+                ).get("false_positive_rate", 0.0),
             }
         )
 
@@ -347,13 +374,14 @@ class EvalService:
         )
 
         try:
-            query_started = time.monotonic()
+            search_started = time.perf_counter()
             raw_output = self.search_callable(
                 query=eval_query.query_text,
                 user_id=run.created_by or 0,
                 workspace_id=dataset.workspace_id,
                 **config,
             )
+            latency_ms = (time.perf_counter() - search_started) * 1000.0
             results, stage_snapshots = _normalize_search_output(raw_output)
             if not stage_snapshots:
                 stage_snapshots = {"final": results}
@@ -370,7 +398,10 @@ class EvalService:
                 {
                     "status": "success",
                     "result_count": len(results),
-                    "latency_ms": (time.monotonic() - query_started) * 1000,
+                    "latency_ms": latency_ms,
+                    "false_positive": (
+                        1.0 if not judgments and len(results) > 0 else 0.0
+                    ),
                 }
             )
             trace_service.finish_span(
@@ -512,7 +543,19 @@ def _query_metrics(
     top_k: int,
     source_scope: str,
 ) -> dict[str, Any]:
-    return {
+    metrics = {
+        "recall@20": recall_at_k(
+            results, judgments, 20, source_scope=source_scope
+        ),
+        "hit_rate@10": hit_rate_at_k(
+            results, judgments, 10, source_scope=source_scope
+        ),
+        "mrr@10": mrr_at_k(
+            results, judgments, k=10, source_scope=source_scope
+        ),
+        "ndcg@10": ndcg_at_k(
+            results, judgments, 10, source_scope=source_scope
+        ),
         f"precision@{top_k}": precision_at_k(results, judgments, top_k, source_scope=source_scope),
         f"recall@{top_k}": recall_at_k(results, judgments, top_k, source_scope=source_scope),
         f"hit_rate@{top_k}": hit_rate_at_k(results, judgments, top_k, source_scope=source_scope),
@@ -521,6 +564,7 @@ def _query_metrics(
         f"ndcg@{top_k}": ndcg_at_k(results, judgments, top_k, source_scope=source_scope),
         "stage_recall@50": stage_recall_at_k(stage_snapshots, judgments, k=50, source_scope=source_scope),
     }
+    return metrics
 
 
 def _average_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -537,6 +581,45 @@ def _average_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> dict[
         if values:
             averages[key] = sum(float(value) for value in values) / len(values)
     return averages
+
+
+def _summarize_result_group(results: Sequence[EvalResult]) -> dict[str, Any]:
+    successful = [
+        result.metrics
+        for result in results
+        if result.metrics.get("status") != "failed"
+    ]
+    summary = _average_numeric_metrics(successful)
+    summary.update(
+        {
+            "query_count": len(results),
+            "success_count": len(successful),
+            "failed_count": len(results) - len(successful),
+            "p95_latency_ms": _percentile(
+                [
+                    float(metrics["latency_ms"])
+                    for metrics in successful
+                    if isinstance(metrics.get("latency_ms"), (int, float))
+                ],
+                0.95,
+            ),
+            "false_positive_rate": (
+                sum(float(metrics.get("false_positive", 0.0)) for metrics in successful)
+                / len(successful)
+                if successful
+                else 0.0
+            ),
+        }
+    )
+    return summary
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    rank = max(0, math.ceil(quantile * len(ordered)) - 1)
+    return ordered[rank]
 
 
 def _normalize_search_output(raw_output: Any) -> tuple[list[Any], dict[str, list[Any]]]:

@@ -6,13 +6,36 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from openrag.api.deps import get_current_user, get_db, get_workspace, get_workspace_admin
+from openrag.config import get_config
 from openrag.models.user import User
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.models.role import Role, RoleWorkspacePermission, UserRole
+from openrag.search.es_chunk_store import (
+    ElasticsearchRequiredError,
+    require_es_chunk_store_from_config,
+)
+from openrag.search.workspace_index_lifecycle import (
+    WorkspaceIndexCleanupError,
+    WorkspaceIndexConflictError,
+    WorkspaceIndexLifecycle,
+    WorkspaceIndexProvisionError,
+)
 from openrag.services.workspace_service import WorkspaceService
 
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
+
+
+def _workspace_service(db: Session) -> WorkspaceService:
+    chunk_index_mode = get_config().elasticsearch.chunk_index_mode
+    lifecycle = None
+    if chunk_index_mode == "v2_alias":
+        lifecycle = WorkspaceIndexLifecycle(require_es_chunk_store_from_config())
+    return WorkspaceService(
+        db,
+        index_lifecycle=lifecycle,
+        chunk_index_mode=chunk_index_mode,
+    )
 
 
 # Pydantic schemas
@@ -93,8 +116,6 @@ async def create_workspace(
             detail="Only administrators can create workspaces"
         )
 
-    service = WorkspaceService(db)
-
     # Check if slug already exists
     existing = db.query(Workspace).filter(Workspace.slug == request.slug).first()
     if existing:
@@ -103,15 +124,27 @@ async def create_workspace(
             detail=f"Workspace with slug '{request.slug}' already exists"
         )
 
-    workspace = service.create_workspace(
-        name=request.name,
-        slug=request.slug,
-        description=request.description,
-        owner_id=current_user.id,
-        max_concurrent_tasks=request.max_concurrent_tasks,
-        max_storage_bytes=request.max_storage_bytes,
-        priority_strategy=request.priority_strategy
-    )
+    try:
+        service = _workspace_service(db)
+        workspace = service.create_workspace(
+            name=request.name,
+            slug=request.slug,
+            description=request.description,
+            owner_id=current_user.id,
+            max_concurrent_tasks=request.max_concurrent_tasks,
+            max_storage_bytes=request.max_storage_bytes,
+            priority_strategy=request.priority_strategy
+        )
+    except WorkspaceIndexConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Workspace search index conflict: {exc}",
+        ) from exc
+    except (ElasticsearchRequiredError, WorkspaceIndexProvisionError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Workspace search index unavailable: {exc}",
+        ) from exc
 
     return WorkspaceResponse(
         id=workspace.id,
@@ -276,8 +309,19 @@ async def delete_workspace(
     db: Session = Depends(get_db)
 ):
     """Delete workspace (admin only)"""
-    service = WorkspaceService(db)
-    service.delete_workspace(workspace.id)
+    try:
+        service = _workspace_service(db)
+        service.delete_workspace(workspace.id)
+    except ElasticsearchRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Workspace search index unavailable: {exc}",
+        ) from exc
+    except WorkspaceIndexCleanupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Workspace search index cleanup failed: {exc}",
+        ) from exc
 
     return MessageResponse(message="Workspace deleted successfully")
 

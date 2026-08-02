@@ -1,0 +1,64 @@
+[
+  {
+    "query_text": "数据安全管理办法适用于哪些场景",
+    "query_type": "content_natural_language",
+    "metadata": {"case": "content_bm25_baseline"},
+    "judgments": [
+      {"chunk_id": "a02-content-security", "file_id": 201, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "GB/T 35273-2020",
+    "query_type": "exact_identifier",
+    "metadata": {"case": "standard_number"},
+    "judgments": [
+      {"chunk_id": "a02-exact-standard", "file_id": 202, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "HT-2025-001",
+    "query_type": "exact_identifier",
+    "metadata": {"case": "product_model"},
+    "judgments": [
+      {"chunk_id": "a02-exact-model", "file_id": 203, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "Qwen3-Embedding-0.6B",
+    "query_type": "exact_identifier",
+    "metadata": {"case": "model_version"},
+    "judgments": [
+      {"chunk_id": "a02-exact-embedding", "file_id": 204, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "OPENRAG_RETRIEVAL_USE_L0_L1",
+    "query_type": "exact_identifier",
+    "metadata": {"case": "configuration_key"},
+    "judgments": [
+      {"chunk_id": "a02-exact-config", "file_id": 205, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "错误码 ERR/A02-503.1",
+    "query_type": "exact_identifier",
+    "metadata": {"case": "error_code"},
+    "judgments": [
+      {"chunk_id": "a02-exact-error", "file_id": 206, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  },
+  {
+    "query_text": "不存在的编号 NO-ANSWER-A02-999",
+    "query_type": "no_answer",
+    "metadata": {"case": "no_answer_false_positive"},
+    "judgments": []
+  },
+  {
+    "query_text": "跨权限范围编号 SCOPE-A02-001",
+    "query_type": "permission_boundary",
+    "metadata": {"case": "authorized_file_only"},
+    "judgments": [
+      {"chunk_id": "a02-scope-allowed", "file_id": 207, "relevance_grade": 3, "source": "gold_manual"}
+    ]
+  }
+]

@@ -23,6 +23,7 @@ from openrag.processors.document_processor import DocumentProcessor
 from openrag.parsers.parser_registry import ParserRegistry
 from openrag.chunking.chunk_engine import ChunkEngine
 from openrag.chunking.document_type import normalize_document_type
+from openrag.config import get_config
 from openrag.embedding.errors import (
     EmbeddingConfigurationError,
     EmbeddingProviderError,
@@ -47,13 +48,23 @@ _logging.basicConfig(
 _logger = _logging.getLogger(__name__)
 
 
-def _create_es_chunk_store():
-    """Elasticsearch chunk fulltext; None if disabled or unreachable."""
+def _create_es_chunk_store(*, required: bool = False):
+    """Create the chunk full-text store, failing closed when it is required."""
     try:
-        from openrag.search.es_chunk_store import create_es_chunk_store_from_config
+        from openrag.search.es_chunk_store import (
+            create_es_chunk_store_from_config,
+            require_es_chunk_store_from_config,
+        )
 
-        return create_es_chunk_store_from_config()
+        factory = (
+            require_es_chunk_store_from_config
+            if required
+            else create_es_chunk_store_from_config
+        )
+        return factory()
     except Exception as exc:
+        if required:
+            raise
         _logger.warning("Elasticsearch chunk store unavailable: %s", exc)
         return None
 
@@ -88,6 +99,7 @@ class TaskWorker:
         self.chunk_engine = None
         self.hierarchy_storage = None
         self.chunk_fulltext_store = None
+        self.chunk_index_mode = "legacy"
         self.require_layer_vectors = False
         self.dependencies_ready = False
         self.next_dependency_probe_at = 0.0
@@ -137,7 +149,10 @@ class TaskWorker:
         self.parser_registry = ParserRegistry()
         self.chunk_engine = ChunkEngine()
         self.hierarchy_storage = HierarchyStorage()
-        self.chunk_fulltext_store = _create_es_chunk_store()
+        self.chunk_index_mode = get_config().elasticsearch.chunk_index_mode
+        self.chunk_fulltext_store = _create_es_chunk_store(
+            required=self.chunk_index_mode == "v2_alias"
+        )
         self.require_layer_vectors = l0_l1_retrieval_enabled()
         self._preflight_processing_dependencies()
 
@@ -475,6 +490,7 @@ class TaskWorker:
                 vector_store=runtime.vector_store,
                 layer_store=runtime.layer_store,
                 chunk_fulltext_store=self.chunk_fulltext_store,
+                chunk_index_mode=self.chunk_index_mode,
                 require_layer_vectors=self.require_layer_vectors,
                 generation_context=runtime.snapshot,
             )
