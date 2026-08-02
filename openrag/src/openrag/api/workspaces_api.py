@@ -20,7 +20,10 @@ from openrag.search.workspace_index_lifecycle import (
     WorkspaceIndexLifecycle,
     WorkspaceIndexProvisionError,
 )
-from openrag.services.workspace_service import WorkspaceService
+from openrag.services.workspace_service import (
+    WorkspaceNotEmptyError,
+    WorkspaceService,
+)
 
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
@@ -312,6 +315,11 @@ async def delete_workspace(
     try:
         service = _workspace_service(db)
         service.delete_workspace(workspace.id)
+    except WorkspaceNotEmptyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     except ElasticsearchRequiredError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

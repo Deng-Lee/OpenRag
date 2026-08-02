@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 from sqlalchemy.orm import Session
 
+from openrag.models.document_chunk import DocumentChunk
+from openrag.models.file import File
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.models.user import User
 
@@ -15,6 +17,10 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+class WorkspaceNotEmptyError(ValueError):
+    """Raised when a workspace still contains file data."""
 
 
 class WorkspaceService:
@@ -320,9 +326,61 @@ class WorkspaceService:
 
     def delete_workspace(self, workspace_id: int) -> bool:
         """Delete a workspace (cascade deletes members)"""
-        workspace = self.get_workspace(workspace_id)
+        workspace = (
+            self.db.query(Workspace)
+            .filter(Workspace.id == workspace_id)
+            .with_for_update()
+            .first()
+        )
         if workspace:
             try:
+                non_root_file = (
+                    self.db.query(File.id)
+                    .filter(File.workspace_id == workspace_id, File.uri != "/")
+                    .first()
+                )
+                if non_root_file is not None:
+                    raise WorkspaceNotEmptyError(
+                        "Workspace is not empty; delete all files and wait for "
+                        "physical cleanup"
+                    )
+
+                root = (
+                    self.db.query(File)
+                    .filter(File.workspace_id == workspace_id, File.uri == "/")
+                    .one_or_none()
+                )
+                if root is not None:
+                    root_chunk = (
+                        self.db.query(DocumentChunk.id)
+                        .filter(DocumentChunk.file_id == root.id)
+                        .first()
+                    )
+                    root_has_content = (
+                        not root.is_directory
+                        or root.parent_id is not None
+                        or root.deleted_at is not None
+                        or root.size != 0
+                        or root.total_chunks != 0
+                        or root.total_tokens != 0
+                        or root.last_aggregated_at is not None
+                        or any(
+                            (
+                                root.l0_path,
+                                root.l1_path,
+                                root.l2_path,
+                                root.l0_vector_id,
+                            )
+                        )
+                        or root_chunk is not None
+                    )
+                    if root_has_content:
+                        raise WorkspaceNotEmptyError(
+                            "Workspace root contains content and cannot be deleted safely"
+                        )
+                    self.db.delete(root)
+                    self.db.flush()
+
                 self.db.delete(workspace)
                 self.db.flush()
                 if self.chunk_index_mode == "v2_alias":

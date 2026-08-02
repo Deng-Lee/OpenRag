@@ -1,11 +1,16 @@
 """Tests for Workspace service"""
 
+from datetime import datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from openrag.models import Base
-from openrag.services.workspace_service import WorkspaceService
+from openrag.models import Base, DocumentChunk, File
+from openrag.services.workspace_service import (
+    WorkspaceNotEmptyError,
+    WorkspaceService,
+)
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.models.user import User
 
@@ -45,6 +50,37 @@ def db():
 
     session.close()
     Base.metadata.drop_all(engine)
+
+
+def _workspace(db, slug):
+    user = User(
+        username=f"{slug}-owner",
+        email=f"{slug}-owner@test.com",
+        password_hash="hash",
+        full_name=f"{slug} Owner",
+    )
+    db.add(user)
+    db.commit()
+    workspace = Workspace(name=slug, slug=slug, owner_id=user.id)
+    db.add(workspace)
+    db.commit()
+    return user, workspace
+
+
+def _file(db, user, workspace, uri="/", **overrides):
+    values = {
+        "uri": uri,
+        "name": uri.rsplit("/", 1)[-1] or "root",
+        "owner_id": user.id,
+        "workspace_id": workspace.id,
+        "is_directory": uri == "/",
+        "size": 0 if uri == "/" else 3,
+    }
+    values.update(overrides)
+    file = File(**values)
+    db.add(file)
+    db.commit()
+    return file
 
 
 def test_create_workspace(db):
@@ -201,6 +237,98 @@ def test_delete_workspace_removes_v2_indices_before_commit(db):
     assert db.get(Workspace, workspace_id) is None
 
 
+def test_delete_workspace_removes_structural_root(db):
+    user, workspace = _workspace(db, "root-only")
+    member = WorkspaceMember(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        role="admin",
+    )
+    db.add(member)
+    db.commit()
+    root = _file(db, user, workspace)
+    workspace_id = workspace.id
+    root_id = root.id
+    lifecycle = FakeIndexLifecycle()
+
+    deleted = WorkspaceService(
+        db,
+        index_lifecycle=lifecycle,
+        chunk_index_mode="v2_alias",
+    ).delete_workspace(workspace_id)
+
+    assert deleted is True
+    assert lifecycle.delete_calls == [(workspace_id, "root-only")]
+    assert db.get(File, root_id) is None
+    assert db.get(Workspace, workspace_id) is None
+    assert (
+        db.query(WorkspaceMember)
+        .filter(WorkspaceMember.workspace_id == workspace_id)
+        .first()
+        is None
+    )
+
+
+@pytest.mark.parametrize("deleted_at", [None, datetime(2026, 8, 2)])
+def test_delete_workspace_rejects_non_root_file(db, deleted_at):
+    user, workspace = _workspace(db, "non-empty")
+    _file(db, user, workspace)
+    _file(db, user, workspace, "/document.txt", deleted_at=deleted_at)
+    workspace_id = workspace.id
+    lifecycle = FakeIndexLifecycle()
+
+    with pytest.raises(WorkspaceNotEmptyError, match="not empty"):
+        WorkspaceService(
+            db,
+            index_lifecycle=lifecycle,
+            chunk_index_mode="v2_alias",
+        ).delete_workspace(workspace_id)
+
+    assert lifecycle.delete_calls == []
+    assert db.get(Workspace, workspace_id) is not None
+    assert db.query(File).filter(File.workspace_id == workspace_id).count() == 2
+
+
+def test_delete_workspace_rejects_root_with_hierarchy_content(db):
+    user, workspace = _workspace(db, "root-content")
+    root = _file(
+        db,
+        user,
+        workspace,
+        l0_path="http://minio/root.abstract.md",
+    )
+    workspace_id = workspace.id
+
+    with pytest.raises(WorkspaceNotEmptyError, match="root contains"):
+        WorkspaceService(db).delete_workspace(workspace_id)
+
+    assert db.get(Workspace, workspace_id) is not None
+    assert db.get(File, root.id) is not None
+
+
+def test_delete_workspace_rejects_root_with_chunk(db):
+    user, workspace = _workspace(db, "root-chunk")
+    root = _file(db, user, workspace)
+    db.add(
+        DocumentChunk(
+            id=1,
+            file_id=root.id,
+            workspace_id=workspace.id,
+            chunk_id="root-chunk",
+            chunk_index=0,
+            object_key="hierarchy/root/chunks/0000.md",
+        )
+    )
+    db.commit()
+    workspace_id = workspace.id
+
+    with pytest.raises(WorkspaceNotEmptyError, match="root contains"):
+        WorkspaceService(db).delete_workspace(workspace_id)
+
+    assert db.get(Workspace, workspace_id) is not None
+    assert db.get(File, root.id) is not None
+
+
 def test_delete_workspace_rolls_back_db_when_v2_cleanup_fails(db):
     user = User(
         username="cleanup-owner",
@@ -213,7 +341,18 @@ def test_delete_workspace_rolls_back_db_when_v2_cleanup_fails(db):
     workspace = Workspace(name="Cleanup", slug="cleanup-v2", owner_id=user.id)
     db.add(workspace)
     db.commit()
+    root = File(
+        uri="/",
+        name="root",
+        owner_id=user.id,
+        workspace_id=workspace.id,
+        is_directory=True,
+        size=0,
+    )
+    db.add(root)
+    db.commit()
     workspace_id = workspace.id
+    root_id = root.id
     lifecycle = FakeIndexLifecycle(fail_delete=True)
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
@@ -224,6 +363,7 @@ def test_delete_workspace_rolls_back_db_when_v2_cleanup_fails(db):
         ).delete_workspace(workspace_id)
 
     assert db.get(Workspace, workspace_id) is not None
+    assert db.get(File, root_id) is not None
 
 
 def test_get_user_workspaces(db):
