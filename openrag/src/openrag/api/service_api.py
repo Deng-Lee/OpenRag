@@ -24,6 +24,7 @@ from openrag.models.file import File as DbFile
 from openrag.models.task import Task
 from openrag.models.workspace import Workspace
 from openrag.services.file_deletion import (
+    FileStorageCleanupError,
     _release_tag_and_soft_delete,
     delete_file_with_storage,
 )
@@ -472,7 +473,13 @@ async def service_delete_document_by_path(
             status_code=status.HTTP_202_ACCEPTED,
             content={"message": "File deletion queued", "task_id": task.id, "async": True},
         )
-    delete_file_with_storage(db, row, ws)
+    try:
+        delete_file_with_storage(db, row, ws)
+    except FileStorageCleanupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=exc.public_message,
+        ) from exc
     return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "File deleted", "async": False})
 
 

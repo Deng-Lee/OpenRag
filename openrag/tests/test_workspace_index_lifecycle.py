@@ -52,9 +52,11 @@ class FakeStore:
         )
 
     def restore_workspace_aliases(self, state):
-        self.aliases = {
-            alias: deepcopy(targets) for alias, targets in state.items()
-        }
+        for alias, targets in state.items():
+            if targets:
+                self.aliases[alias] = deepcopy(targets)
+            else:
+                self.aliases.pop(alias, None)
 
     def delete_index_if_exists(self, index_name):
         if index_name not in self.indices:
@@ -140,3 +142,23 @@ def test_workspace_index_lifecycle_deletes_legacy_and_v2_indices():
 
     assert set(result.deleted_indices) == {legacy, receipt.physical_index}
     assert store.indices == set()
+
+
+def test_workspace_index_lifecycle_removes_drifted_aliases_without_target_index():
+    store = FakeStore()
+    lifecycle = WorkspaceIndexLifecycle(store)
+    receipt = lifecycle.ensure_ready(workspace_id=7, workspace_slug="demo")
+    unexpected = "unrelated-index"
+    store.indices.add(unexpected)
+    store.aliases[receipt.read_alias] = {unexpected: {}}
+    store.aliases[receipt.write_alias] = {
+        unexpected: {"is_write_index": True}
+    }
+
+    lifecycle.delete_workspace_indices(
+        workspace_id=7, workspace_slug="demo"
+    )
+
+    assert receipt.read_alias not in store.aliases
+    assert receipt.write_alias not in store.aliases
+    assert unexpected in store.indices

@@ -23,6 +23,7 @@ from openrag.search.workspace_index_lifecycle import (
 from openrag.services.workspace_service import (
     WorkspaceNotEmptyError,
     WorkspaceService,
+    WorkspaceStorageCleanupError,
 )
 
 
@@ -30,9 +31,10 @@ router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
 
 def _workspace_service(db: Session) -> WorkspaceService:
-    chunk_index_mode = get_config().elasticsearch.chunk_index_mode
+    es_config = get_config().elasticsearch
+    chunk_index_mode = es_config.chunk_index_mode
     lifecycle = None
-    if chunk_index_mode == "v2_alias":
+    if es_config.enabled:
         lifecycle = WorkspaceIndexLifecycle(require_es_chunk_store_from_config())
     return WorkspaceService(
         db,
@@ -329,6 +331,11 @@ async def delete_workspace(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Workspace search index cleanup failed: {exc}",
+        ) from exc
+    except WorkspaceStorageCleanupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Workspace storage cleanup failed: {exc}",
         ) from exc
 
     return MessageResponse(message="Workspace deleted successfully")

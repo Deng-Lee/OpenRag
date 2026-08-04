@@ -178,3 +178,33 @@ def test_worker_persists_partial_generation_result_when_retrying(monkeypatch):
     assert updates[0][0][:2] == (9, "retry")
     assert updates[0][1]["error_code"] == "GENERATION_DELETE_INCOMPLETE"
     assert updates[0][1]["result"] == result
+
+
+def test_worker_retries_file_storage_cleanup_failure(monkeypatch):
+    from openrag.worker.task_worker import TaskWorker
+
+    updates = []
+    worker = TaskWorker.__new__(TaskWorker)
+    monkeypatch.setattr(
+        worker,
+        "_update_task_status",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    worker._handle_task_failure(
+        {
+            "id": 10,
+            "task_type": "delete_file",
+            "file_id": 64,
+            "retry_count": 0,
+            "max_retries": 3,
+        },
+        file_deletion.FileStorageCleanupError(64),
+    )
+
+    assert updates[0][0][:2] == (10, "retry")
+    assert updates[0][1]["error_code"] == "FILE_STORAGE_CLEANUP_FAILED"
+    assert updates[0][1]["result"] == {
+        "file_id": 64,
+        "subsystem": "object_storage",
+    }

@@ -6,9 +6,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from openrag.models import Base, DocumentChunk, File
+from openrag.models import Base, DocumentChunk, File, Task
+from openrag.models.task import TaskStatus
 from openrag.services.workspace_service import (
     WorkspaceNotEmptyError,
+    WorkspaceStorageCleanupError,
     WorkspaceService,
 )
 from openrag.models.workspace import Workspace, WorkspaceMember
@@ -36,6 +38,17 @@ class FakeIndexLifecycle:
         self.delete_calls.append((workspace_id, workspace_slug))
         if self.fail_delete:
             raise RuntimeError("cleanup failed")
+
+
+class FakeWorkspaceStorage:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.delete_calls = []
+
+    def remove_workspace_storage(self, workspace_slug):
+        self.delete_calls.append(workspace_slug)
+        if self.fail:
+            raise OSError("storage cleanup failed")
 
 
 @pytest.fixture(scope="function")
@@ -225,15 +238,111 @@ def test_delete_workspace_removes_v2_indices_before_commit(db):
     db.commit()
     workspace_id = workspace.id
     lifecycle = FakeIndexLifecycle()
+    storage = FakeWorkspaceStorage()
 
     deleted = WorkspaceService(
         db,
         index_lifecycle=lifecycle,
         chunk_index_mode="v2_alias",
+        minio_storage=storage,
     ).delete_workspace(workspace_id)
 
     assert deleted is True
     assert lifecycle.delete_calls == [(workspace_id, "delete-v2")]
+    assert storage.delete_calls == ["delete-v2"]
+    assert db.get(Workspace, workspace_id) is None
+
+
+def test_delete_workspace_removes_legacy_indices_before_commit(db):
+    _, workspace = _workspace(db, "delete-legacy")
+    workspace_id = workspace.id
+    lifecycle = FakeIndexLifecycle()
+    storage = FakeWorkspaceStorage()
+
+    deleted = WorkspaceService(
+        db,
+        index_lifecycle=lifecycle,
+        chunk_index_mode="legacy",
+        minio_storage=storage,
+    ).delete_workspace(workspace_id)
+
+    assert deleted is True
+    assert lifecycle.delete_calls == [(workspace_id, "delete-legacy")]
+    assert storage.delete_calls == ["delete-legacy"]
+    assert db.get(Workspace, workspace_id) is None
+
+
+@pytest.mark.parametrize(
+    "task_status",
+    [
+        TaskStatus.PENDING.value,
+        TaskStatus.ASSIGNED.value,
+        TaskStatus.STARTED.value,
+        TaskStatus.RETRY.value,
+    ],
+)
+def test_delete_workspace_rejects_active_tasks(db, task_status):
+    user, workspace = _workspace(db, f"active-{task_status}")
+    workspace_id = workspace.id
+    task = Task(
+        task_id=f"active-{task_status}",
+        workspace_id=workspace_id,
+        user_id=user.id,
+        task_type="process_document",
+        status=task_status,
+    )
+    db.add(task)
+    db.commit()
+    lifecycle = FakeIndexLifecycle()
+    storage = FakeWorkspaceStorage()
+
+    with pytest.raises(WorkspaceNotEmptyError, match="active tasks"):
+        WorkspaceService(
+            db,
+            index_lifecycle=lifecycle,
+            chunk_index_mode="legacy",
+            minio_storage=storage,
+        ).delete_workspace(workspace_id)
+
+    assert lifecycle.delete_calls == []
+    assert storage.delete_calls == []
+    assert db.get(Workspace, workspace_id) is not None
+
+
+@pytest.mark.parametrize(
+    "task_status",
+    [
+        TaskStatus.SUCCESS.value,
+        TaskStatus.FAILURE.value,
+        TaskStatus.CANCELLED.value,
+    ],
+)
+def test_delete_workspace_allows_terminal_tasks(db, task_status):
+    user, workspace = _workspace(db, f"terminal-{task_status}")
+    workspace_id = workspace.id
+    db.add(
+        Task(
+            task_id=f"terminal-{task_status}",
+            workspace_id=workspace_id,
+            user_id=user.id,
+            task_type="process_document",
+            status=task_status,
+        )
+    )
+    db.commit()
+    lifecycle = FakeIndexLifecycle()
+    storage = FakeWorkspaceStorage()
+
+    deleted = WorkspaceService(
+        db,
+        index_lifecycle=lifecycle,
+        chunk_index_mode="legacy",
+        minio_storage=storage,
+    ).delete_workspace(workspace_id)
+
+    assert deleted is True
+    assert lifecycle.delete_calls == [(workspace_id, f"terminal-{task_status}")]
+    assert storage.delete_calls == [f"terminal-{task_status}"]
     assert db.get(Workspace, workspace_id) is None
 
 
@@ -250,15 +359,18 @@ def test_delete_workspace_removes_structural_root(db):
     workspace_id = workspace.id
     root_id = root.id
     lifecycle = FakeIndexLifecycle()
+    storage = FakeWorkspaceStorage()
 
     deleted = WorkspaceService(
         db,
         index_lifecycle=lifecycle,
         chunk_index_mode="v2_alias",
+        minio_storage=storage,
     ).delete_workspace(workspace_id)
 
     assert deleted is True
     assert lifecycle.delete_calls == [(workspace_id, "root-only")]
+    assert storage.delete_calls == ["root-only"]
     assert db.get(File, root_id) is None
     assert db.get(Workspace, workspace_id) is None
     assert (
@@ -364,6 +476,50 @@ def test_delete_workspace_rolls_back_db_when_v2_cleanup_fails(db):
 
     assert db.get(Workspace, workspace_id) is not None
     assert db.get(File, root_id) is not None
+
+
+def test_delete_workspace_keeps_db_when_storage_cleanup_fails(db):
+    user, workspace = _workspace(db, "storage-failure")
+    root = _file(db, user, workspace)
+    workspace_id = workspace.id
+    root_id = root.id
+    lifecycle = FakeIndexLifecycle()
+    storage = FakeWorkspaceStorage(fail=True)
+
+    with pytest.raises(WorkspaceStorageCleanupError, match="storage cleanup failed"):
+        WorkspaceService(
+            db,
+            index_lifecycle=lifecycle,
+            chunk_index_mode="legacy",
+            minio_storage=storage,
+        ).delete_workspace(workspace_id)
+
+    assert lifecycle.delete_calls == [(workspace_id, "storage-failure")]
+    assert storage.delete_calls == ["storage-failure"]
+    assert db.get(Workspace, workspace_id) is not None
+    assert db.get(File, root_id) is not None
+
+
+def test_delete_workspace_cleans_external_state_before_db_rows(db):
+    user, workspace = _workspace(db, "external-first")
+    root = _file(db, user, workspace)
+    workspace_id = workspace.id
+    root_id = root.id
+
+    class DbObservingStorage:
+        def remove_workspace_storage(self, workspace_slug):
+            assert workspace_slug == "external-first"
+            assert db.get(Workspace, workspace_id) is not None
+            assert db.get(File, root_id) is not None
+
+    deleted = WorkspaceService(
+        db,
+        index_lifecycle=FakeIndexLifecycle(),
+        chunk_index_mode="legacy",
+        minio_storage=DbObservingStorage(),
+    ).delete_workspace(workspace_id)
+
+    assert deleted is True
 
 
 def test_get_user_workspaces(db):

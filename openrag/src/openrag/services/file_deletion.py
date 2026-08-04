@@ -32,6 +32,19 @@ class GenerationDeletePropagationError(RuntimeError):
         self.result = result
 
 
+class FileStorageCleanupError(RuntimeError):
+    code = "FILE_STORAGE_CLEANUP_FAILED"
+    public_message = "File storage cleanup is incomplete"
+    retryable = True
+
+    def __init__(self, file_id: int):
+        super().__init__(self.public_message)
+        self.result = {
+            "file_id": file_id,
+            "subsystem": "object_storage",
+        }
+
+
 _DELETE_TARGET_STATES = {
     IndexGenerationState.BUILDING.value,
     IndexGenerationState.RECONCILING.value,
@@ -187,6 +200,7 @@ def delete_file_with_storage(
             )
             .all()
         )
+        children.sort(key=lambda child: (len(child.uri), child.id), reverse=True)
         for child in children:
             delete_results.append(
                 delete_vectors_for_file_across_generations(db, child.id)
@@ -194,19 +208,32 @@ def delete_file_with_storage(
         delete_results.append(
             delete_vectors_for_file_across_generations(db, file.id)
         )
-        for child in children:
-            hierarchy_storage.delete_document_hierarchy(file_uri=child.uri)
-            minio_storage.remove_document_hierarchy(slug, child.uri)
-        minio_storage.remove_directory(slug, file.uri)
+        try:
+            for child in children:
+                _delete_parse_artifacts(minio_storage, slug, child.id)
+                hierarchy_storage.delete_document_hierarchy(file_uri=child.uri)
+                minio_storage.remove_document_hierarchy(slug, child.uri)
+                if not child.is_directory:
+                    minio_storage.remove_file(slug, child.uri)
+            _delete_parse_artifacts(minio_storage, slug, file.id)
+            hierarchy_storage.delete_document_hierarchy(file_uri=file.uri)
+        except Exception as exc:
+            raise FileStorageCleanupError(file.id) from exc
     else:
         delete_results.append(
             delete_vectors_for_file_across_generations(db, file.id)
         )
-        minio_storage.remove_document_hierarchy(slug, file.uri)
-        minio_storage.remove_file(slug, file.uri)
+        try:
+            _delete_parse_artifacts(minio_storage, slug, file.id)
+            minio_storage.remove_document_hierarchy(slug, file.uri)
+            minio_storage.remove_file(slug, file.uri)
+            hierarchy_storage.delete_document_hierarchy(file_uri=file.uri)
+        except Exception as exc:
+            raise FileStorageCleanupError(file.id) from exc
 
-    hierarchy_storage.delete_document_hierarchy(file_uri=file.uri)
-
+    if file.is_directory:
+        for child in children:
+            db.delete(child)
     db.delete(file)
     db.commit()
     return _merge_generation_delete_results(delete_results)
@@ -267,6 +294,17 @@ def utcnow() -> datetime:
 def _escape_like(value: str) -> str:
     """Escape SQL LIKE wildcard chars in a logical URI prefix."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _delete_parse_artifacts(
+    minio_storage: MinioStorage,
+    workspace_slug: str,
+    file_id: int,
+) -> None:
+    minio_storage.remove_directory(
+        workspace_slug,
+        f"parse_artifacts/{file_id}",
+    )
 
 
 def _release_tag_and_soft_delete(db: Session, file: FileModel, *, user_id: int) -> Task:
@@ -376,14 +414,18 @@ def _physically_delete_row_only(
     deletes deepest-first, so each file's own objects are removed by its own row.
     """
     result = delete_vectors_for_file_across_generations(db, file.id)
-    if file.is_directory:
-        # DB-only virtual node: NO MinIO object, NO remove_directory (prefix-recursive).
-        pass
-    else:
-        minio_storage = MinioStorage()
-        minio_storage.remove_document_hierarchy(workspace.slug, file.uri)
-        minio_storage.remove_file(workspace.slug, file.uri)
-        HierarchyStorage().delete_document_hierarchy(file_uri=file.uri)
+    try:
+        if file.is_directory:
+            # DB-only virtual node: NO MinIO object, NO remove_directory (prefix-recursive).
+            pass
+        else:
+            minio_storage = MinioStorage()
+            _delete_parse_artifacts(minio_storage, workspace.slug, file.id)
+            minio_storage.remove_document_hierarchy(workspace.slug, file.uri)
+            minio_storage.remove_file(workspace.slug, file.uri)
+            HierarchyStorage().delete_document_hierarchy(file_uri=file.uri)
+    except Exception as exc:
+        raise FileStorageCleanupError(file.id) from exc
     db.delete(file)
     db.commit()
     return result

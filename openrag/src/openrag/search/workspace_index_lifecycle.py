@@ -138,8 +138,18 @@ class WorkspaceIndexLifecycle:
                 workspace_slug, workspace_id
             ),
         )
+        aliases = (
+            build_workspace_chunks_read_alias(workspace_slug, workspace_id),
+            build_workspace_chunks_write_alias(workspace_slug, workspace_id),
+        )
         try:
             deleted, missing = self.store.delete_indices_if_exist(names)
+            self.store.restore_workspace_aliases(
+                {alias: {} for alias in aliases}
+            )
+            alias_state = self.store.get_alias_state(list(aliases))
+            if any(alias_state.values()):
+                raise RuntimeError("Workspace aliases still exist after cleanup")
         except Exception as exc:
             raise WorkspaceIndexCleanupError(str(exc)) from exc
         return WorkspaceIndexDeleteResult(deleted, missing)

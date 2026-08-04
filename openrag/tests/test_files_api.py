@@ -19,6 +19,7 @@ from openrag.models.task import Task
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.security import hash_password
 from openrag.services.file_ingest import MAX_FILE_SIZE
+from openrag.services.file_deletion import FileStorageCleanupError
 
 
 class FakeMinioStorage:
@@ -715,6 +716,30 @@ class TestFileDelete:
         response = client.delete("/files/99999")
 
         assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_sync_delete_returns_503_when_storage_cleanup_fails(
+        self, client, db, test_user, test_file, monkeypatch
+    ):
+        app.dependency_overrides[get_current_user] = override_get_current_user_factory(
+            test_user
+        )
+
+        def fail_cleanup(*_args, **_kwargs):
+            raise FileStorageCleanupError(test_file.id)
+
+        monkeypatch.setattr(
+            "openrag.api.files_api.delete_file_with_storage",
+            fail_cleanup,
+        )
+
+        response = client.delete(
+            f"/files/{test_file.id}", params={"background": "false"}
+        )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.json()["detail"] == "File storage cleanup is incomplete"
+        db.expire_all()
+        assert db.get(File, test_file.id) is not None
 
 
 class TestFileMove:

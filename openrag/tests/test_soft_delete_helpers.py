@@ -81,7 +81,7 @@ def test_soft_delete_subtree_escapes_like_wildcards(db, wsowner):
     assert neighbor.deleted_at is None and neighbor.tag == "neighbor"
 
 
-def _stub_storage(monkeypatch):
+def _stub_storage(monkeypatch, *, remove_file_calls=None):
     """Stub external storage/vector deletes so cleanup runs DB-only.
 
     Returns a list recording every remove_directory(bucket, prefix) call, so a test
@@ -98,6 +98,8 @@ def _stub_storage(monkeypatch):
         def remove_document_hierarchy(self, *a, **k):
             return None
         def remove_file(self, *a, **k):
+            if remove_file_calls is not None:
+                remove_file_calls.append(a)
             return None
         def remove_directory(self, *a, **k):
             rmdir_calls.append(a)
@@ -148,8 +150,10 @@ def test_cleanup_does_not_cascade_active_children_of_soft_deleted_dir(db, wsowne
     assert d.id in ids and old_child.id in ids
     assert db.query(File).filter(File.id == new_active.id).first() is not None  # survived
     assert new_active.deleted_at is None
-    # Codex round-3 #1: directory row cleanup must NOT prefix-recursive delete objects
-    assert rmdir_calls == []
+    # The deleted document's file-id-scoped canonical prefix is safe; the directory
+    # URI prefix itself must never be recursively removed because it also contains
+    # the active child created after the watermark.
+    assert rmdir_calls == [("w", f"parse_artifacts/{old_child.id}")]
 
 
 def test_physical_cleanup_rejects_root_prefix(db, wsowner, monkeypatch):
@@ -188,3 +192,68 @@ def test_physical_cleanup_escapes_like_percent_wildcard(db, wsowner, monkeypatch
     assert neighbor.id not in ids
     assert db.query(File).filter(File.id == target.id).first() is None
     assert db.query(File).filter(File.id == neighbor.id).first() is not None
+
+
+def test_storage_cleanup_failure_keeps_file_for_worker_retry(
+    db, wsowner, monkeypatch
+):
+    workspace, user = wsowner
+    file = _mk(db, workspace, user, "/retry.txt")
+    file_id = file.id
+    monkeypatch.setattr(
+        file_deletion,
+        "delete_vectors_for_file_across_generations",
+        lambda *_args, **_kwargs: {},
+    )
+
+    class FailingStorage:
+        def remove_directory(self, *_args, **_kwargs):
+            raise OSError("minio unavailable")
+
+    monkeypatch.setattr(file_deletion, "MinioStorage", FailingStorage)
+    monkeypatch.setattr(
+        file_deletion,
+        "HierarchyStorage",
+        lambda: type(
+            "HierarchyStub",
+            (),
+            {"delete_document_hierarchy": lambda *_args, **_kwargs: None},
+        )(),
+    )
+
+    with pytest.raises(file_deletion.FileStorageCleanupError) as exc_info:
+        file_deletion.delete_file_with_storage(db, file, workspace)
+
+    db.expire_all()
+    assert exc_info.value.retryable is True
+    assert exc_info.value.result == {
+        "file_id": file_id,
+        "subsystem": "object_storage",
+    }
+    assert db.get(File, file_id) is not None
+
+
+def test_sync_directory_delete_removes_descendant_rows_by_uri(
+    db, wsowner, monkeypatch
+):
+    workspace, user = wsowner
+    directory = _mk(db, workspace, user, "/dir", is_dir=True)
+    child = _mk(db, workspace, user, "/dir/child.txt")
+    grandchild = _mk(db, workspace, user, "/dir/sub/grandchild.txt")
+    neighbor = _mk(db, workspace, user, "/dir-other/keep.txt")
+    deleted_ids = {directory.id, child.id, grandchild.id}
+    neighbor_id = neighbor.id
+    remove_file_calls = []
+    rmdir_calls = _stub_storage(
+        monkeypatch, remove_file_calls=remove_file_calls
+    )
+
+    file_deletion.delete_file_with_storage(db, directory, workspace)
+
+    assert db.query(File).filter(File.id.in_(deleted_ids)).count() == 0
+    assert db.get(File, neighbor_id) is not None
+    assert (workspace.slug, directory.uri) not in rmdir_calls
+    assert set(remove_file_calls) == {
+        (workspace.slug, child.uri),
+        (workspace.slug, grandchild.uri),
+    }

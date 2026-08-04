@@ -22,6 +22,7 @@ from openrag.models.file import File as FileModel, ProcessingStatus
 from openrag.models.user import User
 from openrag.models.task import Task, TaskStatus, TaskType
 from openrag.services.file_deletion import (
+    FileStorageCleanupError,
     delete_file_with_storage,
     delete_files_under_uri_prefix,
     delete_vectors_for_file_across_generations,
@@ -829,6 +830,11 @@ async def delete_file(
         return MessageResponse(message="File deleted successfully")
     except HTTPException:
         raise
+    except FileStorageCleanupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=exc.public_message,
+        ) from exc
     except SQLAlchemyError as exc:
         logger.exception(
             "delete_file database error file_id=%s background=%s",

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File
+from openrag.models.task import Task, TaskStatus
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.models.user import User
 
@@ -15,12 +16,17 @@ if TYPE_CHECKING:
         WorkspaceIndexLifecycle,
         WorkspaceIndexProvisionReceipt,
     )
+    from openrag.storage.minio_storage import MinioStorage
 
 logger = logging.getLogger(__name__)
 
 
 class WorkspaceNotEmptyError(ValueError):
     """Raised when a workspace still contains file data."""
+
+
+class WorkspaceStorageCleanupError(RuntimeError):
+    """Raised when workspace object storage cannot be cleaned completely."""
 
 
 class WorkspaceService:
@@ -32,10 +38,12 @@ class WorkspaceService:
         *,
         index_lifecycle: Optional["WorkspaceIndexLifecycle"] = None,
         chunk_index_mode: str = "legacy",
+        minio_storage: Optional["MinioStorage"] = None,
     ):
         self.db = db
         self.index_lifecycle = index_lifecycle
         self.chunk_index_mode = chunk_index_mode
+        self.minio_storage = minio_storage
         if chunk_index_mode == "v2_alias" and index_lifecycle is None:
             raise ValueError("v2_alias requires a workspace index lifecycle")
 
@@ -345,6 +353,26 @@ class WorkspaceService:
                         "physical cleanup"
                     )
 
+                active_task = (
+                    self.db.query(Task.id)
+                    .filter(
+                        Task.workspace_id == workspace_id,
+                        Task.status.in_(
+                            (
+                                TaskStatus.PENDING.value,
+                                TaskStatus.ASSIGNED.value,
+                                TaskStatus.STARTED.value,
+                                TaskStatus.RETRY.value,
+                            )
+                        ),
+                    )
+                    .first()
+                )
+                if active_task is not None:
+                    raise WorkspaceNotEmptyError(
+                        "Workspace has active tasks; wait for them to finish"
+                    )
+
                 root = (
                     self.db.query(File)
                     .filter(File.workspace_id == workspace_id, File.uri == "/")
@@ -378,16 +406,29 @@ class WorkspaceService:
                         raise WorkspaceNotEmptyError(
                             "Workspace root contains content and cannot be deleted safely"
                         )
+
+                if self.index_lifecycle is not None:
+                    self.index_lifecycle.delete_workspace_indices(
+                        workspace_id=workspace.id,
+                        workspace_slug=workspace.slug,
+                    )
+
+                storage = self.minio_storage
+                if storage is None:
+                    from openrag.storage.minio_storage import MinioStorage
+
+                    storage = MinioStorage()
+                try:
+                    storage.remove_workspace_storage(workspace.slug)
+                except Exception as exc:
+                    raise WorkspaceStorageCleanupError(str(exc)) from exc
+
+                if root is not None:
                     self.db.delete(root)
                     self.db.flush()
 
                 self.db.delete(workspace)
                 self.db.flush()
-                if self.chunk_index_mode == "v2_alias":
-                    self.index_lifecycle.delete_workspace_indices(
-                        workspace_id=workspace.id,
-                        workspace_slug=workspace.slug,
-                    )
                 self.db.commit()
             except Exception:
                 self.db.rollback()

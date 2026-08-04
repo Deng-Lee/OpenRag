@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from minio.error import S3Error
 
 from openrag.storage import minio_storage
 from openrag.storage.minio_storage import MinioStorage
@@ -13,8 +14,11 @@ class FakeObject:
 
 class FakeMinioClient:
     def __init__(self):
+        self.bucket_exists_value = True
+        self.remove_bucket_effective = True
         self.bucket_exists_calls = []
         self.make_bucket_calls = []
+        self.remove_bucket_calls = []
         self.put_object_calls = []
         self.list_objects_calls = []
         self.remove_object_calls = []
@@ -26,10 +30,15 @@ class FakeMinioClient:
 
     def bucket_exists(self, bucket_name):
         self.bucket_exists_calls.append(bucket_name)
-        return True
+        return self.bucket_exists_value
 
     def make_bucket(self, bucket_name):
         self.make_bucket_calls.append(bucket_name)
+
+    def remove_bucket(self, bucket_name):
+        self.remove_bucket_calls.append(bucket_name)
+        if self.remove_bucket_effective:
+            self.bucket_exists_value = False
 
     def put_object(self, bucket_name, object_name, **kwargs):
         self.put_object_calls.append((bucket_name, object_name, kwargs))
@@ -39,6 +48,9 @@ class FakeMinioClient:
 
     def remove_object(self, bucket_name, object_name):
         self.remove_object_calls.append((bucket_name, object_name))
+        self.objects = [
+            obj for obj in self.objects if obj.object_name != object_name
+        ]
 
     def list_objects(self, bucket_name, prefix, recursive):
         self.list_objects_calls.append((bucket_name, prefix, recursive))
@@ -165,3 +177,70 @@ def test_move_file_uses_physical_copy_source(fake_storage):
     assert copy_source_bucket(source) == "rag-kb"
     assert copy_source_object(source) == "openrag/law/old.pdf"
     assert storage.client.remove_object_calls == [("rag-kb", "openrag/law/old.pdf")]
+
+
+def test_remove_document_hierarchy_propagates_access_denied(fake_storage):
+    storage = fake_storage(prefix=None)
+    failure = S3Error(
+        None,
+        "AccessDenied",
+        "denied",
+        "hierarchy/doc.txt.abstract.md",
+        "request-id",
+        "host-id",
+    )
+
+    def fail_stat(*_args, **_kwargs):
+        raise failure
+
+    storage.client.stat_object = fail_stat
+
+    with pytest.raises(S3Error) as exc_info:
+        storage.remove_document_hierarchy("law", "/doc.txt")
+
+    assert exc_info.value.code == "AccessDenied"
+
+
+def test_remove_workspace_storage_keeps_neighbor_in_shared_bucket(fake_storage):
+    storage = fake_storage(prefix="openrag")
+    storage.client.objects = [
+        FakeObject("openrag/demo/source.pdf"),
+        FakeObject("openrag/demo/parse_artifacts/1/canonical.json"),
+        FakeObject("openrag/demo-old/source.pdf"),
+    ]
+
+    storage.remove_workspace_storage("demo")
+
+    assert storage.client.list_objects_calls == [
+        ("rag-kb", "openrag/demo/", True),
+        ("rag-kb", "openrag/demo/", True),
+    ]
+    assert storage.client.remove_object_calls == [
+        ("rag-kb", "openrag/demo/source.pdf"),
+        ("rag-kb", "openrag/demo/parse_artifacts/1/canonical.json"),
+    ]
+    assert storage.client.remove_bucket_calls == []
+
+
+def test_remove_workspace_storage_deletes_dedicated_bucket(fake_storage):
+    storage = fake_storage(prefix=None)
+    storage.client.objects = [
+        FakeObject("source.pdf"),
+        FakeObject("parse_artifacts/1/canonical.json"),
+    ]
+
+    storage.remove_workspace_storage("demo")
+
+    assert storage.client.remove_object_calls == [
+        ("demo", "source.pdf"),
+        ("demo", "parse_artifacts/1/canonical.json"),
+    ]
+    assert storage.client.remove_bucket_calls == ["demo"]
+
+
+def test_remove_workspace_storage_fails_if_dedicated_bucket_remains(fake_storage):
+    storage = fake_storage(prefix=None)
+    storage.client.remove_bucket_effective = False
+
+    with pytest.raises(RuntimeError, match="bucket cleanup incomplete"):
+        storage.remove_workspace_storage("demo")

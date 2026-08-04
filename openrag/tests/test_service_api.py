@@ -20,6 +20,7 @@ from openrag.models.file import ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.security import hash_password
 from openrag.services.file_ingest import ensure_directory_path
+from openrag.services.file_deletion import FileStorageCleanupError
 from openrag.services.preview_token_service import decode_preview_token
 from openrag.storage.minio_storage import MinioStorage
 
@@ -415,6 +416,42 @@ def test_service_document_by_path_ok(
     assert r.status_code == 200
     assert r.json()["path"] == "/readme.md"
     assert r.json()["name"] == "readme.md"
+
+
+def test_service_sync_delete_returns_503_when_storage_cleanup_fails(
+    client: TestClient,
+    db: Session,
+    workspace: Workspace,
+    owner: User,
+    service_token_write_headers,
+) -> None:
+    file = File(
+        uri="/delete-me.md",
+        name="delete-me.md",
+        owner_id=owner.id,
+        workspace_id=workspace.id,
+        is_directory=False,
+        size=5,
+        mime_type="text/markdown",
+    )
+    db.add(file)
+    db.commit()
+    db.refresh(file)
+
+    with patch(
+        "openrag.api.service_api.delete_file_with_storage",
+        side_effect=FileStorageCleanupError(file.id),
+    ):
+        response = client.delete(
+            f"/service/v1/workspaces/{workspace.name}/documents/by-path",
+            params={"path": file.uri, "background": "false"},
+            headers=service_token_write_headers,
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "File storage cleanup is incomplete"
+    db.expire_all()
+    assert db.get(File, file.id) is not None
 
 
 def test_service_document_by_path_includes_retry_budget(

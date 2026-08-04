@@ -173,6 +173,49 @@ class MinioStorage:
         for obj in objects_to_delete:
             self.client.remove_object(bucket_name, obj.object_name)
 
+    def remove_workspace_storage(self, workspace_slug: str) -> None:
+        """Remove one workspace's objects without crossing its storage scope."""
+        workspace_slug = workspace_slug.strip().strip("/")
+        if not workspace_slug:
+            raise ValueError("Workspace storage scope must not be empty")
+
+        if self._single_bucket_prefix() is None:
+            bucket_name = self._resolve_bucket(workspace_slug)
+            if not self.client.bucket_exists(bucket_name):
+                return
+            prefix = ""
+        else:
+            bucket_name, prefix = self._resolve_bucket_key(workspace_slug, "")
+            prefix = prefix.rstrip("/") + "/"
+            if prefix == "/":
+                raise ValueError("Refusing to remove an empty shared storage prefix")
+            if not self.client.bucket_exists(bucket_name):
+                return
+
+        for obj in self.client.list_objects(
+            bucket_name, prefix=prefix, recursive=True
+        ):
+            self.client.remove_object(bucket_name, obj.object_name)
+
+        remaining = next(
+            iter(
+                self.client.list_objects(
+                    bucket_name, prefix=prefix, recursive=True
+                )
+            ),
+            None,
+        )
+        if remaining is not None:
+            raise RuntimeError(
+                f"Workspace object cleanup incomplete: {workspace_slug}"
+            )
+        if self._single_bucket_prefix() is None:
+            self.client.remove_bucket(bucket_name)
+            if self.client.bucket_exists(bucket_name):
+                raise RuntimeError(
+                    f"Workspace bucket cleanup incomplete: {workspace_slug}"
+                )
+
     def move_file(self, bucket_name: str, old_object_name: str, new_object_name: str):
         """Move file in minio bucket"""
         src_bucket, old_object_name = self._resolve_bucket_key(
@@ -261,8 +304,9 @@ class MinioStorage:
             try:
                 if self.file_exists(bucket_name, key):
                     self.remove_file(bucket_name, key)
-            except S3Error:
-                pass
+            except S3Error as exc:
+                if exc.code != "NoSuchKey":
+                    raise
         self.remove_directory(bucket_name, hierarchy_chunks_prefix(file_uri))
         self.remove_directory(bucket_name, hierarchy_folder_prefix(file_uri))
 
