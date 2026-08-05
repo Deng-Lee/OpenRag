@@ -210,6 +210,37 @@ def test_bulk_validates_whole_batch_before_elasticsearch_request(monkeypatch):
     assert kwargs["refresh"] == "wait_for"
 
 
+def test_bulk_delete_chunks_uses_only_exact_chunk_ids(monkeypatch):
+    calls = []
+
+    def fake_bulk(client, actions, **kwargs):
+        calls.append((list(actions), kwargs))
+        return len(actions), []
+
+    monkeypatch.setattr("elasticsearch.helpers.bulk", fake_bulk)
+
+    accepted, errors = _store(FakeEsClient()).bulk_delete_chunks(
+        "chunks-v1", ["orphan-b", "orphan-a"]
+    )
+
+    assert accepted == 2
+    assert errors == []
+    actions, kwargs = calls[0]
+    assert actions == [
+        {
+            "_op_type": "delete",
+            "_index": "chunks-v1",
+            "_id": "orphan-b",
+        },
+        {
+            "_op_type": "delete",
+            "_index": "chunks-v1",
+            "_id": "orphan-a",
+        },
+    ]
+    assert kwargs["refresh"] == "wait_for"
+
+
 def test_alias_switch_and_restore_are_each_one_atomic_request():
     indices = FakeIndices(
         exists=True,

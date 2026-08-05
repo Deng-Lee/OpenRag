@@ -346,6 +346,32 @@ class EsChunkStore:
             logger.warning("Elasticsearch bulk had errors: %s", errors[:3])
         return int(ok)
 
+    def bulk_delete_chunks(
+        self, index_name: str, chunk_ids: list[str]
+    ) -> tuple[int, list[Any]]:
+        """Delete only the explicitly supplied Elasticsearch document IDs."""
+        if not chunk_ids:
+            return 0, []
+        from elasticsearch.helpers import bulk
+
+        actions = [
+            {
+                "_op_type": "delete",
+                "_index": index_name,
+                "_id": str(chunk_id),
+            }
+            for chunk_id in chunk_ids
+        ]
+        ok, errors = bulk(
+            self._client,
+            actions,
+            refresh="wait_for",
+            raise_on_error=False,
+        )
+        if errors:
+            logger.warning("Elasticsearch bulk delete had errors: %s", errors[:3])
+        return int(ok), list(errors or [])
+
     def delete_by_file_id(
         self, index_name: str, file_id: int, *, required: bool = False
     ) -> None:

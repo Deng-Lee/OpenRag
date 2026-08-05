@@ -13,13 +13,24 @@ from openrag.search.es_chunk_contract import (
 from scripts.audit_es_chunk_consistency import audit_workspace
 
 
+LEGACY_MAPPING = {
+    "properties": {
+        "chunk_id": {"type": "keyword"},
+        "file_id": {"type": "long"},
+        "workspace_id": {"type": "long"},
+        "workspace_slug": {"type": "keyword"},
+        "content": {"type": "text"},
+    }
+}
+
+
 class FakeEsClient:
     def __init__(self, docs, mapping=None, physical_names=None):
         self.docs = {str(doc["_id"]): doc for doc in docs}
         self._remaining = []
         self.write_calls = []
         self.indices = self.Indices(
-            mapping or build_chunk_mapping(),
+            mapping or LEGACY_MAPPING,
             physical_names=physical_names,
         )
 
@@ -32,11 +43,23 @@ class FakeEsClient:
         def exists(*, index):
             return True
 
+        @staticmethod
+        def exists_alias(*, name):
+            return False
+
         def get_mapping(self, *, index):
             return {
                 physical_name: {"mappings": self.mapping}
                 for physical_name in (self.physical_names or [index])
             }
+
+        @staticmethod
+        def get_settings(*, index, flat_settings):
+            return {index: {"settings": {}}}
+
+        @staticmethod
+        def analyze(*, index, field, text):
+            return {"tokens": [{"token": "openrag"}]}
 
     def search(self, *, index, size, scroll, query, source, sort):
         docs = list(self.docs.values())
@@ -59,6 +82,10 @@ class MissingIndexEsClient:
     class Indices:
         @staticmethod
         def exists(*, index):
+            return False
+
+        @staticmethod
+        def exists_alias(*, name):
             return False
 
     indices = Indices()
@@ -191,7 +218,7 @@ def test_audit_reports_orphan_missing_mismatch_and_soft_deleted_without_writes(a
     assert report["deleted_file_chunk_count"] == 1
     assert report["orphan_chunk_ids"] == ["orphan"]
     assert report["missing_es_chunk_ids"] == ["live-missing"]
-    assert "content" not in str(report).lower()
+    assert "must never appear in report" not in str(report).lower()
     assert "must never appear" not in str(report)
     assert es.write_calls == []
 
@@ -256,7 +283,7 @@ def test_v2_audit_covers_mapping_version_required_and_forbidden_fields(audit_db)
     assert report["missing_required_field_count"] == 1
     assert report["forbidden_field_count"] == 1
     assert report["anomaly_count"] == 4
-    assert "content" not in str(report).lower()
+    assert "must never appear in report" not in str(report).lower()
 
 
 def test_v2_audit_clean_contract_has_full_field_coverage(audit_db):
@@ -267,7 +294,8 @@ def test_v2_audit_clean_contract_has_full_field_coverage(audit_db):
     report = audit_workspace(
         db=db,
         es_client=FakeEsClient(
-            [_v2_es_doc("live-present", live.id, workspace.id)]
+            [_v2_es_doc("live-present", live.id, workspace.id)],
+            mapping=build_chunk_mapping(),
         ),
         index_name="audit-chunks-v2",
         workspace_id=workspace.id,
@@ -288,6 +316,7 @@ def test_alias_audit_requires_exactly_one_physical_target(audit_db):
         db=db,
         es_client=FakeEsClient(
             [_v2_es_doc("live-present", live.id, workspace.id)],
+            mapping=build_chunk_mapping(),
             physical_names=["chunks-v2-a", "chunks-v2-b"],
         ),
         index_name="audit-chunks-read",

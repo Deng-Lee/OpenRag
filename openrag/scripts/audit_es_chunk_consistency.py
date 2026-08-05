@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,7 +16,10 @@ from openrag.database import SessionLocal, get_engine
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File
 from openrag.models.workspace import Workspace
-from openrag.search.es_chunk_store import create_es_chunk_store_from_config
+from openrag.search.es_chunk_store import (
+    _LEGACY_CHUNK_MAPPINGS,
+    create_es_chunk_store_from_config,
+)
 from openrag.search.es_chunk_contract import (
     SCHEMA_VERSION,
     build_chunk_mapping,
@@ -26,6 +30,135 @@ from openrag.search.workspace_es_slug import (
     build_workspace_chunks_physical_index_name,
     build_workspace_chunks_read_alias,
 )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def inspect_legacy_mapping(
+    client, *, index_name: str, active_chunk_count: int
+) -> dict[str, Any]:
+    """Inspect the legacy physical-index contract without mutating ES."""
+    result: dict[str, Any] = {
+        "index_name": index_name,
+        "expected_mapping": copy.deepcopy(_LEGACY_CHUNK_MAPPINGS),
+        "resource_type": "unknown",
+        "status": "FAILED",
+        "compatible": False,
+        "mismatches": [],
+        "extra_fields": [],
+        "raw_mapping": None,
+        "raw_settings": None,
+        "analyze_probe_tokens": [],
+    }
+    try:
+        if bool(client.indices.exists_alias(name=index_name)):
+            result.update(resource_type="alias", status="ALIAS_CONFLICT")
+            result["mismatches"].append(
+                "expected legacy physical index name is occupied by an alias"
+            )
+            return result
+        if not bool(client.indices.exists(index=index_name)):
+            result.update(
+                resource_type="absent",
+                status=(
+                    "INDEX_ABSENT"
+                    if active_chunk_count
+                    else "EMPTY_INDEX_NOT_REQUIRED"
+                ),
+            )
+            return result
+
+        mapping_response = dict(client.indices.get_mapping(index=index_name))
+        settings_response = dict(
+            client.indices.get_settings(index=index_name, flat_settings=True)
+        )
+        result.update(
+            resource_type="physical_index",
+            raw_mapping=mapping_response,
+            raw_settings=settings_response,
+        )
+        if set(mapping_response) != {index_name}:
+            result["status"] = "RESOURCE_TARGET_MISMATCH"
+            result["mismatches"].append(
+                f"expected physical index {index_name}, got {sorted(mapping_response)}"
+            )
+            return result
+
+        expected_properties = _LEGACY_CHUNK_MAPPINGS["properties"]
+        actual_mapping = mapping_response[index_name].get("mappings") or {}
+        actual_properties = actual_mapping.get("properties") or {}
+        for field, expected in expected_properties.items():
+            actual = actual_properties.get(field)
+            if actual is None:
+                result["mismatches"].append(
+                    f"missing required field mapping: {field}"
+                )
+            elif actual.get("type") != expected.get("type"):
+                result["mismatches"].append(
+                    f"field {field} type={actual.get('type')!r}, "
+                    f"expected={expected.get('type')!r}"
+                )
+        result["extra_fields"] = sorted(
+            set(actual_properties) - set(expected_properties)
+        )
+
+        content_mapping = actual_properties.get("content") or {}
+        field_analyzer = content_mapping.get("analyzer")
+        search_analyzer = content_mapping.get("search_analyzer")
+        flat_settings = (
+            (settings_response.get(index_name) or {}).get("settings") or {}
+        )
+        default_analyzer_settings = {
+            key: value
+            for key, value in flat_settings.items()
+            if key.startswith("index.analysis.analyzer.default")
+        }
+        if field_analyzer not in (None, "standard"):
+            result["mismatches"].append(
+                f"content analyzer={field_analyzer!r}, expected='standard'"
+            )
+        if search_analyzer not in (None, "standard"):
+            result["mismatches"].append(
+                f"content search_analyzer={search_analyzer!r}, expected='standard'"
+            )
+        if field_analyzer is None and default_analyzer_settings not in (
+            {},
+            {"index.analysis.analyzer.default.type": "standard"},
+        ):
+            result["mismatches"].append(
+                "content uses a customized index default analyzer: "
+                + json.dumps(
+                    default_analyzer_settings,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+
+        try:
+            probe = client.indices.analyze(
+                index=index_name,
+                field="content",
+                text="OpenRag Alpha-123 中国",
+            )
+            result["analyze_probe_tokens"] = [
+                str(token.get("token")) for token in probe.get("tokens", [])
+            ]
+        except Exception as exc:
+            result["mismatches"].append(
+                f"content analyzer probe failed: {type(exc).__name__}: {exc}"
+            )
+
+        if result["mismatches"]:
+            result["status"] = "MAPPING_INCOMPATIBLE"
+        else:
+            result.update(status="MAPPING_COMPATIBLE", compatible=True)
+        return result
+    except Exception as exc:
+        result["status"] = "ES_PREFLIGHT_ERROR"
+        result["mismatches"].append(f"{type(exc).__name__}: {exc}")
+        return result
 
 
 def _append_sample(report: dict[str, Any], key: str, value: str, limit: int) -> None:
@@ -87,13 +220,20 @@ def audit_workspace(
     batch_size: int = 500,
     sample_limit: int = 20,
     index_version: str = "legacy",
+    environment_label: str | None = None,
 ) -> dict[str, Any]:
     """Compare ES and active DB chunks without mutating either system."""
     if index_version not in {"legacy", "v2", "alias"}:
         raise ValueError(f"Unsupported index version: {index_version}")
     audit_v2_contract = index_version in {"v2", "alias"}
+    workspace = db.get(Workspace, workspace_id)
     report: dict[str, Any] = {
+        "format_version": 1,
+        "checked_at": _utc_now(),
+        "environment_label": environment_label,
         "workspace_id": int(workspace_id),
+        "workspace_name": workspace.name if workspace is not None else None,
+        "workspace_slug": workspace.slug if workspace is not None else None,
         "index_name": index_name,
         "dry_run": True,
         "index_exists": True,
@@ -120,6 +260,8 @@ def audit_workspace(
         "missing_required_field_chunk_ids": [],
         "forbidden_field_chunk_ids": [],
         "required_field_coverage": 1.0,
+        "mapping_preflight": None,
+        "legacy_mapping_mismatch_count": 0,
     }
 
     indices = getattr(es_client, "indices", None)
@@ -245,6 +387,20 @@ def audit_workspace(
             report["es_doc_count"] - report["missing_required_field_count"]
         ) / report["es_doc_count"]
 
+    if index_version == "legacy":
+        report["mapping_preflight"] = inspect_legacy_mapping(
+            es_client,
+            index_name=index_name,
+            active_chunk_count=report["db_active_chunk_count"],
+        )
+        mapping_status = report["mapping_preflight"]["status"]
+        if mapping_status not in {
+            "MAPPING_COMPATIBLE",
+            "INDEX_ABSENT",
+            "EMPTY_INDEX_NOT_REQUIRED",
+        }:
+            report["legacy_mapping_mismatch_count"] = 1
+
     anomaly_keys = [
         "orphan_chunk_count",
         "missing_es_chunk_count",
@@ -262,6 +418,8 @@ def audit_workspace(
                 "forbidden_field_count",
             ]
         )
+    else:
+        anomaly_keys.append("legacy_mapping_mismatch_count")
     report["anomaly_count"] = sum(
         report[key]
         for key in anomaly_keys
@@ -345,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace-id", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument("--environment-label")
     parser.add_argument(
         "--index-version",
         choices=("legacy", "v2", "alias"),
@@ -380,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=workspace.id,
             batch_size=args.batch_size,
             index_version=args.index_version,
+            environment_label=args.environment_label,
         )
         args.output.write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
