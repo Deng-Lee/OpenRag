@@ -100,6 +100,7 @@ class TaskWorker:
         self.hierarchy_storage = None
         self.chunk_fulltext_store = None
         self.chunk_index_mode = "legacy"
+        self.fulltext_required = False
         self.require_layer_vectors = False
         self.dependencies_ready = False
         self.next_dependency_probe_at = 0.0
@@ -149,9 +150,19 @@ class TaskWorker:
         self.parser_registry = ParserRegistry()
         self.chunk_engine = ChunkEngine()
         self.hierarchy_storage = HierarchyStorage()
-        self.chunk_index_mode = get_config().elasticsearch.chunk_index_mode
+        es_config = get_config().elasticsearch
+        self.chunk_index_mode = es_config.chunk_index_mode
+        self.fulltext_required = es_config.requires_fulltext_indexing
         self.chunk_fulltext_store = _create_es_chunk_store(
-            required=self.chunk_index_mode == "v2_alias"
+            required=self.fulltext_required
+        )
+        _logger.info(
+            "elasticsearch_write_policy enabled=%s hybrid_recall_mode=%s "
+            "chunk_index_mode=%s fulltext_required=%s",
+            str(es_config.enabled).lower(),
+            es_config.hybrid_recall_mode,
+            self.chunk_index_mode,
+            str(self.fulltext_required).lower(),
         )
         self.require_layer_vectors = l0_l1_retrieval_enabled()
         self._preflight_processing_dependencies()
@@ -485,6 +496,7 @@ class TaskWorker:
                 parser_registry=self.parser_registry,
                 chunk_engine=self.chunk_engine,
                 embedding_engine=runtime.embedding_engine,
+                fulltext_required=self.fulltext_required,
                 hierarchy_storage=self.hierarchy_storage,
                 minio_storage=minio_storage,
                 vector_store=runtime.vector_store,
@@ -959,7 +971,8 @@ class TaskWorker:
                 result=getattr(exc, "result", None),
             )
             _logger.warning(
-                "document_embedding_failed task_id=%s error_code=%s retryable=true retry_delay_seconds=%d",
+                "document_processing_failed task_id=%s error_code=%s "
+                "retryable=true retry_delay_seconds=%d",
                 task_id,
                 error_code,
                 delay,
@@ -977,7 +990,7 @@ class TaskWorker:
             result=getattr(exc, "result", None),
         )
         _logger.warning(
-            "document_embedding_failed task_id=%s error_code=%s retryable=%s final=true",
+            "document_processing_failed task_id=%s error_code=%s retryable=%s final=true",
             task_id,
             error_code,
             retryable,

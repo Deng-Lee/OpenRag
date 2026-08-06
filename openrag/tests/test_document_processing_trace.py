@@ -358,6 +358,7 @@ def test_document_processor_uses_canonical_source_for_text_like_parsers(tmp_path
             parser_registry=FakeCanonicalParserRegistry(),
             chunk_engine=chunk_engine,
             embedding_engine=FakeEmbeddingEngine(),
+            fulltext_required=False,
             minio_storage=processing_minio,
             vector_store=FakeVectorStore(),
             layer_store=None,
@@ -397,30 +398,23 @@ def test_document_processor_uses_canonical_source_for_text_like_parsers(tmp_path
         Base.metadata.drop_all(bind=engine)
 
 
-def test_v2_document_processing_fails_when_fulltext_store_is_unavailable(tmp_path):
+def test_required_document_processing_rejects_unavailable_fulltext_store(tmp_path):
     engine, db = _new_db()
     try:
-        user, _workspace, file = _seed_file(db)
-        source_path = tmp_path / "report.pdf"
-        source_path.write_bytes(b"source document bytes")
-        processor = DocumentProcessor(
-            db=db,
-            parser_registry=FakeParserRegistry(),
-            chunk_engine=FakeChunkEngine(),
-            embedding_engine=FakeEmbeddingEngine(),
-            minio_storage=FakeProcessingMinio(),
-            vector_store=FakeVectorStore(),
-            layer_store=None,
-            chunk_fulltext_store=None,
-            chunk_index_mode="v2_alias",
-        )
+        _user, _workspace, file = _seed_file(db)
 
-        with pytest.raises(FulltextIndexingError, match="not_enabled"):
-            processor.process_document(
-                file_path=str(source_path),
-                file_id=file.id,
-                user_id=user.id,
-                parser_type="pdf",
+        with pytest.raises(FulltextIndexingError, match="unavailable"):
+            DocumentProcessor(
+                db=db,
+                parser_registry=FakeParserRegistry(),
+                chunk_engine=FakeChunkEngine(),
+                embedding_engine=FakeEmbeddingEngine(),
+                fulltext_required=True,
+                minio_storage=FakeProcessingMinio(),
+                vector_store=FakeVectorStore(),
+                layer_store=None,
+                chunk_fulltext_store=None,
+                chunk_index_mode="legacy",
             )
 
         db.refresh(file)
@@ -431,7 +425,10 @@ def test_v2_document_processing_fails_when_fulltext_store_is_unavailable(tmp_pat
         Base.metadata.drop_all(bind=engine)
 
 
-def test_v2_document_processing_fails_on_partial_fulltext_write(tmp_path):
+@pytest.mark.parametrize("chunk_index_mode", ["legacy", "v2_alias"])
+def test_required_document_processing_fails_on_partial_fulltext_write(
+    tmp_path, chunk_index_mode
+):
     engine, db = _new_db()
     try:
         user, _workspace, file = _seed_file(db)
@@ -446,7 +443,8 @@ def test_v2_document_processing_fails_on_partial_fulltext_write(tmp_path):
             vector_store=FakeVectorStore(),
             layer_store=None,
             chunk_fulltext_store=FakeV2EsStore(upsert_count=2),
-            chunk_index_mode="v2_alias",
+            chunk_index_mode=chunk_index_mode,
+            fulltext_required=True,
         )
 
         with pytest.raises(FulltextIndexingError, match="partial_write:2/3"):
@@ -579,6 +577,7 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         es_store = FakeV2EsStore()
         worker.chunk_fulltext_store = es_store
         worker.chunk_index_mode = "v2_alias"
+        worker.fulltext_required = True
         worker.require_layer_vectors = False
         runtime = IndexRuntime(
             snapshot=SimpleNamespace(
@@ -661,6 +660,11 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
             }
             assert stages["fulltext.es_index"].output_summary["doc_count"] == 3
             assert stages["fulltext.es_index"].output_summary["upsert_count"] == 3
+            assert stages["fulltext.es_index"].output_summary["fulltext_required"] is True
+            assert stages["fulltext.es_index"].output_summary["chunk_index_mode"] == "v2_alias"
+            assert stages["fulltext.es_index"].output_summary["expected_doc_count"] == 3
+            assert stages["fulltext.es_index"].output_summary["submitted_doc_count"] == 3
+            assert stages["fulltext.es_index"].output_summary["accepted_doc_count"] == 3
             assert (
                 stages["metadata.persist_chunks"].output_summary[
                     "document_chunks_written"
@@ -710,19 +714,7 @@ def test_worker_document_processing_records_trace_and_canonical_artifacts(monkey
         Base.metadata.drop_all(bind=engine)
 
 
-@pytest.mark.parametrize(
-    ("chunk_engine", "es_store", "expected"),
-    [
-        (
-            FakeChunkEngine,
-            FakeEsStore(upsert_count=2),
-            {"doc_count": 3, "upsert_count": 2, "complete": False, "reason": "partial_write:2/3"},
-        ),
-    ],
-)
-def test_document_processing_es_sync_is_complete_or_explicitly_degraded(
-    monkeypatch, chunk_engine, es_store, expected
-):
+def test_required_legacy_es_partial_write_fails_closed(monkeypatch):
     engine, db = _new_db()
     try:
         user, workspace, file = _seed_file(db)
@@ -732,13 +724,14 @@ def test_document_processing_es_sync_is_complete_or_explicitly_degraded(
         monkeypatch.setattr(task_worker, "MinioStorage", FakeProcessingMinio)
         worker = task_worker.TaskWorker()
         worker.parser_registry = FakeParserRegistry()
-        worker.chunk_engine = chunk_engine()
+        worker.chunk_engine = FakeChunkEngine()
         worker.embedding_engine = FakeEmbeddingEngine()
         worker.hierarchy_storage = object()
         worker.vector_store = FakeVectorStore()
         worker.layer_store = None
-        worker.chunk_fulltext_store = es_store
+        worker.chunk_fulltext_store = FakeEsStore(upsert_count=2)
         worker.chunk_index_mode = "legacy"
+        worker.fulltext_required = True
         worker.require_layer_vectors = False
         runtime = IndexRuntime(
             snapshot=SimpleNamespace(
@@ -753,7 +746,7 @@ def test_document_processing_es_sync_is_complete_or_explicitly_degraded(
             layer_store=None,
         )
 
-        trace_id = f"es-sync-{expected['doc_count']}"
+        trace_id = "required-legacy-es-partial"
         set_trace_context(
             trace_id=trace_id,
             trace_type="document_processing",
@@ -763,28 +756,32 @@ def test_document_processing_es_sync_is_complete_or_explicitly_degraded(
             task_id="a01",
             sampling_reason="unit-test",
         )
-        result = worker._process_document(
-            {
-                "file_id": ids[2],
-                "workspace_id": ids[1],
-                "user_id": ids[0],
-                "index_generation_id": "generation-test",
-            },
-            task_id=78,
-            runtime=runtime,
-        )
+        with pytest.raises(FulltextIndexingError, match="partial_write:2/3"):
+            worker._process_document(
+                {
+                    "file_id": ids[2],
+                    "workspace_id": ids[1],
+                    "user_id": ids[0],
+                    "index_generation_id": "generation-test",
+                },
+                task_id=78,
+                runtime=runtime,
+            )
 
         db2 = sessionmaker(bind=engine)()
         try:
+            stored_file = db2.get(File, ids[2])
+            assert stored_file.processing_status != ProcessingStatus.completed
+            assert db2.query(DocumentChunk).count() == 0
             span = db2.query(TraceSpan).filter_by(
                 trace_id=trace_id, stage="fulltext.es_index"
             ).one()
-            assert result["status"] == "success"
-            assert span.output_summary["doc_count"] == expected["doc_count"]
-            assert span.output_summary["upsert_count"] == expected["upsert_count"]
-            assert span.output_summary["es_write_complete"] is expected["complete"]
-            assert span.output_summary["failure_reason"] == expected["reason"]
-            assert [operation[0] for operation in es_store.operations] == ["delete", "bulk"]
+            assert span.output_summary["fulltext_required"] is True
+            assert span.output_summary["chunk_index_mode"] == "legacy"
+            assert span.output_summary["expected_doc_count"] == 3
+            assert span.output_summary["submitted_doc_count"] == 3
+            assert span.output_summary["accepted_doc_count"] == 2
+            assert span.output_summary["failure_reason"] == "partial_write:2/3"
         finally:
             db2.close()
     finally:
@@ -862,6 +859,7 @@ def test_process_document_persists_pdf_stage_profile_on_failure(tmp_path):
             parser_registry=FakeFailingProfiledRegistry(),
             chunk_engine=FakeChunkEngine(),
             embedding_engine=FakeEmbeddingEngine(),
+            fulltext_required=False,
             minio_storage=FakeProcessingMinio(),
             vector_store=FakeVectorStore(),
             layer_store=None,
@@ -904,6 +902,7 @@ def test_process_document_persists_pdf_stage_profile_on_success(tmp_path):
             parser_registry=FakeProfiledRegistry(),
             chunk_engine=FakeChunkEngine(),
             embedding_engine=FakeEmbeddingEngine(),
+            fulltext_required=False,
             minio_storage=FakeProcessingMinio(),
             vector_store=FakeVectorStore(),
             layer_store=None,

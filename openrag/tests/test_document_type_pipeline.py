@@ -253,6 +253,7 @@ def test_document_processor_passes_document_type_to_chunk_engine(tmp_path, monke
             parser_registry=FakeParserRegistry(),
             chunk_engine=chunk_engine,
             embedding_engine=FakeEmbeddingEngine(),
+            fulltext_required=False,
             hierarchy_storage=FakeHierarchyStorage(),
             minio_storage=None,
             vector_store=FakeVectorStore(),

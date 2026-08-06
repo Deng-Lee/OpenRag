@@ -148,7 +148,8 @@ def document_processor_paragraph(mock_db, parser_registry):
         db=mock_db,
         parser_registry=parser_registry,
         chunk_engine=chunk_engine,
-        embedding_engine=embedding_engine
+        embedding_engine=embedding_engine,
+        fulltext_required=False,
     )
 
 
@@ -161,7 +162,8 @@ def document_processor_semantic(mock_db, parser_registry):
         db=mock_db,
         parser_registry=parser_registry,
         chunk_engine=chunk_engine,
-        embedding_engine=embedding_engine
+        embedding_engine=embedding_engine,
+        fulltext_required=False,
     )
 
 
@@ -174,7 +176,8 @@ def document_processor_fixed(mock_db, parser_registry):
         db=mock_db,
         parser_registry=parser_registry,
         chunk_engine=chunk_engine,
-        embedding_engine=embedding_engine
+        embedding_engine=embedding_engine,
+        fulltext_required=False,
     )
 
 

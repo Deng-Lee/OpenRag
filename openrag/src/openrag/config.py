@@ -118,8 +118,25 @@ class ElasticsearchConfig(BaseSettings):
     hybrid_recall_mode: Literal["legacy", "independent_rrf"] = "legacy"
     chunk_index_mode: Literal["legacy", "v2_alias"] = "legacy"
 
+    @property
+    def requires_fulltext_indexing(self) -> bool:
+        return self.enabled and self.hybrid_recall_mode in {
+            "legacy",
+            "independent_rrf",
+        }
+
     @model_validator(mode="after")
     def validate_mode_combination(self) -> "ElasticsearchConfig":
+        if self.hybrid_recall_mode == "independent_rrf" and not self.enabled:
+            raise ValueError(
+                "ELASTICSEARCH__HYBRID_RECALL_MODE=independent_rrf requires "
+                "ELASTICSEARCH__ENABLED=true"
+            )
+        if self.enabled and not self.hosts.strip():
+            raise ValueError(
+                "ELASTICSEARCH__ENABLED=true requires non-empty "
+                "ELASTICSEARCH__HOSTS"
+            )
         if self.chunk_index_mode == "v2_alias":
             if self.hybrid_recall_mode != "independent_rrf":
                 raise ValueError(

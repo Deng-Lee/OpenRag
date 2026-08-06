@@ -52,6 +52,10 @@ _TEXT_PREVIEW_MAX = 16000
 class FulltextIndexingError(RuntimeError):
     """Raised when required full-text indexing cannot be completed."""
 
+    code = "FULLTEXT_INDEXING_FAILED"
+    public_message = "Elasticsearch chunk indexing failed"
+    retryable = True
+
 
 try:
     from common.token_utils import num_tokens_from_string
@@ -227,6 +231,7 @@ class DocumentProcessor:
         parser_registry: ParserRegistry,
         chunk_engine: ChunkEngine,
         embedding_engine: EmbeddingEngine,
+        fulltext_required: bool,
         hierarchy_storage: Optional[HierarchyStorage] = None,
         minio_storage: Optional[MinioStorage] = None,
         vector_store=None,
@@ -247,6 +252,10 @@ class DocumentProcessor:
             raise VectorWriteIncompleteError(
                 "Milvus layer vector store is required when L0/L1 retrieval is enabled"
             )
+        if fulltext_required and chunk_fulltext_store is None:
+            raise FulltextIndexingError(
+                "Required Elasticsearch chunk store is unavailable"
+            )
         self.db = db
         self.parser_registry = parser_registry
         self.chunk_engine = chunk_engine
@@ -258,7 +267,7 @@ class DocumentProcessor:
         self.require_layer_vectors = require_layer_vectors
         self.chunk_fulltext_store = chunk_fulltext_store
         self.chunk_index_mode = chunk_index_mode
-        self.fulltext_required = chunk_index_mode == "v2_alias"
+        self.fulltext_required = fulltext_required
         self.generation_context = generation_context
         self._assert_generation_consistency(
             generation_context,
@@ -767,12 +776,14 @@ class DocumentProcessor:
             },
         )
 
-        # Step 5a: Elasticsearch 全文（与 Milvus 同一批 chunk；失败仅告警）
+        # Step 5a: Elasticsearch full text for the same chunks stored in Milvus.
         es_span = _safe_start_span(
             trace_service,
             "fulltext.es_index",
             input_summary={
                 "chunk_count": len(chunk_embeddings),
+                "fulltext_required": self.fulltext_required,
+                "chunk_index_mode": self.chunk_index_mode,
                 "enabled": (
                     self.chunk_fulltext_store is not None
                     and self.vector_store is not None
@@ -781,6 +792,7 @@ class DocumentProcessor:
             },
         )
         es_index_name = None
+        expected_es_doc_count = len(chunk_embeddings)
         es_doc_count = 0
         es_upsert_count = 0
         es_failure_reason = None
@@ -846,6 +858,11 @@ class DocumentProcessor:
                                 metadata=md,
                             )
                         )
+                    if len(es_docs) != expected_es_doc_count:
+                        raise FulltextIndexingError(
+                            "Elasticsearch document build count does not match "
+                            f"chunk count: {len(es_docs)}/{expected_es_doc_count}"
+                        )
                     if self.fulltext_required:
                         self.chunk_fulltext_store.delete_by_file_id(
                             index_name,
@@ -888,6 +905,11 @@ class DocumentProcessor:
                 "index_name": es_index_name,
                 "doc_count": es_doc_count,
                 "upsert_count": es_upsert_count,
+                "fulltext_required": self.fulltext_required,
+                "chunk_index_mode": self.chunk_index_mode,
+                "expected_doc_count": expected_es_doc_count,
+                "submitted_doc_count": es_doc_count,
+                "accepted_doc_count": es_upsert_count,
                 "es_delete_performed": es_delete_performed,
                 "es_write_complete": es_write_complete,
                 "failure_reason": es_failure_reason,

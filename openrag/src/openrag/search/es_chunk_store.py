@@ -641,7 +641,7 @@ def create_es_chunk_store_from_config() -> Optional[EsChunkStore]:
 
 
 def require_es_chunk_store_from_config() -> EsChunkStore:
-    """Return a reachable store or fail when v2 indexing requires Elasticsearch."""
+    """Return a reachable store or fail when full-text indexing is required."""
     from openrag.config import get_config
 
     cfg = get_config().elasticsearch
