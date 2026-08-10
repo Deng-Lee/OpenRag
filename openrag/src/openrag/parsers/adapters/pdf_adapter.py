@@ -1,10 +1,12 @@
 """PDF parser adapter (RAGFlow deepdoc only)."""
 
+from io import BytesIO
 import logging
 import re
 
 from openrag.parsers.adapters.base_adapter import RAGFlowParserAdapter
 from openrag.parsers.base import DocumentBlock
+from openrag.parsers.pdf_heading_hierarchy import PdfHeadingHierarchyResolver
 from openrag.ragflow_core.compat import to_document_blocks
 
 logger = logging.getLogger(__name__)
@@ -165,6 +167,135 @@ def _unpack_ragflow_table_item(
     return tbl_item[0], tbl_item[1], []
 
 
+def _structured_box_page_bbox(
+    box: dict,
+) -> tuple[
+    int,
+    tuple[float, float, float, float] | None,
+    dict[int, tuple[float, float, float, float]],
+]:
+    """Return 1-based page and page-local bbox from ``parse_into_bboxes`` output."""
+    by_page: dict[int, list[tuple[float, float, float, float]]] = {}
+    for raw in box.get("positions") or []:
+        if not isinstance(raw, (tuple, list)) or len(raw) < 5:
+            continue
+        try:
+            page = int(raw[0])
+            left, right, top, bottom = map(float, raw[1:5])
+        except (TypeError, ValueError):
+            continue
+        by_page.setdefault(page, []).append((left, top, right, bottom))
+
+    primary_page = int(box.get("page_number") or 1)
+    if not by_page:
+        try:
+            bbox = (
+                float(box["x0"]),
+                float(box["top"]),
+                float(box["x1"]),
+                float(box["bottom"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            bbox = None
+        return primary_page, bbox, {}
+
+    per_page = {
+        page: (
+            min(rect[0] for rect in rects),
+            min(rect[1] for rect in rects),
+            max(rect[2] for rect in rects),
+            max(rect[3] for rect in rects),
+        )
+        for page, rects in by_page.items()
+    }
+    if primary_page not in per_page:
+        primary_page = min(per_page)
+    return primary_page, per_page[primary_page], per_page
+
+
+def _structured_image_bytes(image: object) -> bytes | None:
+    if isinstance(image, bytes):
+        return image
+    save = getattr(image, "save", None)
+    if not callable(save):
+        return None
+    buffer = BytesIO()
+    try:
+        save(buffer, format="PNG")
+    except Exception:
+        logger.debug("Failed to serialize DeepDoc block image", exc_info=True)
+        return None
+    return buffer.getvalue()
+
+
+def _deepdoc_boxes_to_document_blocks(boxes: list[dict]) -> list[DocumentBlock]:
+    raw_rows: list[dict] = []
+    stream_cursor = 0
+    for index, box in enumerate(boxes or []):
+        text = str(box.get("text") or "").strip()
+        layout_type = str(box.get("layout_type") or "text").lower()
+        if not text and layout_type not in {"figure", "image"}:
+            continue
+
+        page, bbox, per_page_bboxes = _structured_box_page_bbox(box)
+        if layout_type == "table":
+            block_type = "table"
+        elif layout_type in {"figure", "image"}:
+            block_type = "image"
+        else:
+            block_type = "text"
+
+        metadata: dict = {
+            "structured_pdf": True,
+            "deepdoc_order": index,
+        }
+        if box.get("layoutno") is not None:
+            metadata["deepdoc_layoutno"] = str(box["layoutno"])
+        layout_score = box.get("layout_score", box.get("score"))
+        if layout_score is not None:
+            metadata["deepdoc_layout_score"] = float(layout_score)
+        if box.get("positions"):
+            metadata["positions"] = [list(pos) for pos in box["positions"]]
+        if len(per_page_bboxes) > 1:
+            metadata["page_bboxes"] = {
+                str(pg): list(value) for pg, value in sorted(per_page_bboxes.items())
+            }
+        for key in (
+            "font_size_median",
+            "font_name_mode",
+            "bold_ratio",
+            "char_height_median",
+            "char_count",
+            "style_source",
+        ):
+            if box.get(key) is not None:
+                metadata[key] = box[key]
+
+        raw_rows.append(
+            {
+                "text": text,
+                "page": page,
+                "offset": len(raw_rows),
+                "bbox": bbox,
+                "block_type": block_type,
+                "level": 0,
+                "layout_type": layout_type,
+                "image": _structured_image_bytes(box.get("image")),
+                "table_data": (
+                    {"html": text}
+                    if layout_type == "table" and text.lstrip().lower().startswith("<table")
+                    else None
+                ),
+                "block_id": f"ragflow:{layout_type}:{index}",
+                "char_start": stream_cursor,
+                "char_end": stream_cursor + len(text),
+                "metadata": metadata,
+            }
+        )
+        stream_cursor += len(text) + 2
+    return to_document_blocks(raw_rows, source="pdf")
+
+
 def _plain_page_bbox_from_tagged_paragraph(
     para: str,
 ) -> tuple[str, int, tuple[float, float, float, float] | None]:
@@ -228,7 +359,32 @@ class PDFParserAdapter(RAGFlowParserAdapter):
             raise RuntimeError(
                 f"RAGFlow deepdoc backend unavailable: {_RAGFLOW_IMPORT_ERROR}"
             )
-        return self._parse_ragflow_with_tables(file_path)
+        return self._parse_ragflow_structured(file_path)
+
+    def _parse_ragflow_structured(self, file_path: str) -> list[DocumentBlock]:
+        if self.ragflow_parser is None:
+            raise RuntimeError(f"RAGFlow backend unavailable: {_RAGFLOW_IMPORT_ERROR}")
+        parse_into_bboxes = getattr(self.ragflow_parser, "parse_into_bboxes", None)
+        if not callable(parse_into_bboxes):
+            return self._parse_ragflow_with_tables(file_path)
+
+        logger.info("[pdf_adapter] calling structured ragflow parser for file=%s", file_path)
+        try:
+            boxes = parse_into_bboxes(file_path)
+        except Exception:
+            logger.exception(
+                "[pdf_adapter] structured ragflow parser FAILED for file=%s",
+                file_path,
+            )
+            raise
+        finally:
+            self.last_parse_profile = getattr(
+                self.ragflow_parser, "_last_parse_profile", None
+            )
+
+        blocks = _deepdoc_boxes_to_document_blocks(boxes)
+        outlines = getattr(self.ragflow_parser, "outlines", [])
+        return PdfHeadingHierarchyResolver().resolve(blocks, outlines)
 
     def _parse_ragflow_with_tables(self, file_path: str) -> list[DocumentBlock]:
         if self.ragflow_parser is None:

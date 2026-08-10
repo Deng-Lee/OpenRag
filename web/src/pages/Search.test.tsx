@@ -140,6 +140,7 @@ describe('SearchPage', () => {
       query: 'hybrid retrieval',
       workspace_id: 7,
       vector_similarity_weight: 0.7,
+      use_rerank: false,
     }));
   });
 

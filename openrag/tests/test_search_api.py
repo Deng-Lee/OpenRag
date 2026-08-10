@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 
 from openrag.api import search_api
 from openrag.api.search_api import SearchRequest
+from openrag.api.service_api import (
+    ServiceMultiWorkspaceSearchRequest,
+    ServiceSearchRequest,
+)
 from openrag.retrieval.retrieval_service import (
     PermissionScopeResolutionError,
     ResolvedFileScope,
@@ -16,6 +20,11 @@ from openrag.retrieval.retrieval_service import (
 
 
 class TestSearchRequestVectorSimilarityWeight:
+    def test_rerank_defaults_to_false(self):
+        assert SearchRequest(query="test").use_rerank is False
+        assert ServiceSearchRequest(query="test").use_rerank is False
+        assert ServiceMultiWorkspaceSearchRequest(query="test").use_rerank is False
+
     def test_vector_similarity_weight_defaults_to_0_7(self):
         assert SearchRequest(query="test").vector_similarity_weight == 0.7
 
@@ -159,6 +168,30 @@ def test_execute_search_reranks_union_before_top_k(monkeypatch):
     assert rerank.call_args.args[1] == results
     assert response.results[0].chunk_id == "c3"
     assert response.results[0].score == 0.99
+
+
+def test_execute_search_preserves_fused_scores_when_reranker_is_unavailable(monkeypatch):
+    results = [
+        {"text": "first", "score": 0.9, "fused_score": 0.02, "file_id": 1, "chunk_id": "c1"},
+        {"text": "second", "score": 0.1, "fused_score": 0.01, "file_id": 2, "chunk_id": "c2"},
+    ]
+    _patch_execute_dependencies(monkeypatch, results)
+    monkeypatch.setenv("RERANKER_PROVIDER", "local")
+    monkeypatch.setattr(
+        "openrag.retrieval.reranker._get_cross_encoder_model",
+        lambda _model_name: None,
+    )
+
+    response = search_api._execute_search(
+        Mock(spec=Session),
+        user_id=1,
+        request=SearchRequest(query="q", top_k=2, use_rerank=True),
+        endpoint="semantic",
+        rerank_hierarchical_boost=None,
+    )
+
+    assert [item.chunk_id for item in response.results] == ["c1", "c2"]
+    assert [item.score for item in response.results] == [0.02, 0.01]
 
 
 def test_permission_scope_resolution_error_returns_explicit_503(monkeypatch):

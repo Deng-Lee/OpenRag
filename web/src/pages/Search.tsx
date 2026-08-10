@@ -371,7 +371,7 @@ export default function SearchPage() {
                 top_k: 10,
                 vector_similarity_weight: 0.7,
                 search_mode: 'semantic' as SearchMode,
-                use_rerank: true,
+                use_rerank: false,
                 use_contextual_retrieval: false,
                 use_l1_llm_navigation: false,
                 retrieval_strategy: 'auto',

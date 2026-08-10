@@ -1,6 +1,7 @@
 """Chunking engine with multiple strategies."""
 
 from enum import Enum
+import os
 from typing import Optional
 import uuid
 
@@ -11,6 +12,9 @@ from openrag.parsers.char_spans import paragraph_absolute_spans
 from openrag.chunking.ragflow_core.semantic import (
     chunk_semantic_ragflow,
     find_chunk_pos_robust,
+)
+from openrag.chunking.structure_recursive_chunker import (
+    chunk_general_structured_recursive,
 )
 
 try:
@@ -168,6 +172,29 @@ class ChunkEngine:
         document_type: str = DEFAULT_DOCUMENT_TYPE,
     ) -> list[Chunk]:
         """Semantic chunking with RAGFlow-like naive merge (delegates to ragflow_core)."""
+        structured_enabled = os.environ.get(
+            "OPENRAG_GENERAL_STRUCTURE_RECURSIVE_ENABLED", "true"
+        ).lower() in {"1", "true", "yes"}
+        is_structured_pdf = any(
+            bool((block.metadata or {}).get("structured_pdf"))
+            and (
+                (block.metadata or {}).get("parser_backend")
+                in {"deepdoc", "paddleocr"}
+                or (block.metadata or {}).get("compat_source") == "pdf"
+            )
+            for block in text_blocks
+        )
+        if (
+            document_type == DEFAULT_DOCUMENT_TYPE
+            and structured_enabled
+            and is_structured_pdf
+        ):
+            return chunk_general_structured_recursive(
+                text_blocks,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                min_chunk_tokens=min_chunk_tokens,
+            )
         return chunk_semantic_ragflow(
             text_blocks,
             chunk_size,

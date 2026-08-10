@@ -125,6 +125,7 @@ class LayoutRecognizer(Recognizer):
                         i += 1
                         continue
                     lts_[ii]["visited"] = True
+                    bxs[i]["layout_score"] = float(lts_[ii]["score"])
                     keep_feats = [
                         lts_[ii]["type"] == "footer" and bxs[i]["bottom"] < image_list[pn].size[1] * 0.9 / scale_factor,
                         lts_[ii]["type"] == "header" and bxs[i]["top"] > image_list[pn].size[1] * 0.1 / scale_factor,
@@ -427,6 +428,7 @@ class AscendLayoutRecognizer(Recognizer):
                         continue
 
                     lts_of_ty[ii]["visited"] = True
+                    bxs[i]["layout_score"] = float(lts_of_ty[ii]["score"])
 
                     keep_feats = [
                         lts_of_ty[ii]["type"] == "footer" and bxs[i]["bottom"] < image_list[pn].shape[0] * 0.9 / scale_factor,

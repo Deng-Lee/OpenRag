@@ -166,6 +166,8 @@ def test_success_response_creates_document_blocks(tmp_path, monkeypatch, caplog)
     assert profile["invalid_bbox_count"] == 1
     assert profile["scaled_bbox_count"] == 3
     assert profile["unmapped_bbox_count"] == 0
+    assert profile["filtered_block_count"] == 1
+    assert profile["filtered_labels"] == {"footer": 1}
     assert [stage["stage"] for stage in profile["stages"]] == [
         "paddleocr.submit",
         "paddleocr.poll",
@@ -198,6 +200,99 @@ def test_success_response_creates_document_blocks(tmp_path, monkeypatch, caplog)
     assert profile_event["block_count"] == 4
     assert "file_path" not in profile_event
     assert "ocr_task_id" not in profile_event
+
+
+def test_parse_resolves_paddle_title_hierarchy_and_filters_page_number(
+    tmp_path,
+    monkeypatch,
+):
+    pdf = write_pdf(tmp_path)
+    result = {
+        "pages": [
+            {
+                "width": 100,
+                "height": 200,
+                "doc_preprocessor_res": {"angle": 0},
+                "parsing_res_list": [
+                    {
+                        "label": "doc_title",
+                        "content": "OpenRAG 白皮书",
+                        "bbox": [10, 10, 90, 25],
+                    },
+                    {
+                        "label": "paragraph_title",
+                        "content": "第一章 概述",
+                        "bbox": [10, 35, 70, 50],
+                    },
+                    {
+                        "label": "text",
+                        "content": "章节正文",
+                        "bbox": [10, 55, 90, 75],
+                    },
+                    {
+                        "label": "paragraph_title",
+                        "content": "1.1 范围",
+                        "bbox": [15, 80, 65, 92],
+                    },
+                    {
+                        "label": "text",
+                        "content": "范围正文",
+                        "bbox": [10, 98, 90, 120],
+                    },
+                    {
+                        "label": "number",
+                        "content": "第 1 页",
+                        "bbox": [45, 180, 55, 190],
+                    },
+                ],
+                "markdown": {
+                    "markdown_texts": (
+                        "# OpenRAG 白皮书\n\n"
+                        "## 第一章 概述\n\n章节正文\n\n"
+                        "### 1.1 范围\n\n范围正文"
+                    )
+                },
+            }
+        ]
+    }
+    monkeypatch.setenv("PADDLEOCR_SERVER_URL", "http://ocr.test")
+    monkeypatch.setattr(
+        PaddleOCRPDFParserAdapter,
+        "_submit",
+        lambda self, file_path, server_url, request_timeout: "task-1",
+    )
+    monkeypatch.setattr(
+        PaddleOCRPDFParserAdapter,
+        "_poll",
+        lambda self, server_url, task_id, request_timeout: {"result": result},
+    )
+
+    parser = PaddleOCRPDFParserAdapter()
+    blocks = parser.parse(str(pdf))
+
+    assert [block.text for block in blocks] == [
+        "OpenRAG 白皮书",
+        "第一章 概述",
+        "章节正文",
+        "1.1 范围",
+        "范围正文",
+    ]
+    assert [(block.block_type, block.level) for block in blocks] == [
+        ("text", 0),
+        ("heading", 1),
+        ("text", 0),
+        ("heading", 2),
+        ("text", 0),
+    ]
+    assert blocks[0].metadata["heading_role"] == "document_title"
+    assert blocks[0].metadata["hard_boundary"] is False
+    assert blocks[1].metadata["hard_boundary"] is True
+    assert blocks[1].metadata["heading_sources"] == [
+        "numbering",
+        "paddle_markdown",
+    ]
+    assert blocks[4].metadata["heading_path"] == ["第一章 概述", "1.1 范围"]
+    assert parser.last_parse_stats["filtered_labels"] == {"number": 1}
 
 
 def test_read_pdf_page_sizes_uses_display_dimensions(tmp_path):
@@ -250,7 +345,102 @@ def test_result_to_rows_scales_ocr_bbox_to_pdf_coordinates():
         "invalid_bbox_count": 0,
         "scaled_bbox_count": 1,
         "unmapped_bbox_count": 0,
+        "filtered_block_count": 0,
+        "filtered_labels": {},
+        "layout_matched_count": 0,
+        "markdown_heading_matched_count": 0,
     }
+
+
+def test_result_to_rows_preserves_structure_evidence_and_filters_noise():
+    result = {
+        "pages": [
+            {
+                "width": 100,
+                "height": 200,
+                "doc_preprocessor_res": {"angle": 0},
+                "layout_det_res": {
+                    "boxes": [
+                        {
+                            "label": "doc_title",
+                            "score": 0.91,
+                            "coordinate": [10, 10, 90, 30],
+                            "order": 1,
+                        },
+                        {
+                            "label": "paragraph_title",
+                            "score": 0.87,
+                            "coordinate": [10, 40, 70, 55],
+                            "order": 2,
+                        },
+                    ]
+                },
+                "parsing_res_list": [
+                    {
+                        "label": "doc_title",
+                        "content": "测试文档",
+                        "bbox": [10, 10, 90, 30],
+                        "polygon_points": [[10, 10], [90, 10], [90, 30], [10, 30]],
+                    },
+                    {
+                        "label": "paragraph_title",
+                        "content": "第一章 概述",
+                        "bbox": [10, 40, 70, 55],
+                    },
+                    {
+                        "label": "text",
+                        "content": "正文",
+                        "bbox": [10, 60, 90, 80],
+                    },
+                    {
+                        "label": "table",
+                        "content": "<table><tr><td>A</td></tr></table>",
+                        "bbox": [10, 90, 90, 120],
+                    },
+                    {
+                        "label": "number",
+                        "content": "第 1 页",
+                        "bbox": [45, 180, 55, 190],
+                    },
+                ],
+                "markdown": {
+                    "markdown_texts": "# 测试文档\n\n## 第一章 概述\n\n正文"
+                },
+            }
+        ]
+    }
+
+    rows, stats = adapter_module._result_to_rows(result, [(100.0, 200.0)])
+
+    assert [row["text"] for row in rows] == [
+        "测试文档",
+        "第一章 概述",
+        "正文",
+        "<table><tr><td>A</td></tr></table>",
+    ]
+    assert [row["layout_type"] for row in rows] == [
+        "title",
+        "title",
+        "text",
+        "table",
+    ]
+    assert rows[0]["metadata"]["heading_role"] == "document_title"
+    assert rows[0]["metadata"]["paddle_markdown_level"] == 0
+    assert rows[1]["metadata"]["heading_candidate"] is True
+    assert rows[1]["metadata"]["paddle_markdown_level_raw"] == 2
+    assert rows[1]["metadata"]["paddle_markdown_level"] == 1
+    assert rows[1]["metadata"]["layout_score"] == pytest.approx(0.87)
+    assert rows[1]["metadata"]["paddleocr_layout_order"] == 2
+    assert rows[1]["metadata"]["style_source"] == "paddle_bbox"
+    assert rows[1]["metadata"]["geometry_height_ratio"] == pytest.approx(0.075)
+    assert rows[3]["block_type"] == "table"
+    assert rows[3]["table_data"] == {
+        "html": "<table><tr><td>A</td></tr></table>"
+    }
+    assert stats["filtered_block_count"] == 1
+    assert stats["filtered_labels"] == {"number": 1}
+    assert stats["layout_matched_count"] == 2
+    assert stats["markdown_heading_matched_count"] == 2
 
 
 def test_result_to_rows_rejects_non_monotonic_bbox():

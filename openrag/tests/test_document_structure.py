@@ -52,6 +52,21 @@ def test_general_without_headings_keeps_root_order():
     ]
 
 
+def test_level_zero_title_candidate_is_not_promoted_to_h1():
+    blocks = [
+        _block("封面标题", "title", level=0, offset=0),
+        _block("正文", offset=10),
+    ]
+
+    structure = build_document_structure(blocks, "general")
+
+    assert list(structure.nodes) == [structure.root_id]
+    assert [item.text for item in structure.items_for_node(structure.root_id)] == [
+        "封面标题",
+        "正文",
+    ]
+
+
 def test_manual_rule_headings_keep_steps_and_table_in_section():
     blocks = [
         _block("安装流程：", offset=0),

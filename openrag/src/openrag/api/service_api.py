@@ -91,7 +91,7 @@ class ServiceSearchRequest(BaseModel):
         description="限定检索范围到这些逻辑路径；显式传入时覆盖 path_prefix（含 []=空范围）",
     )
     top_k: int = Field(10, gt=0, le=100)
-    use_rerank: bool = True
+    use_rerank: bool = False
     use_contextual_retrieval: bool = False
     contextual_l0_top_n: int = Field(40, ge=5, le=200)
     contextual_l1_top_n: int = Field(30, ge=5, le=200)
@@ -114,7 +114,7 @@ class ServiceMultiWorkspaceSearchRequest(BaseModel):
         description="限定检索范围到这些逻辑路径；显式传入时覆盖 path_prefix（含 []=空范围）",
     )
     top_k: int = Field(10, gt=0, le=100)
-    use_rerank: bool = True
+    use_rerank: bool = False
     use_contextual_retrieval: bool = False
     contextual_l0_top_n: int = Field(40, ge=5, le=200)
     contextual_l1_top_n: int = Field(30, ge=5, le=200)

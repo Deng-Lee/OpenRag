@@ -885,7 +885,7 @@ POST /service/v1/workspaces/{workspace_name}/documents/by-path/retry?path=/docs/
 | `paths` | array[string] | 否 | `null` | — | 把检索范围限定到这些逻辑路径（文件夹按子树递归，单个文件精确匹配）。传入时**覆盖** `path_prefix`；`paths: []` 表示空范围，直接返回空结果。仅当本字段缺省（未传或 `null`）时才回退使用 `path_prefix`。 |
 | `path_prefix` | string | 否 | `null` | — | 把检索范围限定到该逻辑路径前缀下的文件（**预过滤**，在 top_k 之前就限定候选文件）。当 `paths` 已显式传入时本字段被忽略。⚠️ **行为变更**：旧版为检索后过滤（post-filter），现已升级为检索前预过滤（pre-filter），与 `paths` 语义一致；结果更准、召回更充分，但与旧版本不完全一致（旧版先在整个工作区取 top_k 再裁剪，可能漏掉目录内排名靠后的命中）。 |
 | `top_k` | int | 否 | `10` | gt=0, le=100 | 返回结果数 |
-| `use_rerank` | bool | 否 | `true` | — | 是否使用 cross-encoder 重排 |
+| `use_rerank` | bool | 否 | `false` | — | 是否使用 cross-encoder 重排 |
 | `use_contextual_retrieval` | bool | 否 | `false` | — | 启用 L0→L1→L2 层级检索 |
 | `contextual_l0_top_n` | int | 否 | `40` | ge=5, le=200 | L0 候选文件数 |
 | `contextual_l1_top_n` | int | 否 | `30` | ge=5, le=200 | L1 检索深度 |
@@ -1091,7 +1091,7 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 | `paths` | array[string] | 否 | `null` | — | 把检索范围限定到这些逻辑路径（文件夹按子树递归，单个文件精确匹配），同一范围应用于所有目标工作区。传入时**覆盖** `path_prefix`；`paths: []` 直接返回空结果。仅当本字段缺省（未传或 `null`）时才回退使用 `path_prefix`。 |
 | `path_prefix` | string/null | 否 | `null` | — | 把检索范围限定到该逻辑路径前缀下的文件（**预过滤**），同一前缀应用于所有目标工作区。当 `paths` 已显式传入时本字段被忽略。⚠️ **行为变更**：已由检索后过滤（post-filter）升级为检索前预过滤（pre-filter）。 |
 | `top_k` | int | 否 | `10` | gt=0, le=100 | 全局返回结果数；多工作区结果合并后按分数截断 |
-| `use_rerank` | bool | 否 | `true` | — | 是否使用 cross-encoder 重排 |
+| `use_rerank` | bool | 否 | `false` | — | 是否使用 cross-encoder 重排 |
 | `use_contextual_retrieval` | bool | 否 | `false` | — | 启用 L0→L1→L2 层级检索 |
 | `contextual_l0_top_n` | int | 否 | `40` | ge=5, le=200 | L0 候选文件数 |
 | `contextual_l1_top_n` | int | 否 | `30` | ge=5, le=200 | L1 检索深度 |

@@ -73,6 +73,15 @@ def _tag_contains_n(tag_result):
     return False
 
 
+def _outline_page_number(reader, destination):
+    """Return a 1-based destination page without failing the whole outline."""
+    try:
+        page_index = reader.get_destination_page_number(destination)
+    except Exception:
+        return None
+    return page_index + 1 if page_index is not None and page_index >= 0 else None
+
+
 class RAGFlowPdfParser:
     def __init__(self, **kwargs):
         """
@@ -905,7 +914,6 @@ class RAGFlowPdfParser:
                             total_count += 1
                             if self._is_garbled_char(ch):
                                 garbled_count += 1
-            del b["chars"]
             # If the majority of characters from pdfplumber are garbled,
             # clear the text so OCR recognition will be used as fallback.
             # Strategy 1: PUA / unmapped CID characters
@@ -919,6 +927,7 @@ class RAGFlowPdfParser:
                     b["top"],
                 )
                 b["text"] = ""
+                del b["chars"]
                 continue
             # Strategy 2: font-encoding garbling — all chars are ASCII
             # punctuation from subset fonts (no CJK output)
@@ -933,6 +942,33 @@ class RAGFlowPdfParser:
                     b["top"],
                 )
                 b["text"] = ""
+                del b["chars"]
+                continue
+
+            font_sizes = [
+                float(c["size"])
+                for c in box_chars
+                if isinstance(c.get("size"), (int, float))
+            ]
+            font_names = [str(c.get("fontname") or "") for c in box_chars]
+            font_names = [name for name in font_names if name]
+            char_heights = [
+                float(c["height"])
+                for c in box_chars
+                if isinstance(c.get("height"), (int, float))
+            ]
+            if font_sizes:
+                b["font_size_median"] = float(np.median(font_sizes))
+            if font_names:
+                b["font_name_mode"] = Counter(font_names).most_common(1)[0][0]
+                b["bold_ratio"] = sum(
+                    1 for name in font_names if re.search(r"bold|black|heavy", name, re.I)
+                ) / len(font_names)
+            if char_heights:
+                b["char_height_median"] = float(np.median(char_heights))
+            b["char_count"] = len(box_chars)
+            b["style_source"] = "pdf_chars"
+            del b["chars"]
 
         logging.info(f"__ocr sorting {len(chars)} chars cost {timer() - start}s")
         start = timer()
@@ -961,6 +997,10 @@ class RAGFlowPdfParser:
         for i in range(len(boxes_to_reg)):
             boxes_to_reg[i]["text"] = texts[i]
             del boxes_to_reg[i]["box_image"]
+            boxes_to_reg[i]["char_height_median"] = float(
+                boxes_to_reg[i]["bottom"] - boxes_to_reg[i]["top"]
+            )
+            boxes_to_reg[i]["style_source"] = "ocr_geometry"
         logging.info(f"__ocr recognize {len(bxs)} boxes cost {timer() - start}s")
         bxs = [b for b in bxs if b["text"]]
         if self.mean_height[pagenum - 1] == 0:
@@ -2021,7 +2061,9 @@ class RAGFlowPdfParser:
                 def dfs(arr, depth):
                     for a in arr:
                         if isinstance(a, dict):
-                            self.outlines.append((a["/Title"], depth))
+                            self.outlines.append(
+                                (a["/Title"], depth, _outline_page_number(pdf, a))
+                            )
                             continue
                         dfs(a, depth + 1)
 
@@ -2314,6 +2356,30 @@ class RAGFlowPdfParser:
             )
 
     def parse_into_bboxes(self, fnm, callback=None, zoomin=3):
+        """Parse into an ordered structured block stream with trace profiling."""
+        self._parse_file_path = fnm if isinstance(fnm, str) else "<bytes>"
+        self._stage_profile = []
+        self._last_parse_profile = None
+        parse_start = timer()
+        status = "ok"
+        boxes = []
+        try:
+            with self._stage("pdf.structured"):
+                boxes = self._parse_into_bboxes_impl(fnm, callback, zoomin)
+            return boxes
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self._emit_parse_profile(
+                total_ms=int((timer() - parse_start) * 1000),
+                n_tables=sum(
+                    1 for box in boxes if box.get("layout_type") == "table"
+                ),
+                status=status,
+            )
+
+    def _parse_into_bboxes_impl(self, fnm, callback=None, zoomin=3):
         start = timer()
         self.__images__(fnm, zoomin, callback=callback)
         if callback:
@@ -2693,7 +2759,13 @@ class PlainParser:
             def dfs(arr, depth):
                 for a in arr:
                     if isinstance(a, dict):
-                        self.outlines.append((a["/Title"], depth))
+                        self.outlines.append(
+                            (
+                                a["/Title"],
+                                depth,
+                                _outline_page_number(self.pdf, a),
+                            )
+                        )
                         continue
                     dfs(a, depth + 1)
 

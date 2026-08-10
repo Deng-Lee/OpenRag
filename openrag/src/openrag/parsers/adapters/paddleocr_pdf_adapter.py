@@ -4,12 +4,19 @@ import json
 import logging
 import math
 import os
+import re
 import time
+import unicodedata
 from contextlib import contextmanager
+from typing import Any
 
 import requests
 
 from openrag.parsers.base import DocumentBlock, DocumentParser
+from openrag.parsers.pdf_heading_hierarchy import (
+    PdfHeadingHierarchyResolver,
+    extract_pdf_outlines,
+)
 from openrag.ragflow_core.compat import to_document_blocks
 from openrag.tracing.context import get_trace_context
 
@@ -18,6 +25,17 @@ DONE_STATUS = "done"
 FAILED_STATUS = "failed"
 NOT_FOUND_STATUS = "not_found"
 PAGE_ASPECT_RATIO_REL_TOLERANCE = 0.01
+LAYOUT_MATCH_THRESHOLD = 0.5
+TITLE_LABELS = {"doc_title", "paragraph_title", "title"}
+NON_CONTENT_LABELS = {
+    "aside_text",
+    "footer",
+    "footer_image",
+    "footnote",
+    "header",
+    "header_image",
+    "number",
+}
 
 
 class PaddleOCRPDFParserAdapter(DocumentParser):
@@ -28,6 +46,10 @@ class PaddleOCRPDFParserAdapter(DocumentParser):
             "invalid_bbox_count": 0,
             "scaled_bbox_count": 0,
             "unmapped_bbox_count": 0,
+            "filtered_block_count": 0,
+            "filtered_labels": {},
+            "layout_matched_count": 0,
+            "markdown_heading_matched_count": 0,
         }
         self.last_parse_profile = None
         self._parse_file_path = None
@@ -46,6 +68,10 @@ class PaddleOCRPDFParserAdapter(DocumentParser):
             "invalid_bbox_count": 0,
             "scaled_bbox_count": 0,
             "unmapped_bbox_count": 0,
+            "filtered_block_count": 0,
+            "filtered_labels": {},
+            "layout_matched_count": 0,
+            "markdown_heading_matched_count": 0,
         }
         started_at = time.monotonic()
         page_count = None
@@ -69,6 +95,10 @@ class PaddleOCRPDFParserAdapter(DocumentParser):
                 pdf_page_sizes = _read_pdf_page_sizes(file_path)
                 raw_rows, stats = _result_to_rows(result, pdf_page_sizes)
                 blocks = to_document_blocks(raw_rows, source="paddleocr")
+                blocks = PdfHeadingHierarchyResolver().resolve(
+                    blocks,
+                    extract_pdf_outlines(file_path),
+                )
             block_count = len(blocks)
             n_tables = sum(1 for block in blocks if block.block_type == "table")
             self.last_parse_stats = stats
@@ -285,12 +315,15 @@ def _read_pdf_page_sizes(
 def _result_to_rows(
     result: dict,
     pdf_page_sizes: list[tuple[float, float] | None],
-) -> tuple[list[dict], dict[str, int]]:
+) -> tuple[list[dict], dict[str, Any]]:
     rows: list[dict] = []
     stream_cursor = 0
     invalid_bbox_count = 0
     scaled_bbox_count = 0
     unmapped_bbox_count = 0
+    filtered_labels: dict[str, int] = {}
+    layout_matched_count = 0
+    markdown_heading_matched_count = 0
 
     for page_index, page in enumerate(result.get("pages") or [], start=1):
         pdf_page_size = (
@@ -302,15 +335,21 @@ def _result_to_rows(
         ocr_height = page.get("height")
         preprocessor = page.get("doc_preprocessor_res") or {}
         angle = preprocessor.get("angle", 0)
-        for block_index, item in enumerate(page.get("parsing_res_list") or []):
+        parsing_items = page.get("parsing_res_list") or []
+        layout_evidence = _match_layout_evidence(page, parsing_items)
+        markdown_evidence = _match_markdown_headings(page, parsing_items)
+        for block_index, item in enumerate(parsing_items):
+            label = _item_label(item)
+            if label in NON_CONTENT_LABELS:
+                filtered_labels[label] = filtered_labels.get(label, 0) + 1
+                continue
+
             text = item.get("content", item.get("block_content", ""))
             text = str(text).strip()
             if not text:
                 continue
 
-            label = item.get("label", item.get("block_label", "text"))
-            label = str(label or "text")
-            block_type = "table" if label == "table" else "text"
+            block_type, layout_type = _paddle_block_types(label)
             raw_bbox = item.get("bbox", item.get("block_bbox"))
             bbox = _normalize_bbox(raw_bbox)
             if raw_bbox is not None and bbox is None:
@@ -327,6 +366,46 @@ def _result_to_rows(
                     unmapped_bbox_count += 1
                 else:
                     scaled_bbox_count += 1
+            metadata: dict[str, Any] = {
+                "ocr_label": label,
+                "paddleocr_order": block_index,
+                "parser_backend": "paddleocr",
+                "structured_pdf": True,
+            }
+            if label in TITLE_LABELS:
+                metadata["heading_candidate"] = True
+            if label == "doc_title":
+                metadata["heading_role"] = "document_title"
+                metadata["hard_boundary"] = False
+            evidence = layout_evidence.get(block_index)
+            if evidence:
+                metadata.update(evidence)
+                layout_matched_count += 1
+            markdown = markdown_evidence.get(block_index)
+            if markdown:
+                metadata.update(markdown)
+                markdown_heading_matched_count += 1
+            polygon_points = item.get("polygon_points")
+            if isinstance(polygon_points, list):
+                metadata["polygon_points"] = polygon_points
+            group_id = item.get("group_id")
+            if group_id is not None:
+                metadata["paddleocr_group_id"] = group_id
+            if bbox is not None and pdf_page_size is not None:
+                page_width, page_height = pdf_page_size
+                x0, y0, x1, y1 = bbox
+                metadata.update(
+                    {
+                        "style_source": "paddle_bbox",
+                        "geometry_height_ratio": (y1 - y0) / page_height,
+                        "geometry_left_ratio": x0 / page_width,
+                        "geometry_width_ratio": (x1 - x0) / page_width,
+                        "geometry_center_offset_ratio": abs(
+                            ((x0 + x1) / 2) - (page_width / 2)
+                        )
+                        / page_width,
+                    }
+                )
             rows.append(
                 {
                     "text": text,
@@ -335,20 +414,178 @@ def _result_to_rows(
                     "bbox": bbox,
                     "block_type": block_type,
                     "level": 0,
-                    "layout_type": block_type,
+                    "layout_type": layout_type,
                     "block_id": f"paddleocr:page:{page_index}:block:{len(rows)}",
                     "char_start": stream_cursor,
                     "char_end": stream_cursor + len(text),
-                    "metadata": {"ocr_label": label},
+                    "table_data": (
+                        {"html": text}
+                        if block_type == "table"
+                        and text.lstrip().lower().startswith("<table")
+                        else None
+                    ),
+                    "metadata": metadata,
                 }
             )
             stream_cursor += len(text) + 2
 
+    _normalize_markdown_levels(rows)
     return rows, {
         "invalid_bbox_count": invalid_bbox_count,
         "scaled_bbox_count": scaled_bbox_count,
         "unmapped_bbox_count": unmapped_bbox_count,
+        "filtered_block_count": sum(filtered_labels.values()),
+        "filtered_labels": dict(sorted(filtered_labels.items())),
+        "layout_matched_count": layout_matched_count,
+        "markdown_heading_matched_count": markdown_heading_matched_count,
     }
+
+
+def _item_label(item: dict) -> str:
+    value = item.get("label", item.get("block_label", "text"))
+    return str(value or "text").strip().lower()
+
+
+def _paddle_block_types(label: str) -> tuple[str, str]:
+    if label in TITLE_LABELS:
+        return "text", "title"
+    if label == "table":
+        return "table", "table"
+    if label in {"image", "figure", "chart"}:
+        return "image", label
+    return "text", label or "text"
+
+
+def _match_layout_evidence(page: dict, parsing_items: list[dict]) -> dict[int, dict]:
+    layout_result = page.get("layout_det_res") or {}
+    boxes = layout_result.get("boxes") or []
+    normalized_boxes: list[tuple[int, str, tuple[float, float, float, float], dict]] = []
+    for box_index, box in enumerate(boxes):
+        bbox = _normalize_bbox(box.get("coordinate", box.get("bbox")))
+        if bbox is None:
+            continue
+        normalized_boxes.append((box_index, _item_label(box), bbox, box))
+
+    matches: dict[int, dict] = {}
+    used: set[int] = set()
+    for item_index, item in enumerate(parsing_items):
+        item_bbox = _normalize_bbox(item.get("bbox", item.get("block_bbox")))
+        if item_bbox is None:
+            continue
+        label_group = _layout_label_group(_item_label(item))
+        candidates: list[tuple[float, int, dict]] = []
+        for box_index, box_label, box_bbox, box in normalized_boxes:
+            if box_index in used or _layout_label_group(box_label) != label_group:
+                continue
+            match_score = _bbox_overlap_score(item_bbox, box_bbox)
+            if match_score >= LAYOUT_MATCH_THRESHOLD:
+                candidates.append((match_score, box_index, box))
+        if not candidates:
+            continue
+
+        best_match, _best_index, best_box = max(
+            candidates,
+            key=lambda value: (value[0], _safe_float(value[2].get("score")) or 0.0),
+        )
+        used.update(box_index for _score, box_index, _box in candidates)
+        scores = [
+            value
+            for _match, _index, box in candidates
+            if (value := _safe_float(box.get("score"))) is not None
+        ]
+        evidence: dict[str, Any] = {
+            "layout_match_iou": round(best_match, 4),
+            "layout_match_count": len(candidates),
+        }
+        if scores:
+            evidence["layout_score"] = max(scores)
+        if best_box.get("order") is not None:
+            evidence["paddleocr_layout_order"] = best_box["order"]
+        matches[item_index] = evidence
+    return matches
+
+
+def _layout_label_group(label: str) -> str:
+    if label in {"paragraph_title", "title"}:
+        return "title"
+    return label
+
+
+def _bbox_overlap_score(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    x0 = max(left[0], right[0])
+    y0 = max(left[1], right[1])
+    x1 = min(left[2], right[2])
+    y1 = min(left[3], right[3])
+    if x0 >= x1 or y0 >= y1:
+        return 0.0
+    intersection = (x1 - x0) * (y1 - y0)
+    left_area = (left[2] - left[0]) * (left[3] - left[1])
+    right_area = (right[2] - right[0]) * (right[3] - right[1])
+    return intersection / min(left_area, right_area)
+
+
+def _match_markdown_headings(page: dict, parsing_items: list[dict]) -> dict[int, dict]:
+    markdown = page.get("markdown") or {}
+    text = str(markdown.get("markdown_texts") or "")
+    headings: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            headings.append((len(match.group(1)), match.group(2)))
+
+    matches: dict[int, dict] = {}
+    next_item = 0
+    for level, heading_text in headings:
+        normalized_heading = _normalize_match_text(heading_text)
+        for item_index in range(next_item, len(parsing_items)):
+            item = parsing_items[item_index]
+            if _item_label(item) not in TITLE_LABELS:
+                continue
+            content = item.get("content", item.get("block_content", ""))
+            if _normalize_match_text(str(content)) != normalized_heading:
+                continue
+            matches[item_index] = {
+                "paddle_markdown_level_raw": level,
+                "paddle_markdown_match_score": 1.0,
+            }
+            next_item = item_index + 1
+            break
+    return matches
+
+
+def _normalize_markdown_levels(rows: list[dict]) -> None:
+    section_levels = [
+        int(metadata["paddle_markdown_level_raw"])
+        for row in rows
+        if (metadata := row.get("metadata") or {}).get("paddle_markdown_level_raw")
+        and metadata.get("heading_role") != "document_title"
+    ]
+    offset = min(section_levels) - 1 if section_levels else 0
+    for row in rows:
+        metadata = row.get("metadata") or {}
+        raw_level = metadata.get("paddle_markdown_level_raw")
+        if raw_level is None:
+            continue
+        if metadata.get("heading_role") == "document_title":
+            metadata["paddle_markdown_level"] = 0
+        else:
+            metadata["paddle_markdown_level"] = max(1, int(raw_level) - offset)
+
+
+def _normalize_match_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "").lower()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalized)
+
+
+def _safe_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _scale_bbox_to_pdf(

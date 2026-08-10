@@ -124,7 +124,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Search query text")
     top_k: int = Field(10, gt=0, le=100, description="Number of results")
     workspace_id: Optional[int] = Field(None, description="Restrict to workspace")
-    use_rerank: bool = Field(True, description="Apply reranking")
+    use_rerank: bool = Field(False, description="Apply reranking")
     use_contextual_retrieval: bool = Field(
         False,
         description="OpenViking 式：L0 粗筛 → L1 → 候选内 L2，并按 0.2/0.3/0.5 融合打分",

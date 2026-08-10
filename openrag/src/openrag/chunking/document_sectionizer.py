@@ -69,7 +69,7 @@ def _new_node(
 
 
 def _is_parser_heading(item: DocumentItem) -> bool:
-    return item.level > 0 or item.block_type in {"heading", "title"}
+    return item.level > 0
 
 
 def _build_heading_stack_structure(
@@ -92,7 +92,14 @@ def _build_heading_stack_structure(
             level = max(1, item.level)
             while len(stack) > 1 and stack[-1][0] >= level:
                 stack.pop()
-            node = _new_node(nodes, "section", item.text, level, stack[-1][1])
+            node = _new_node(
+                nodes,
+                "section",
+                item.text,
+                level,
+                stack[-1][1],
+                metadata=item.metadata,
+            )
             node.metadata["heading_item_id"] = item.item_id
             if assign_sec_id:
                 node.metadata["sec_id"] = node.node_id

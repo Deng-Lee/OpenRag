@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 _DASHSCOPE_RERANK_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
 )
-_API_RERANK_PROVIDERS = {"api", "dashscope", "dashscope_vl", "http"}
+_LITELLM_RERANK_URL = "http://litellm.guozhijishu.com/rerank"
+_API_RERANK_PROVIDERS = {"api", "dashscope", "dashscope_vl", "http", "litellm"}
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded CrossEncoder model (sentence-transformers)
@@ -45,8 +46,8 @@ def _get_cross_encoder_model(model_name: str):
         return _model_instance
     except ImportError:
         logger.warning(
-            "sentence_transformers not installed; reranker will fall back to "
-            "keyword-overlap scoring. Install with: pip install sentence-transformers"
+            "sentence_transformers not installed; reranking will preserve the "
+            "retrieval order. Install with: pip install sentence-transformers"
         )
         return None
     except Exception as exc:
@@ -193,12 +194,93 @@ class DashScopeRerankAdapter:
         return []
 
 
+class LiteLLMRerankAdapter(DashScopeRerankAdapter):
+    """LiteLLM /rerank adapter using the flat rerank request contract."""
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        max_documents: Optional[int] = None,
+    ):
+        effective_max_documents = (
+            max_documents
+            if max_documents is not None
+            else _env_int("RERANKER_MAX_DOCUMENTS", 100)
+        )
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url
+            or os.environ.get("RERANKER_BASE_URL")
+            or _LITELLM_RERANK_URL,
+            model=model
+            or os.environ.get("RERANKER_MODEL")
+            or "Qwen3-VL-Reranker-8B",
+            timeout=timeout,
+            max_documents=effective_max_documents,
+            payload_format="litellm",
+        )
+
+    def score(self, query: str, results: list[dict]) -> list[float]:
+        if not results:
+            return []
+        if not self.api_key:
+            raise RuntimeError("RERANKER_API_KEY/OPENAI_API_KEY is not set")
+
+        scores: list[float] = []
+        batch_size = max(1, self.max_documents)
+        for start in range(0, len(results), batch_size):
+            docs = results[start : start + batch_size]
+            response = requests.post(
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=self._build_payload(query, docs),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            ranked = self._extract_ranked_results(response.json())
+            if len(ranked) != len(docs):
+                raise RuntimeError("incomplete rerank response")
+
+            batch_scores: list[Optional[float]] = [None] * len(docs)
+            for item in ranked:
+                try:
+                    idx = int(item.get("index"))
+                    score = float(item.get("relevance_score", item.get("score")))
+                except (TypeError, ValueError):
+                    raise RuntimeError("invalid rerank response") from None
+                if idx < 0 or idx >= len(docs) or batch_scores[idx] is not None:
+                    raise RuntimeError("invalid rerank response")
+                batch_scores[idx] = score
+
+            if any(score is None for score in batch_scores):
+                raise RuntimeError("incomplete rerank response")
+            scores.extend(float(score) for score in batch_scores)
+        return scores
+
+    def _build_payload(self, query: str, docs: list[dict]) -> dict:
+        texts = [str(d.get("text", "") or "") for d in docs]
+        return {
+            "model": self.model,
+            "query": query,
+            "documents": texts,
+            "top_n": len(texts),
+            "return_documents": self.return_documents,
+        }
+
+
 class Reranker:
     """
     Reranker that uses cross-encoder models and hierarchical information to improve ranking.
 
     This reranker:
-    - Uses real cross-encoder scoring via sentence-transformers (with keyword-overlap fallback)
+    - Uses real cross-encoder scoring via sentence-transformers
     - Applies hierarchical boosts (titles, headings get higher scores)
     - Applies position boosts (early pages, larger elements get higher scores)
     - Supports context expansion using parent chunks
@@ -222,13 +304,15 @@ class Reranker:
         self.hierarchical_boost = hierarchical_boost
         self.position_boost = position_boost
         self._model = None
+        self._last_unavailable_reason: Optional[str] = None
         self.provider = os.environ.get("RERANKER_PROVIDER", "local").strip().lower()
-        api_model = os.environ.get("RERANKER_MODEL") or "qwen3-vl-rerank"
-        self._api_adapter = (
-            DashScopeRerankAdapter(model=api_model)
-            if self.provider in _API_RERANK_PROVIDERS
-            else None
-        )
+        if self.provider == "litellm":
+            self._api_adapter = LiteLLMRerankAdapter()
+        elif self.provider in _API_RERANK_PROVIDERS:
+            api_model = os.environ.get("RERANKER_MODEL") or "qwen3-vl-rerank"
+            self._api_adapter = DashScopeRerankAdapter(model=api_model)
+        else:
+            self._api_adapter = None
 
     @property
     def model(self):
@@ -265,7 +349,11 @@ class Reranker:
         trace_service.start_span(
             "retrieval.rerank",
             input_summary={
-                "model": self.model_name,
+                "model": (
+                    self._api_adapter.model
+                    if self._api_adapter is not None
+                    else self.model_name
+                ),
                 "provider": self.provider,
                 "candidate_count": len(results),
                 "top_k": top_k,
@@ -280,13 +368,52 @@ class Reranker:
             trace_service.fail_span(error_message=str(exc))
             raise
 
+        if cross_scores is None:
+            final_results = [result.copy() for result in results[:top_k]]
+            _record_rerank_snapshots(
+                trace_service,
+                final_results,
+                phase="output",
+                original_rank_by_chunk_id=_original_rank_by_chunk_id(results),
+            )
+            trace_service.finish_span(
+                output_summary={
+                    "result_count": len(final_results),
+                    "applied": False,
+                    "degraded": True,
+                    "fallback": "identity",
+                    "reason": self._last_unavailable_reason,
+                }
+            )
+            return final_results
+
+        retrieval_scores = [
+            float(
+                result.get("fused_score")
+                if result.get("fused_score") is not None
+                else result.get("score", 0.0)
+            )
+            for result in results
+        ]
+        retrieval_min = min(retrieval_scores)
+        retrieval_max = max(retrieval_scores)
+        if retrieval_max - retrieval_min < 1e-9:
+            normalized_retrieval_scores = [0.5] * len(retrieval_scores)
+        else:
+            normalized_retrieval_scores = [
+                (score - retrieval_min) / (retrieval_max - retrieval_min)
+                for score in retrieval_scores
+            ]
+
         reranked_results = []
         for i, result in enumerate(results):
             cross_encoder_score = cross_scores[i]
 
-            # Combine with original score (weighted average)
-            original_score = result.get("score", 0.0)
-            base_score = cross_encoder_score * 0.6 + original_score * 0.4
+            # Combine model relevance with the normalized retrieval score.
+            base_score = (
+                cross_encoder_score * 0.6
+                + normalized_retrieval_scores[i] * 0.4
+            )
 
             # Apply hierarchical boost
             level = result.get("level")
@@ -302,6 +429,14 @@ class Reranker:
 
             # Create new result with reranked score
             reranked_result = result.copy()
+            reranked_result["retrieval_score"] = retrieval_scores[i]
+            reranked_result["retrieval_normalized_score"] = (
+                normalized_retrieval_scores[i]
+            )
+            reranked_result["rerank_model_score"] = cross_encoder_score
+            reranked_result["rerank_base_score"] = base_score
+            reranked_result["hierarchy_boost"] = score_with_hierarchy - base_score
+            reranked_result["position_boost"] = final_score - score_with_hierarchy
             reranked_result["reranked_score"] = final_score
             reranked_results.append(reranked_result)
 
@@ -316,17 +451,25 @@ class Reranker:
             phase="output",
             original_rank_by_chunk_id=_original_rank_by_chunk_id(results),
         )
-        trace_service.finish_span(output_summary={"result_count": len(final_results)})
+        trace_service.finish_span(
+            output_summary={
+                "result_count": len(final_results),
+                "applied": True,
+                "degraded": False,
+            }
+        )
         return final_results
 
     # ------------------------------------------------------------------
-    # Cross-encoder scoring: real model with keyword fallback
+    # Cross-encoder scoring
     # ------------------------------------------------------------------
 
     def _batch_cross_encoder_scores(
         self, query: str, results: list[dict]
-    ) -> list[float]:
-        """Score all query-text pairs in one batch call; fallback to keyword overlap."""
+    ) -> Optional[list[float]]:
+        """Score all query-text pairs, or return None when reranking is unavailable."""
+        self._last_unavailable_reason = None
+        api_failed = False
         if self._api_adapter is not None:
             try:
                 scores = self._api_adapter.score(query, results)
@@ -338,6 +481,14 @@ class Reranker:
                 )
                 return scores
             except Exception as exc:
+                if self.provider == "litellm":
+                    logger.warning(
+                        "LiteLLM reranker failed; preserving retrieval order: %s",
+                        exc,
+                    )
+                    self._last_unavailable_reason = "litellm_request_failed"
+                    return None
+                api_failed = True
                 logger.warning("API reranker failed, falling back to local reranker: %s", exc)
 
         self._ensure_model()
@@ -363,16 +514,25 @@ class Reranker:
                 return norm
             except Exception as exc:
                 logger.warning(
-                    "CrossEncoder predict failed, falling back to keyword overlap: %s",
+                    "CrossEncoder predict failed; reranking is disabled for this request: %s",
                     exc,
                 )
+                self._last_unavailable_reason = "local_model_prediction_failed"
+                return None
 
-        # Fallback: keyword overlap (original mock logic)
-        return [self._keyword_overlap_score(query, r.get("text", "")) for r in results]
+        self._last_unavailable_reason = (
+            "api_and_local_reranker_unavailable"
+            if api_failed
+            else "local_model_unavailable"
+        )
+        return None
 
     def _compute_cross_encoder_score(self, query: str, text: str) -> float:
         """Compatibility helper for single-pair tests and callers."""
-        return self._batch_cross_encoder_scores(query, [{"text": text}])[0]
+        scores = self._batch_cross_encoder_scores(query, [{"text": text}])
+        if scores is None:
+            return self._keyword_overlap_score(query, text)
+        return scores[0]
 
     @staticmethod
     def _keyword_overlap_score(query: str, text: str) -> float:
@@ -505,16 +665,37 @@ def _record_rerank_snapshots(
             else rank
         )
         rerank_score = result.get("reranked_score")
+        effective_score = (
+            rerank_score
+            if rerank_score is not None
+            else result.get("fused_score", result.get("score"))
+        )
+        score_parts = {
+            "fused_score": _safe_float(result.get("fused_score", result.get("score"))),
+            "rerank_score": _safe_float(rerank_score),
+        }
+        if "rerank_model_score" in result:
+            score_parts.update(
+                {
+                    "retrieval_score": _safe_float(result.get("retrieval_score")),
+                    "retrieval_normalized_score": _safe_float(
+                        result.get("retrieval_normalized_score")
+                    ),
+                    "rerank_model_score": _safe_float(
+                        result.get("rerank_model_score")
+                    ),
+                    "base_score": _safe_float(result.get("rerank_base_score")),
+                    "hierarchy_boost": _safe_float(result.get("hierarchy_boost")),
+                    "position_boost": _safe_float(result.get("position_boost")),
+                }
+            )
         trace_service.record_snapshot(
             stage="retrieval.rerank",
             rank=rank,
             chunk_id=chunk_key,
             file_id=_safe_int(result.get("file_id")),
-            score=_safe_float(rerank_score),
-            score_parts={
-                "fused_score": _safe_float(result.get("fused_score", result.get("score"))),
-                "rerank_score": _safe_float(rerank_score),
-            },
+            score=_safe_float(effective_score),
+            score_parts=score_parts,
             metadata={
                 "phase": phase,
                 "original_rank": original_rank,

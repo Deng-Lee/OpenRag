@@ -6,6 +6,17 @@ from unittest.mock import Mock, patch
 from openrag.retrieval.reranker import Reranker
 
 
+@pytest.fixture(autouse=True)
+def available_cross_encoder(monkeypatch):
+    """Keep normal rerank tests independent from optional model installation."""
+    model = Mock()
+    model.predict.side_effect = lambda pairs: [0.0] * len(pairs)
+    monkeypatch.setattr(
+        "openrag.retrieval.reranker._get_cross_encoder_model",
+        lambda _model_name: model,
+    )
+
+
 class TestReranker:
     """Test Reranker class"""
 
@@ -53,6 +64,81 @@ class TestReranker:
         assert reranked[0]["reranked_score"] >= reranked[1]["reranked_score"]
         assert reranked[1]["reranked_score"] >= reranked[2]["reranked_score"]
 
+    def test_rerank_uses_normalized_fused_score_instead_of_dense_score(self):
+        """RRF score, not the original dense score, feeds the retrieval component."""
+        reranker = Reranker(hierarchical_boost=0.0, position_boost=0.0)
+        reranker._model = Mock()
+        reranker._model.predict.return_value = [0.0, 0.0]
+        results = [
+            {"chunk_id": "dense-first", "text": "a", "score": 0.9, "fused_score": 0.01},
+            {"chunk_id": "rrf-first", "text": "b", "score": 0.1, "fused_score": 0.02},
+        ]
+
+        reranked = reranker.rerank("query", results, top_k=2)
+
+        assert [item["chunk_id"] for item in reranked] == ["rrf-first", "dense-first"]
+        assert reranked[0]["reranked_score"] == pytest.approx(0.7)
+        assert reranked[1]["reranked_score"] == pytest.approx(0.3)
+
+    def test_rerank_is_identity_when_model_is_unavailable(self):
+        """Unavailable reranking must preserve the RRF order and scores."""
+        reranker = Reranker(hierarchical_boost=0.0, position_boost=0.0)
+        trace_service = Mock()
+        results = [
+            {"chunk_id": "rrf-first", "text": "unrelated", "score": 0.1, "fused_score": 0.02},
+            {"chunk_id": "keyword-match", "text": "银行卡绑卡", "score": 0.9, "fused_score": 0.01},
+        ]
+
+        with patch("openrag.retrieval.reranker._get_cross_encoder_model", return_value=None):
+            reranked = reranker.rerank(
+                "银行卡绑卡", results, top_k=2, trace_service=trace_service
+            )
+
+        assert reranked == results
+        assert all("reranked_score" not in item for item in reranked)
+        output_snapshots = [
+            call.kwargs
+            for call in trace_service.record_snapshot.call_args_list
+            if call.kwargs["metadata"]["phase"] == "output"
+        ]
+        assert [item["score"] for item in output_snapshots] == [0.02, 0.01]
+        assert trace_service.finish_span.call_args.kwargs["output_summary"] == {
+            "result_count": 2,
+            "applied": False,
+            "degraded": True,
+            "fallback": "identity",
+            "reason": "local_model_unavailable",
+        }
+
+    def test_rerank_trace_records_score_components(self):
+        reranker = Reranker(hierarchical_boost=0.0, position_boost=0.0)
+        reranker._model = Mock()
+        reranker._model.predict.return_value = [0.0, 0.0]
+        trace_service = Mock()
+        results = [
+            {"chunk_id": "a", "text": "a", "score": 0.9, "fused_score": 0.01},
+            {"chunk_id": "b", "text": "b", "score": 0.1, "fused_score": 0.02},
+        ]
+
+        reranker.rerank("query", results, top_k=2, trace_service=trace_service)
+
+        output_snapshots = [
+            call.kwargs
+            for call in trace_service.record_snapshot.call_args_list
+            if call.kwargs["metadata"]["phase"] == "output"
+        ]
+        assert output_snapshots[0]["chunk_id"] == "b"
+        assert output_snapshots[0]["score_parts"] == {
+            "fused_score": 0.02,
+            "retrieval_score": 0.02,
+            "retrieval_normalized_score": 1.0,
+            "rerank_model_score": 0.5,
+            "base_score": 0.7,
+            "hierarchy_boost": 0.0,
+            "position_boost": 0.0,
+            "rerank_score": 0.7,
+        }
+
     def test_rerank_with_top_k_limit(self):
         """Test reranking with top_k limit"""
         reranker = Reranker()
@@ -95,8 +181,8 @@ class TestReranker:
 
         results = [
             {"text": "Content query on page 5", "score": 0.7, "file_id": 1, "page": 5, "bbox": [0, 0, 100, 50]},
-            {"text": "Content query on page 1", "score": 0.65, "file_id": 2, "page": 1, "bbox": [0, 0, 200, 100]},
-            {"text": "Content query on page 10", "score": 0.68, "file_id": 3, "page": 10, "bbox": [0, 0, 50, 25]}
+            {"text": "Content query on page 1", "score": 0.7, "file_id": 2, "page": 1, "bbox": [0, 0, 200, 100]},
+            {"text": "Content query on page 10", "score": 0.7, "file_id": 3, "page": 10, "bbox": [0, 0, 50, 25]}
         ]
 
         reranked = reranker.rerank("test query", results, top_k=3)

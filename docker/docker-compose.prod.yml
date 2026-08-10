@@ -51,13 +51,13 @@ services:
       - L1_NAV_API_KEY=${L1_NAV_API_KEY:-}
       - L1_NAV_BASE_URL=${L1_NAV_BASE_URL:-}
       - L1_NAV_MODEL=${L1_NAV_MODEL:-youfu/Qwen3.6-35B-A3B}
-      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-local}
-      - RERANKER_MODEL=${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
-      - RERANKER_BASE_URL=${RERANKER_BASE_URL:-https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank}
+      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-litellm}
+      - RERANKER_MODEL=${RERANKER_MODEL:-Qwen3-VL-Reranker-8B}
+      - RERANKER_BASE_URL=${RERANKER_BASE_URL:-http://litellm.guozhijishu.com/rerank}
       - RERANKER_API_KEY=${RERANKER_API_KEY:-}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
       - RERANKER_PAYLOAD_FORMAT=${RERANKER_PAYLOAD_FORMAT:-}
-      - RERANKER_MAX_DOCUMENTS=${RERANKER_MAX_DOCUMENTS:-}
+      - RERANKER_MAX_DOCUMENTS=${RERANKER_MAX_DOCUMENTS:-100}
       - RERANKER_TIMEOUT=${RERANKER_TIMEOUT:-30}
     volumes:
       - api-uploads:/app/uploads

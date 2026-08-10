@@ -303,8 +303,16 @@ def test_semantic_search_records_retrieval_trace_spans_and_top50_snapshots(
     assert rerank_outputs[0].metadata_["rank_delta"] == 0
     assert set(rerank_outputs[0].score_parts) == {
         "fused_score",
+        "retrieval_score",
+        "retrieval_normalized_score",
+        "rerank_model_score",
+        "base_score",
+        "hierarchy_boost",
+        "position_boost",
         "rerank_score",
     }
+    assert spans["retrieval.rerank"].output_summary["applied"] is True
+    assert spans["retrieval.rerank"].output_summary["degraded"] is False
 
 
 def test_elasticsearch_failure_records_skip_reason_without_breaking_search(

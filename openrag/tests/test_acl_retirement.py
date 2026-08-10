@@ -381,6 +381,9 @@ def test_same_workspace_readers_share_hierarchy_scope(db):
     file_a = create_file(db, owner, workspace, uri="/shared/a.txt")
     file_b = create_file(db, owner, workspace, uri="/shared/b.txt")
     other_file = create_file(db, owner, other_workspace, uri="/private/unique.txt")
+    create_chunk(db, file_a, f"contract-chunk-{file_a.id}")
+    create_chunk(db, file_b, f"contract-chunk-{file_b.id}")
+    create_chunk(db, other_file, f"contract-chunk-{other_file.id}")
     file_a.l0_path = "l0/shared-a.md"
     file_a.l1_path = "l1/shared-a.md"
     file_a.l2_path = "l2/shared-a"
