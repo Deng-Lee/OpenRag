@@ -23,8 +23,8 @@ def resolve_chunk_method(file_path: str, parser_type: str) -> str:
 
 def chunk_size_overlap_from_env() -> tuple[int, int]:
     """Read ``OPENRAG_CHUNK_SIZE`` / ``OPENRAG_CHUNK_OVERLAP`` with defaults."""
-    size = int(os.environ.get("OPENRAG_CHUNK_SIZE", "600"))
-    overlap = int(os.environ.get("OPENRAG_CHUNK_OVERLAP", "80"))
+    size = int(os.environ.get("OPENRAG_CHUNK_SIZE", "300"))
+    overlap = int(os.environ.get("OPENRAG_CHUNK_OVERLAP", "40"))
     return size, overlap
 
 

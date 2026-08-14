@@ -26,8 +26,8 @@ def test_chunk_size_overlap_from_env_defaults():
     for k in ("OPENRAG_CHUNK_SIZE", "OPENRAG_CHUNK_OVERLAP"):
         os.environ.pop(k, None)
     size, overlap = chunk_size_overlap_from_env()
-    assert size == 600
-    assert overlap == 80
+    assert size == 300
+    assert overlap == 40
 
 
 def test_parity_fixtures_readme_exists():
