@@ -22,7 +22,6 @@ cp 01-secret.example.yaml 01-secret.yaml
 # 3. 一次性应用（按顺序前缀已编号）
 kubectl apply -f 00-namespace.yaml
 kubectl apply -f 01-secret.yaml
-kubectl apply -f 02-configmap-nginx.yaml
 kubectl apply -f 03-postgres.yaml
 kubectl apply -f 05-milvus-etcd.yaml
 kubectl apply -f 06-milvus-minio.yaml
@@ -93,6 +92,19 @@ kubectl -n openrag rollout restart deployment/openrag-web
 
 无需重打 `openrag/web` 镜像。
 
+## 单文件上传上限
+
+- `09-api.yaml` 中的 `MAX_UPLOAD_SIZE` 是文件内容的权威上限，当前为 `104857600` 字节（100 MiB）。如需改为 50 MiB，设置为 `52428800`。
+- `12-ingress.yaml` 的 `proxy-body-size: "110m"` 是包含 multipart 开销的请求体上限，需始终略大于 API 文件上限；50 MiB 和 100 MiB 两档均可保持 `110m`。
+- Web 前端和批量导入脚本会从 `GET /config/client` 读取当前 API 上限，调整 50/100 MiB 时无需再修改前端常量。
+
+修改后重新应用 API 清单并滚动更新：
+
+```bash
+kubectl apply -f 09-api.yaml
+kubectl -n openrag rollout status deployment/openrag-api --timeout=600s
+```
+
 ## 卸载（会删 PVC 数据，慎用）
 
 ```bash
@@ -107,7 +119,6 @@ kubectl delete -f 07-milvus.yaml
 kubectl delete -f 06-milvus-minio.yaml
 kubectl delete -f 05-milvus-etcd.yaml
 kubectl delete -f 03-postgres.yaml
-kubectl delete -f 02-configmap-nginx.yaml
 kubectl delete -f 01-secret.yaml --ignore-not-found
 kubectl delete -f 00-namespace.yaml
 ```

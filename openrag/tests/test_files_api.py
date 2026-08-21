@@ -18,7 +18,6 @@ from openrag.models.file import File, ProcessingStatus
 from openrag.models.task import Task
 from openrag.models.workspace import Workspace, WorkspaceMember
 from openrag.security import hash_password
-from openrag.services.file_ingest import MAX_FILE_SIZE
 from openrag.services.file_deletion import FileStorageCleanupError
 
 
@@ -247,11 +246,12 @@ class TestFileUpload:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "invalid path" in response.json()["detail"].lower()
 
-    def test_upload_file_large_file(self, client, db, test_user, test_workspace):
+    def test_upload_file_large_file(self, client, db, test_user, test_workspace, monkeypatch):
         """Test file upload with large file (exceeds limit)"""
         app.dependency_overrides[get_current_user] = override_get_current_user_factory(test_user)
+        monkeypatch.setattr("openrag.services.upload_policy.get_max_upload_size", lambda: 8)
 
-        file_content = b"x" * (MAX_FILE_SIZE + 1)
+        file_content = b"x" * 9
         files = {"file": ("large.txt", io.BytesIO(file_content), "text/plain")}
         data = {"workspace_id": str(test_workspace.id)}
 
@@ -260,6 +260,14 @@ class TestFileUpload:
         assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
         assert db.query(File).count() == 0
         assert db.query(Task).count() == 0
+
+    def test_client_config_returns_upload_limit(self, client, monkeypatch):
+        monkeypatch.setattr("openrag.api.main.get_max_upload_size", lambda: 1234)
+
+        response = client.get("/config/client")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"max_upload_size_bytes": 1234}
 
     def test_upload_pdf_parser_rejects_spoofed_pdf_content_type(
         self, client, db, test_user, test_workspace, monkeypatch

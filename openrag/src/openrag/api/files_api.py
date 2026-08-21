@@ -29,7 +29,6 @@ from openrag.services.file_deletion import (
 )
 from openrag.services.file_preview import build_file_preview
 from openrag.services.file_ingest import (
-    MAX_FILE_SIZE,
     SUPPORTED_PARSER_TYPES,
     build_file_uri,
     ingest_new_file,
@@ -37,6 +36,7 @@ from openrag.services.file_ingest import (
     resolve_effective_mime_type,
     validate_path,
 )
+from openrag.services.upload_policy import read_upload_content
 from openrag.parsers.selection import resolve_pdf_default_parser_type
 from openrag.services.task_service import TaskService
 from openrag.storage.minio_storage import MinioStorage, chunk_object_key
@@ -389,7 +389,7 @@ async def upload_file(
             detail="Write permission required for this workspace",
         )
 
-    file_content = await file.read()
+    file_content = await read_upload_content(file)
     workspace = ws_service.get_workspace(workspace_id)
     if not workspace:
         raise HTTPException(

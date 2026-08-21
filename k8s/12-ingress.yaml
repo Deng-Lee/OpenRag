@@ -5,7 +5,8 @@ metadata:
   name: openrag
   namespace: openrag
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    # Includes multipart overhead; the API enforces a 100 MiB file payload limit.
+    nginx.ingress.kubernetes.io/proxy-body-size: "110m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
 spec:
   ingressClassName: nginx

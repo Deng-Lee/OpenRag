@@ -22,10 +22,10 @@ from openrag.services.document_retry_status import document_conflict_detail
 from openrag.services.file_deletion import delete_vectors_for_file_across_generations
 from openrag.services.task_service import TaskService
 from openrag.services.trace_service import TraceService
+from openrag.services.upload_policy import validate_upload_size
 from openrag.storage.minio_storage import MinioStorage
 from openrag.tracing.context import get_trace_context, reset_trace_context, set_trace_context
 
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 # Leaf filename byte budget. The worker downloads each file to a local temp path
 # named ``doc_{file_id}_{basename}`` (worker/task_worker.py), where a single path
 # component is capped at 255 bytes by the OS (ENAMETOOLONG). 200 leaves headroom
@@ -524,7 +524,9 @@ def ingest_new_file(
             )
 
         file_size = len(file_content)
-        if file_size > MAX_FILE_SIZE:
+        try:
+            validate_upload_size(file_size)
+        except HTTPException:
             _safe_span(
                 trace_service,
                 "upload.validate",
@@ -537,10 +539,7 @@ def ingest_new_file(
                 },
                 error_message="file_too_large",
             )
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
-            )
+            raise
 
         if normalized_tag is not None:
             tag_clash = (
@@ -768,11 +767,7 @@ def replace_file_content(
     parser_type = resolve_pdf_default_parser_type(file.name, parser_type)
 
     file_size = len(new_content)
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
-        )
+    validate_upload_size(file_size)
 
     parser_hint = (parser_type or "").strip().lower()
     effective_mime = resolve_effective_mime_type(
@@ -864,11 +859,7 @@ def _move_replace_no_intermediate_commit(
         )
     parser_type = resolve_pdf_default_parser_type(target_uri, parser_type)
     file_size = len(new_content)
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
-        )
+    validate_upload_size(file_size)
     target_name = posixpath.basename(target_uri)
     parser_hint = (parser_type or "").strip().lower()
     effective_mime = resolve_effective_mime_type(
@@ -993,11 +984,7 @@ def upsert_file_by_tag(
             detail=f"Invalid parser_type. Supported types: {', '.join(SUPPORTED_PARSER_TYPES)}",
         )
     parser_type = resolve_pdf_default_parser_type(basename, parser_type)
-    if len(file_content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / 1024 / 1024}MB",
-        )
+    validate_upload_size(len(file_content))
     parser_hint = (parser_type or "").strip().lower()
     effective_mime = resolve_effective_mime_type(content_type, basename, parser_type)
     if parser_hint == "pdf":

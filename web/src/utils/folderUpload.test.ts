@@ -8,7 +8,7 @@ import {
   isFilenameTooLongError,
   walkEntry,
   filenameBytes,
-  MAX_FILE_SIZE,
+  DEFAULT_MAX_FILE_SIZE,
   MAX_FILENAME_BYTES,
   type PickedFile,
 } from './folderUpload';
@@ -108,7 +108,16 @@ describe('precheck', () => {
   });
 
   it('skips files over the size limit', () => {
-    const { skipped } = precheck([{ file: fakeFile(MAX_FILE_SIZE + 1), relativePath: 'f/big.pdf' }]);
+    const { skipped } = precheck([{ file: fakeFile(DEFAULT_MAX_FILE_SIZE + 1), relativePath: 'f/big.pdf' }]);
+    expect(skipped).toEqual([{ rel: 'f/big.pdf', reason: 'too_large' }]);
+  });
+
+  it('uses the runtime size limit', () => {
+    const { accepted, skipped } = precheck(
+      [{ file: fakeFile(51), relativePath: 'f/big.pdf' }],
+      50,
+    );
+    expect(accepted).toHaveLength(0);
     expect(skipped).toEqual([{ rel: 'f/big.pdf', reason: 'too_large' }]);
   });
 
@@ -139,7 +148,7 @@ describe('precheck', () => {
       { file: fakeFile(10), relativePath: 'f/a.pdf' },
       { file: fakeFile(10), relativePath: 'f/__MACOSX/b.pdf' },
       { file: fakeFile(10), relativePath: 'f/c.png' },
-      { file: fakeFile(MAX_FILE_SIZE + 1), relativePath: 'f/d.pdf' },
+      { file: fakeFile(DEFAULT_MAX_FILE_SIZE + 1), relativePath: 'f/d.pdf' },
       { file: fakeFile(10), relativePath: `f/${'e'.repeat(201)}.pdf` },
     ];
     const { accepted, skipped } = precheck(items);

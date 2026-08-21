@@ -34,6 +34,7 @@ from openrag.services.file_ingest import (
     upsert_file_by_tag,
     validate_path,
 )
+from openrag.services.upload_policy import read_upload_content
 from openrag.services.preview_token_service import create_preview_token, decode_preview_token
 from openrag.services.document_retry_status import (
     document_processing_fields,
@@ -347,7 +348,7 @@ async def service_upload_document(
 ) -> dict[str, Any]:
     ws = require_workspace_for_name(db, workspace_name)
     assert_token_workspace_permission(ctx, ws.id, "write")
-    body = await file.read()
+    body = await read_upload_content(file)
     # Parent directories (when create_dirs) are materialised inside ingest_new_file
     # via require_parent_dir=False, AFTER the tag dup-check — so a tag conflict aborts
     # with 409 before any empty directory rows are created.
@@ -391,7 +392,7 @@ async def service_replace_document(
     )
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-    body = await file.read()
+    body = await read_upload_content(file)
     task = replace_file_content(
         db,
         ws,
@@ -426,7 +427,7 @@ async def service_upsert_document_by_tag(
     """
     ws = require_workspace_for_name(db, workspace_name)
     assert_token_workspace_permission(ctx, ws.id, "write")
-    body = await file.read()
+    body = await read_upload_content(file)
     file_record, task_record, action = upsert_file_by_tag(
         db,
         ws,

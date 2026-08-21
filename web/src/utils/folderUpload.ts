@@ -16,8 +16,7 @@ export interface SkippedItem {
   ext?: string;
 }
 
-// 与后端 file_ingest.py:23 一致
-export const MAX_FILE_SIZE = 100 * 1024 * 1024;
+export const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024;
 
 // 叶子文件名字节上限，与后端 file_ingest.py 的 MAX_FILENAME_BYTES 一致。
 // 后端 worker 落盘临时文件名受操作系统单分量 255 字节限制，按字节判断（中文每字 3 字节）。
@@ -66,7 +65,10 @@ export function isJunkPath(relativePath: string): boolean {
 }
 
 /** 客户端预检：分出可上传项与跳过项（按路径段过滤垃圾、扩展名白名单、大小上限）。 */
-export function precheck(items: PickedFile[]): { accepted: PickedFile[]; skipped: SkippedItem[] } {
+export function precheck(
+  items: PickedFile[],
+  maxFileSize: number = DEFAULT_MAX_FILE_SIZE,
+): { accepted: PickedFile[]; skipped: SkippedItem[] } {
   const accepted: PickedFile[] = [];
   const skipped: SkippedItem[] = [];
   for (const it of items) {
@@ -81,7 +83,7 @@ export function precheck(items: PickedFile[]): { accepted: PickedFile[]; skipped
       skipped.push({ rel, reason: 'unsupported', ext });
       continue;
     }
-    if (it.file.size > MAX_FILE_SIZE) {
+    if (it.file.size > maxFileSize) {
       skipped.push({ rel, reason: 'too_large' });
       continue;
     }

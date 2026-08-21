@@ -77,6 +77,10 @@ export const authAPI = {
 };
 
 export const filesAPI = {
+  getClientConfig: async (): Promise<{ max_upload_size_bytes: number }> => {
+    const response = await api.get('/config/client');
+    return response.data;
+  },
   list: async (
     workspaceId?: number,
     opts?: {

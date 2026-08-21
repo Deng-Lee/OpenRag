@@ -13,6 +13,7 @@ import {
   remoteParentDir,
   isDuplicateError,
   walkEntry,
+  DEFAULT_MAX_FILE_SIZE,
   type PickedFile,
   type SkipReason,
 } from '../utils/folderUpload';
@@ -122,6 +123,24 @@ export default function FileUpload({
   const [uploading, setUploading] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [fetchedFiles, setFetchedFiles] = useState<File[]>([]);
+  const [maxFileSize, setMaxFileSize] = useState(DEFAULT_MAX_FILE_SIZE);
+
+  useEffect(() => {
+    let cancelled = false;
+    filesAPI
+      .getClientConfig()
+      .then((value) => {
+        if (!cancelled && value.max_upload_size_bytes > 0) {
+          setMaxFileSize(value.max_upload_size_bytes);
+        }
+      })
+      .catch(() => {
+        // Older API versions do not expose client config; keep the 100 MiB default.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     setUploadPath(selectedPath);
@@ -170,7 +189,9 @@ export default function FileUpload({
 
   const skipReasonText = (reason: SkipReason, ext?: string): string => {
     if (reason === 'unsupported') return t('files.upload.skip_unsupported', { ext: ext ? `.${ext}` : '' });
-    if (reason === 'too_large') return t('files.upload.skip_too_large');
+    if (reason === 'too_large') {
+      return t('files.upload.skip_too_large', { size: maxFileSize / 1024 / 1024 });
+    }
     if (reason === 'name_too_long') return t('files.upload.skip_name_too_long');
     return t('files.upload.skip_junk');
   };
@@ -211,7 +232,7 @@ export default function FileUpload({
         message.info(t('files.upload.empty_folder'));
         return;
       }
-      const { accepted, skipped } = precheck(items);
+      const { accepted, skipped } = precheck(items, maxFileSize);
       const results: ItemResult[] = skipped.map((s) => ({
         rel: s.rel,
         status: 'skipped' as const,
@@ -330,7 +351,11 @@ export default function FileUpload({
     customRequest: async ({ file, onSuccess, onError }) => {
       setUploading(true);
       try {
-        await filesAPI.upload(file as globalThis.File, parserType, workspaceId, uploadPath, documentType, tag);
+        const uploadFile = file as globalThis.File;
+        if (uploadFile.size > maxFileSize) {
+          throw Object.assign(new Error('file_too_large'), { response: { status: 413 } });
+        }
+        await filesAPI.upload(uploadFile, parserType, workspaceId, uploadPath, documentType, tag);
         message.success('文件上传成功');
         onSuccess?.({});
         onUploadSuccess();
@@ -346,6 +371,8 @@ export default function FileUpload({
         const errorMsg =
           kind === 'tag_conflict'
             ? t('files.upload.tag_conflict')
+            : kind === 'too_large'
+            ? t('files.upload.too_large', { size: maxFileSize / 1024 / 1024 })
             : kind === 'name_too_long'
             ? t('files.upload.name_too_long')
             : kind === 'backend_detail'

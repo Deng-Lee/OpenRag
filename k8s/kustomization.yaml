@@ -10,7 +10,6 @@ namespace: openrag
 
 resources:
   - 00-namespace.yaml
-  - 02-configmap-nginx.yaml
   - 03-postgres.yaml
   - 05-milvus-etcd.yaml
   - 07-milvus-config.yaml

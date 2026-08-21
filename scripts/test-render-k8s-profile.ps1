@@ -82,6 +82,7 @@ try {
     Assert-FileContains -Path (Join-Path $RenderedDir "09-api.yaml") -Needle "value: openrag"
     Assert-FileContains -Path (Join-Path $RenderedDir "09-api.yaml") -Needle "image: openrag/api:9.9.9"
     Assert-FileContains -Path (Join-Path $RenderedDir "09-api.yaml") -Needle "imagePullPolicy: IfNotPresent"
+    Assert-FileContains -Path (Join-Path $RenderedDir "09-api.yaml") -Needle 'value: "104857600"'
 
     Assert-FileContains -Path (Join-Path $RenderedDir "10-task-worker.yaml") -Needle "image: openrag/task-worker:9.9.9"
     Assert-FileContains -Path (Join-Path $RenderedDir "10-task-worker.yaml") -Needle "imagePullPolicy: IfNotPresent"
@@ -89,6 +90,8 @@ try {
     Assert-FileContains -Path (Join-Path $RenderedDir "11-web.yaml") -Needle "image: openrag/web:9.9.9"
     Assert-FileContains -Path (Join-Path $RenderedDir "11-web.yaml") -Needle "imagePullPolicy: IfNotPresent"
     Assert-FileNotContains -Path (Join-Path $RenderedDir "11-web.yaml") -Needle "imagePullPolicy: Always"
+    Assert-FileContains -Path (Join-Path $RenderedDir "12-ingress.yaml") -Needle 'nginx.ingress.kubernetes.io/proxy-body-size: "110m"'
+    Assert-True -Condition (-not (Test-Path -LiteralPath (Join-Path $RenderedDir "02-configmap-nginx.yaml"))) -Message "Unused nginx ConfigMap must not be rendered."
 
     Assert-FileContains -Path (Join-Path $RenderedDir "13-configmap-openrag-llm.yaml") -Needle 'EMBEDDING_DIMENSION: "2560"'
     Assert-FileContains -Path (Join-Path $RenderedDir "09-api.yaml") -Needle "key: EMBEDDING_DIMENSION"

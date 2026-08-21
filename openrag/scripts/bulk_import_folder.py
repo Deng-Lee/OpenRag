@@ -26,8 +26,7 @@ from typing import Iterable
 
 import httpx
 
-# 与 openrag.services.file_ingest 一致，便于本机预检
-MAX_FILE_SIZE = 50 * 1024 * 1024
+DEFAULT_MAX_UPLOAD_SIZE = 100 * 1024 * 1024
 
 
 def _normalize_remote_prefix(prefix: str) -> str:
@@ -141,6 +140,23 @@ async def _resolve_api_base_for_user_auth(
     raise SystemExit("无法完成登录：请检查 API 地址与网络连通性")
 
 
+async def _get_max_upload_size(client: httpx.AsyncClient, api_base: str) -> int:
+    """Read the server policy, falling back for older OpenRag releases."""
+    try:
+        response = await client.get(
+            f"{api_base.rstrip('/')}/config/client",
+            timeout=httpx.Timeout(10.0),
+        )
+        if response.is_success:
+            value = int(response.json().get("max_upload_size_bytes", 0))
+            if value > 0:
+                return value
+    except (httpx.HTTPError, TypeError, ValueError):
+        pass
+    print("无法读取服务端上传限制，按兼容默认值 100 MiB 预检。", file=sys.stderr)
+    return DEFAULT_MAX_UPLOAD_SIZE
+
+
 async def _upload_one(
     client: httpx.AsyncClient,
     api_base: str,
@@ -151,12 +167,17 @@ async def _upload_one(
     remote_prefix: str,
     parser_type: str,
     dry_run: bool,
+    max_upload_size: int,
 ) -> tuple[str, bool, str]:
     logical_parent = _parent_logical_path(remote_prefix, relative)
     parser = _guess_parser(local_path, parser_type)
     size = local_path.stat().st_size
-    if size > MAX_FILE_SIZE:
-        return (relative.as_posix(), False, f"超过 {MAX_FILE_SIZE // (1024 * 1024)}MB 限制，跳过")
+    if size > max_upload_size:
+        return (
+            relative.as_posix(),
+            False,
+            f"超过 {max_upload_size / 1024 / 1024:g} MiB 限制，跳过",
+        )
 
     ctype = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
 
@@ -231,6 +252,8 @@ async def _run(args: argparse.Namespace) -> int:
                 client, api_base, args.email, args.password
             )
 
+        max_upload_size = await _get_max_upload_size(client, api_base)
+
         sem = asyncio.Semaphore(args.workers)
 
         total = len(files)
@@ -252,6 +275,7 @@ async def _run(args: argparse.Namespace) -> int:
                     remote_prefix,
                     args.parser_type,
                     args.dry_run,
+                    max_upload_size,
                 )
 
         ok, fail = 0, 0

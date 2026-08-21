@@ -263,6 +263,11 @@ class IndexQualityConfig(BaseSettings):
 class Config(BaseSettings):
     """全局配置"""
 
+    max_upload_size: int = Field(
+        default=100 * 1024 * 1024,
+        validation_alias="MAX_UPLOAD_SIZE",
+        gt=0,
+    )
     storage: StorageConfig = Field(default_factory=StorageConfig)
     vector_db: VectorDBConfig = Field(default_factory=VectorDBConfig)
     elasticsearch: ElasticsearchConfig = Field(default_factory=ElasticsearchConfig)

@@ -34,10 +34,12 @@ vi.mock('../services/api', () => ({
   filesAPI: {
     upload: vi.fn(),
     list: vi.fn(() => Promise.resolve([])),
+    getClientConfig: vi.fn(() => Promise.resolve({ max_upload_size_bytes: 100 * 1024 * 1024 })),
   },
 }));
 
 vi.mock('../utils/folderUpload', () => ({
+  DEFAULT_MAX_FILE_SIZE: 100 * 1024 * 1024,
   precheck: (items: Array<{ file: File; relativePath: string }>) => {
     const accepted: Array<{ file: File; relativePath: string }> = [];
     const skipped: Array<{ rel: string; reason: string; ext?: string }> = [];
@@ -69,6 +71,7 @@ describe('FileUpload', () => {
     vi.mocked(filesAPI.upload).mockReset();
     vi.mocked(filesAPI.upload).mockResolvedValue({} as any);
     vi.mocked(filesAPI.list).mockClear();
+    vi.mocked(filesAPI.getClientConfig).mockClear();
   });
 
   it('shows the public auto, pdf, and deepdoc parser labels', async () => {
