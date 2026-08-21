@@ -1,6 +1,6 @@
 import { isFilenameTooLongError } from '../utils/folderUpload';
 
-export type UploadErrorKind = 'tag_conflict' | 'name_too_long' | 'backend_detail' | 'generic';
+export type UploadErrorKind = 'too_large' | 'tag_conflict' | 'name_too_long' | 'backend_detail' | 'generic';
 
 /** Pick which message a failed single-file upload should show.
  *
@@ -10,6 +10,7 @@ export type UploadErrorKind = 'tag_conflict' | 'name_too_long' | 'backend_detail
  * detail, so a user who never typed a tag is not misled into thinking their tag
  * clashed. */
 export function classifyUploadError(code: number | undefined, detailMsg: string): UploadErrorKind {
+  if (code === 413) return 'too_large';
   if (code === 409 && /Tag already in use/i.test(detailMsg)) return 'tag_conflict';
   if (isFilenameTooLongError(code, detailMsg)) return 'name_too_long';
   if (detailMsg) return 'backend_detail';

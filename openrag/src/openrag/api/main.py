@@ -34,6 +34,7 @@ from openrag.api.traces_api import router as traces_router
 from openrag.api.eval_api import router as eval_router
 from openrag.api.index_generations_api import router as index_generations_router
 from openrag.config import get_config
+from openrag.services.upload_policy import get_max_upload_size
 from openrag.tracing.context import reset_trace_context, set_trace_context
 
 TRACE_HEADER = "X-OpenRag-Trace-Id"
@@ -47,6 +48,13 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
 )
+
+
+@app.get("/config/client", tags=["config"])
+async def client_config() -> dict[str, int]:
+    """Return non-sensitive runtime limits needed by browser and CLI clients."""
+    return {"max_upload_size_bytes": get_max_upload_size()}
+
 
 # CORS Configuration
 config = get_config()

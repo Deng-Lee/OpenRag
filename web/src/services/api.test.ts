@@ -41,6 +41,17 @@ describe('API Client', () => {
     expect(mocks.mockAxiosInstance.interceptors.response.use).toHaveBeenCalled();
   });
 
+  it('fetches the public client upload policy', async () => {
+    const data = { max_upload_size_bytes: 100 * 1024 * 1024 };
+    mocks.mockAxiosInstance.get.mockResolvedValueOnce({ data });
+
+    const { filesAPI } = await import('./api');
+    const result = await filesAPI.getClientConfig();
+
+    expect(mocks.mockAxiosInstance.get).toHaveBeenCalledWith('/config/client');
+    expect(result).toBe(data);
+  });
+
   it('lists workspace file chunks with params', async () => {
     const data = {
       file: {

@@ -146,7 +146,7 @@ spec:
             - name: ACCESS_TOKEN_EXPIRE_MINUTES
               value: "30"
             - name: MAX_UPLOAD_SIZE
-              value: "20971520"
+              value: "104857600"
             - name: UPLOAD_DIR
               value: /app/uploads
             - name: CORS_ORIGINS

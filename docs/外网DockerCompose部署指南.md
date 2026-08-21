@@ -174,9 +174,12 @@ EMBEDDING_DIMENSION=<实际 embedding 维度>
 WEB_PORT=80
 PREVIEW_PUBLIC_WEB_BASE_URL=http://192.168.100.33
 PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.32:2026 http://192.168.100.33:2026"
+MAX_UPLOAD_SIZE=104857600
 ELASTICSEARCH__ENABLED=true
 ELASTICSEARCH__HOSTS=http://elasticsearch:9200
 ```
+
+`MAX_UPLOAD_SIZE` 使用字节数：`104857600` 为 100 MiB，若办公网环境采用 50 MiB 则改为 `52428800`。Web 镜像内 Nginx 的请求体上限为 110 MiB，已为 multipart 开销留余量，覆盖这两档配置；实际单文件上限仍由 API 强制执行并由前端运行时读取。
 
 ### 验证预期
 

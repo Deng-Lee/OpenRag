@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { classifyUploadError } from './fileUploadError';
 
 describe('classifyUploadError', () => {
+  it('413 without backend detail -> too_large', () => {
+    expect(classifyUploadError(413, '')).toBe('too_large');
+  });
+
   it('409 with tag-uniqueness detail -> tag_conflict', () => {
     expect(classifyUploadError(409, 'Tag already in use')).toBe('tag_conflict');
   });

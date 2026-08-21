@@ -86,7 +86,7 @@ JWT 重处理时选择 PaddleOCR 的请求体示例：
 ### 1.4 网络、TLS 与限流
 
 - 生产环境应对公网 **HTTPS** 终止（Ingress / 网关），后端可只接收集群内 HTTP。
-- 上传体积当前由后端 `MAX_FILE_SIZE` 约束为 **100 MB**。
+- 上传体积由后端环境变量 `MAX_UPLOAD_SIZE` 约束，默认 **100 MiB**（`104857600` 字节）。
 - 对 `/service/v1` 建议在网关侧做 **IP allowlist**、**速率限制** 与密钥轮换。
 
 ### 1.5 与前端同源部署时的基地址
@@ -626,7 +626,7 @@ X-OpenRag-Token: sk-<完整密钥字符串>
 | `application/json` | JSON |
 | `application/epub+zip` | EPUB |
 
-**文件大小限制：** **100 MB**；超出 → **413**。
+**文件大小限制：** 默认 **100 MiB**；超出 → **413**。客户端可通过 `GET /config/client` 查询当前的 `max_upload_size_bytes`。
 
 **成功：** **201 Created**
 
@@ -1613,7 +1613,7 @@ print(r.json())
 | **409** | `Document is not in a retryable state` | 手动 retry 时最新处理任务不是失败或取消状态 |
 | **409** | `Retry limit reached` | 手动 retry 时重试次数已耗尽 |
 | **409** | `Token already has a binding for this workspace` | 添加已存在的绑定 |
-| **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过 100 MB |
+| **413** | `File size exceeds maximum allowed size of 100.0MB` | 上传文件超过当前 `MAX_UPLOAD_SIZE` 限制 |
 | **422** | — | multipart/form-data 缺少必填字段，如 upsert 缺少 `target_path` |
 | **500** | — | 内部错误或检索执行失败 |
 

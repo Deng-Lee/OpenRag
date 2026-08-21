@@ -345,6 +345,7 @@ function Assert-RenderedOutput {
         "09-api.yaml",
         "10-task-worker.yaml",
         "11-web.yaml",
+        "12-ingress.yaml",
         "13-configmap-openrag-llm.yaml",
         "15-configmap-openrag-service-conf.yaml",
         "kustomization.yaml"
@@ -365,6 +366,7 @@ function Assert-RenderedOutput {
     Assert-Contains -Path (Join-Path $Dir "09-api.yaml") -Needle "value: $($Minio.PublicUrl)"
     Assert-Contains -Path (Join-Path $Dir "09-api.yaml") -Needle "image: openrag/api:$ImageTag"
     Assert-Contains -Path (Join-Path $Dir "09-api.yaml") -Needle "imagePullPolicy: IfNotPresent"
+    Assert-Contains -Path (Join-Path $Dir "09-api.yaml") -Needle 'value: "104857600"'
 
     Assert-Contains -Path (Join-Path $Dir "10-task-worker.yaml") -Needle "value: $($Minio.Endpoint)"
     Assert-Contains -Path (Join-Path $Dir "10-task-worker.yaml") -Needle "value: $($Minio.StorageBucket)"
@@ -376,6 +378,7 @@ function Assert-RenderedOutput {
     Assert-Contains -Path (Join-Path $Dir "11-web.yaml") -Needle "image: openrag/web:$ImageTag"
     Assert-Contains -Path (Join-Path $Dir "11-web.yaml") -Needle "imagePullPolicy: IfNotPresent"
     Assert-NotContains -Path (Join-Path $Dir "11-web.yaml") -Needle "imagePullPolicy: Always"
+    Assert-Contains -Path (Join-Path $Dir "12-ingress.yaml") -Needle 'nginx.ingress.kubernetes.io/proxy-body-size: "110m"'
 
     Assert-Contains -Path (Join-Path $Dir "13-configmap-openrag-llm.yaml") -Needle 'EMBEDDING_DIMENSION: "2560"'
     Assert-Contains -Path (Join-Path $Dir "09-api.yaml") -Needle "key: EMBEDDING_DIMENSION"
