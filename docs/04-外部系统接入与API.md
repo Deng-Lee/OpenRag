@@ -1092,6 +1092,7 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 | `path_prefix` | string/null | 否 | `null` | — | 把检索范围限定到该逻辑路径前缀下的文件（**预过滤**），同一前缀应用于所有目标工作区。当 `paths` 已显式传入时本字段被忽略。⚠️ **行为变更**：已由检索后过滤（post-filter）升级为检索前预过滤（pre-filter）。 |
 | `top_k` | int | 否 | `10` | gt=0, le=100 | 全局返回结果数；多工作区结果合并后按分数截断 |
 | `use_rerank` | bool | 否 | `false` | — | 是否使用 cross-encoder 重排 |
+| `rerank_scope` | string | 否 | `"workspace"` | `workspace` / `global` | `workspace` 保留逐工作区重排兼容语义；`global` 先以最多 10 路并发召回所有候选，再对合并候选池执行一次统一重排 |
 | `use_contextual_retrieval` | bool | 否 | `false` | — | 启用 L0→L1→L2 层级检索 |
 | `contextual_l0_top_n` | int | 否 | `40` | ge=5, le=200 | L0 候选文件数 |
 | `contextual_l1_top_n` | int | 否 | `30` | ge=5, le=200 | L1 检索深度 |
@@ -1102,10 +1103,13 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 **行为规则：**
 
 - `workspace_names` 缺失、为空或去重后为空 → **400**，`detail` 为 `workspace_names is required for multi_space search`。
+- `workspace_names` 超过 20 个 → **422**；调用方不得依赖 OpenRAG 静默截断。
 - 请求中的工作区不存在时，该工作区进入 `skipped_workspaces`，`reason` 为 `not_found`。
 - 当前 service token 对某工作区无 read/write 权限时，该工作区进入 `skipped_workspaces`，`reason` 为 `permission_denied`。
-- 只传 1 个可访问工作区时，检索行为与单工作区 `/workspaces/{workspace_name}/search` 一致，但响应仍包含多工作区接口的顶层字段。
-- 传多个可访问工作区时，后端分别在这些工作区内检索，结果补充 `workspace_id` / `workspace_name` 后合并排序。
+- 只传 1 个可访问工作区且 `rerank_scope="workspace"` 时，检索行为与单工作区 `/workspaces/{workspace_name}/search` 一致，但响应仍包含多工作区接口的顶层字段；`global` 时仍走统一候选管线。
+- `rerank_scope="global"` 时，后端最多同时执行 10 个工作区召回任务；并发窗口不是请求或重排边界，所有成功工作区的候选合并、去重后只执行一次统一重排，再截取全局 `top_k`。
+- `rerank_scope="global"` 时，统一重排不混入工作区内原始召回分数；原始分数通过 `retrieval_score` 保留，最终统一重排分数通过 `rerank_score` 返回。
+- 单个工作区召回失败时采用部分成功策略，`reason="search_failed"`；所有已授权工作区召回都失败时返回 **503**。
 - 如果所有请求工作区都不可检索，仍返回 **200**，`results=[]`、`total=0`、`workspace_count=0`，并通过 `skipped_workspaces` 说明原因。
 - 为避免误用，真实工作区不应命名为 `multi_space`。
 
@@ -1123,7 +1127,8 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
   "contextual_l1_top_n": 30,
   "contextual_chunk_fetch_multiplier": 4,
   "retrieval_strategy": "auto",
-  "use_l1_llm_navigation": false
+  "use_l1_llm_navigation": false,
+  "rerank_scope": "global"
 }
 ```
 
@@ -1137,6 +1142,8 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
       "workspace_name": "MyWorkspace",
       "text": "合同约定总金额为...",
       "score": 0.95,
+      "retrieval_score": 0.72,
+      "rerank_score": 0.95,
       "file_id": 123,
       "chunk_id": "abc-456",
       "chunk_index": 0,
@@ -1173,7 +1180,15 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
       "reason": "permission_denied",
       "message": "Token does not have read permission for this workspace"
     }
-  ]
+  ],
+  "rerank_scope_applied": "global",
+  "rerank_status": "success",
+  "ranking_mode": "global_rerank",
+  "candidate_count": 30,
+  "candidate_pool_truncated": false,
+  "requested_workspace_count": 2,
+  "failed_workspace_count": 0,
+  "rerank_time_ms": 38.4
 }
 ```
 
@@ -1183,18 +1198,26 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 |------|------|------|
 | `results` | array | 合并、排序、截断后的检索命中列表 |
 | `total` | int | 最终返回的命中条数，即 `results.length` |
-| `query_time_ms` | float | 所有实际参与检索工作区的查询耗时汇总（毫秒） |
+| `query_time_ms` | float | 端到端墙钟耗时（毫秒），并发工作区耗时不累加 |
 | `workspace_count` | int | 去重后实际参与检索的工作区数量；被跳过的工作区不计入 |
 | `l1_llm_applied` | bool/null | 任一工作区实际应用 L1 LLM 导航时为 `true`；全部为空时为 `null` |
 | `l1_llm_skip_reason` | string/null | 未应用 L1 LLM 的原因；多种原因混合时为 `"mixed"` |
 | `skipped_workspaces` | array | 被跳过的工作区列表，可能为空数组 |
+| `rerank_scope_applied` | string | 实际应用的重排范围：`workspace` 或 `global` |
+| `rerank_status` | string | `success`、`disabled` 或 `degraded`；统一重排不可用时按全局召回分数降级 |
+| `ranking_mode` | string | `global_rerank`、`global_retrieval_score` 或 `workspace_rerank` |
+| `candidate_count` | int | 去重后进入最终排序阶段的候选数量 |
+| `candidate_pool_truncated` | bool | 候选预算是否限制了召回或合并候选池 |
+| `requested_workspace_count` | int | 请求去重后的工作区数量 |
+| `failed_workspace_count` | int | 已授权但召回失败的工作区数量 |
+| `rerank_time_ms` | float | 全局重排阶段墙钟耗时（毫秒） |
 
 **`skipped_workspaces[]` 字段：**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `workspace_name` | string | 请求中被跳过的工作区名称 |
-| `reason` | string | 跳过原因：`not_found` 或 `permission_denied` |
+| `reason` | string | 跳过原因：`not_found`、`permission_denied` 或 `search_failed` |
 | `message` | string | 面向调用方的原因说明 |
 
 **多工作区命中字段补充：**
@@ -1203,6 +1226,8 @@ PREVIEW_FRAME_ANCESTORS="'self' http://192.168.100.33:2026 http://192.168.100.32
 |------|------|------|
 | `workspace_id` | int | 命中所属工作区 ID |
 | `workspace_name` | string | 命中所属工作区名称 |
+| `retrieval_score` | float/null | 该候选在所属工作区内的原始召回分数 |
+| `rerank_score` | float/null | 全局重排后的最终分数；未启用或降级时为 `null` |
 
 其余命中字段与单工作区 `SearchResult` 一致。
 

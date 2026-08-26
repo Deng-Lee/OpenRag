@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from openrag.api.deps import get_db, get_service_token_context
 from openrag.api.search_api import (
@@ -18,11 +31,17 @@ from openrag.api.search_api import (
     SearchResult,
     _execute_search,
 )
-from openrag.config import get_preview_public_web_base_url
+from openrag.config import get_config, get_preview_public_web_base_url
 from openrag.models.document_chunk import DocumentChunk
 from openrag.models.file import File as DbFile
 from openrag.models.task import Task
 from openrag.models.workspace import Workspace
+from openrag.retrieval.reranker import Reranker
+from openrag.services.document_retry_status import (
+    document_processing_fields,
+    retry_failed_document_processing,
+    task_retry_fields,
+)
 from openrag.services.file_deletion import (
     FileStorageCleanupError,
     _release_tag_and_soft_delete,
@@ -34,25 +53,24 @@ from openrag.services.file_ingest import (
     upsert_file_by_tag,
     validate_path,
 )
-from openrag.services.upload_policy import read_upload_content
-from openrag.services.preview_token_service import create_preview_token, decode_preview_token
-from openrag.services.document_retry_status import (
-    document_processing_fields,
-    retry_failed_document_processing,
-    task_retry_fields,
+from openrag.services.preview_token_service import (
+    create_preview_token,
+    decode_preview_token,
 )
 from openrag.services.service_token_service import (
     ServiceTokenContext,
     assert_token_workspace_permission,
     require_workspace_for_name,
 )
+from openrag.services.upload_policy import read_upload_content
 from openrag.services.workspace_file_tree import (
     build_nested_tree,
     get_file_document_by_path,
-    list_entries_by_prefix,
     list_direct_children,
+    list_entries_by_prefix,
     search_documents_by_name,
 )
+from openrag.tracing.context import set_trace_context
 
 router = APIRouter(prefix="/service/v1", tags=["service"])
 
@@ -104,7 +122,7 @@ class ServiceSearchRequest(BaseModel):
 class ServiceMultiWorkspaceSearchRequest(BaseModel):
     """Semantic search body for service token API across multiple workspaces."""
 
-    workspace_names: Optional[List[str]] = None
+    workspace_names: Optional[List[str]] = Field(default=None, max_length=20)
     query: str = Field(..., min_length=1)
     path_prefix: Optional[str] = Field(
         None,
@@ -122,6 +140,7 @@ class ServiceMultiWorkspaceSearchRequest(BaseModel):
     contextual_chunk_fetch_multiplier: int = Field(4, ge=1, le=20)
     retrieval_strategy: str = "auto"
     use_l1_llm_navigation: bool = False
+    rerank_scope: Literal["workspace", "global"] = "workspace"
 
 
 class SkippedWorkspace(BaseModel):
@@ -133,6 +152,8 @@ class SkippedWorkspace(BaseModel):
 class MultiWorkspaceSearchResult(SearchResult):
     workspace_id: int
     workspace_name: str
+    retrieval_score: Optional[float] = None
+    rerank_score: Optional[float] = None
 
 
 class MultiWorkspaceSearchResponse(BaseModel):
@@ -143,6 +164,16 @@ class MultiWorkspaceSearchResponse(BaseModel):
     l1_llm_applied: Optional[bool] = None
     l1_llm_skip_reason: Optional[str] = None
     skipped_workspaces: list[SkippedWorkspace]
+    rerank_scope_applied: Literal["workspace", "global"] = "workspace"
+    rerank_status: Literal["success", "disabled", "degraded"] = "disabled"
+    ranking_mode: Literal[
+        "global_rerank", "global_retrieval_score", "workspace_rerank"
+    ] = "workspace_rerank"
+    candidate_count: int = 0
+    candidate_pool_truncated: bool = False
+    requested_workspace_count: int = 0
+    failed_workspace_count: int = 0
+    rerank_time_ms: float = 0.0
 
 
 class ServicePreviewLinkRequest(BaseModel):
@@ -282,6 +313,306 @@ def _merge_l1_skip_reason(values: list[Optional[str]]) -> Optional[str]:
     if len(reasons) == 1:
         return next(iter(reasons))
     return "mixed"
+
+
+@dataclass(frozen=True)
+class _WorkspaceSearchTarget:
+    workspace_id: int
+    workspace_name: str
+    owner_id: int
+
+
+@dataclass(frozen=True)
+class _WorkspaceSearchOutcome:
+    target: _WorkspaceSearchTarget
+    response: SearchResponse
+
+
+def _candidate_limit(
+    *, workspace_count: int, final_top_k: int, use_rerank: bool
+) -> tuple[int, bool]:
+    config = get_config().multi_workspace_search
+    desired = final_top_k
+    if use_rerank:
+        desired = max(
+            final_top_k * config.candidate_multiplier,
+            config.min_candidates_per_workspace,
+        )
+    desired = min(desired, config.max_candidates_per_workspace)
+    global_budget = max(1, config.max_global_rerank_candidates // workspace_count)
+    candidate_limit = max(1, min(desired, global_budget))
+    return candidate_limit, candidate_limit < desired
+
+
+def _candidate_identity(candidate: dict[str, Any]) -> tuple[Any, ...]:
+    workspace_id = candidate["_workspace_id"]
+    chunk_id = candidate.get("chunk_id")
+    if chunk_id:
+        return workspace_id, "chunk", chunk_id
+    return (
+        workspace_id,
+        "position",
+        candidate.get("file_id"),
+        candidate.get("chunk_index"),
+    )
+
+
+def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best_by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for candidate in candidates:
+        identity = _candidate_identity(candidate)
+        previous = best_by_identity.get(identity)
+        if previous is None or float(candidate.get("score", 0.0)) > float(
+            previous.get("score", 0.0)
+        ):
+            best_by_identity[identity] = candidate
+    return list(best_by_identity.values())
+
+
+def _multi_workspace_result(candidate: dict[str, Any]) -> MultiWorkspaceSearchResult:
+    effective_score = float(
+        candidate.get("reranked_score", candidate.get("score", 0.0))
+    )
+    payload = dict(candidate)
+    payload["score"] = effective_score
+    payload.pop("retrieval_score", None)
+    return MultiWorkspaceSearchResult(
+        **payload,
+        workspace_id=int(candidate["_workspace_id"]),
+        workspace_name=str(candidate["_workspace_name"]),
+        retrieval_score=float(candidate.get("score", 0.0)),
+        rerank_score=(
+            float(candidate["reranked_score"])
+            if candidate.get("reranked_score") is not None
+            else None
+        ),
+    )
+
+
+async def _execute_global_multi_workspace_search(
+    *,
+    body: ServiceMultiWorkspaceSearchRequest,
+    ctx: ServiceTokenContext,
+    db: Session,
+    workspace_names: list[str],
+) -> MultiWorkspaceSearchResponse:
+    started_at = time.perf_counter()
+    config = get_config().multi_workspace_search
+    if len(workspace_names) > config.max_workspaces:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"multi_space search supports at most {config.max_workspaces} workspaces",
+        )
+
+    workspaces = (
+        db.query(Workspace).filter(Workspace.name.in_(workspace_names)).all()
+    )
+    workspace_by_name = {workspace.name: workspace for workspace in workspaces}
+    skipped: list[SkippedWorkspace] = []
+    targets: list[_WorkspaceSearchTarget] = []
+    for workspace_name in workspace_names:
+        workspace = workspace_by_name.get(workspace_name)
+        if workspace is None:
+            skipped.append(
+                SkippedWorkspace(
+                    workspace_name=workspace_name,
+                    reason="not_found",
+                    message="Workspace not found",
+                )
+            )
+            continue
+        if not _token_can_read_workspace(ctx, workspace.id):
+            skipped.append(
+                SkippedWorkspace(
+                    workspace_name=workspace_name,
+                    reason="permission_denied",
+                    message="Token not authorized for this workspace",
+                )
+            )
+            continue
+        targets.append(
+            _WorkspaceSearchTarget(
+                workspace_id=workspace.id,
+                workspace_name=workspace.name,
+                owner_id=workspace.owner_id,
+            )
+        )
+
+    if not targets:
+        return MultiWorkspaceSearchResponse(
+            results=[],
+            total=0,
+            query_time_ms=(time.perf_counter() - started_at) * 1000,
+            workspace_count=0,
+            skipped_workspaces=skipped,
+            rerank_scope_applied="global",
+            rerank_status="disabled" if not body.use_rerank else "success",
+            ranking_mode=(
+                "global_retrieval_score" if not body.use_rerank else "global_rerank"
+            ),
+            requested_workspace_count=len(workspace_names),
+        )
+
+    candidate_top_k, candidate_pool_truncated = _candidate_limit(
+        workspace_count=len(targets),
+        final_top_k=body.top_k,
+        use_rerank=body.use_rerank,
+    )
+    semaphore = asyncio.Semaphore(min(config.recall_concurrency, len(targets)))
+    session_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=db.get_bind(),
+    )
+    scope_paths = _resolve_scope_paths(body.paths, body.path_prefix)
+
+    def run_workspace(target: _WorkspaceSearchTarget) -> _WorkspaceSearchOutcome:
+        worker_db = session_factory()
+        set_trace_context(
+            trace_id=uuid.uuid4().hex,
+            span_id=None,
+            trace_type="retrieval",
+            workspace_id=target.workspace_id,
+            user_id=target.owner_id,
+        )
+        try:
+            request = SearchRequest(
+                query=body.query,
+                top_k=candidate_top_k,
+                workspace_id=target.workspace_id,
+                use_rerank=False,
+                use_contextual_retrieval=body.use_contextual_retrieval,
+                contextual_l0_top_n=body.contextual_l0_top_n,
+                contextual_l1_top_n=body.contextual_l1_top_n,
+                contextual_chunk_fetch_multiplier=body.contextual_chunk_fetch_multiplier,
+                retrieval_strategy=body.retrieval_strategy,
+                use_l1_llm_navigation=body.use_l1_llm_navigation,
+                paths=scope_paths,
+            )
+            response = _execute_search(
+                worker_db,
+                target.owner_id,
+                request,
+                endpoint="service_multi_workspace_candidate",
+                rerank_hierarchical_boost=None,
+                workspace_access_prevalidated=True,
+                allow_shadow=False,
+            )
+            return _WorkspaceSearchOutcome(target=target, response=response)
+        finally:
+            worker_db.close()
+
+    async def search_workspace(target: _WorkspaceSearchTarget):
+        async with semaphore:
+            return await asyncio.to_thread(run_workspace, target)
+
+    raw_outcomes = await asyncio.gather(
+        *(search_workspace(target) for target in targets),
+        return_exceptions=True,
+    )
+    outcomes: list[_WorkspaceSearchOutcome] = []
+    failed_workspace_count = 0
+    for target, outcome in zip(targets, raw_outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            failed_workspace_count += 1
+            logger.warning(
+                "multi_workspace_search.workspace_failed workspace_name=%s exception_type=%s",
+                target.workspace_name,
+                type(outcome).__name__,
+            )
+            skipped.append(
+                SkippedWorkspace(
+                    workspace_name=target.workspace_name,
+                    reason="search_failed",
+                    message="Workspace search failed",
+                )
+            )
+            continue
+        outcomes.append(outcome)
+
+    if targets and not outcomes:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="All workspace searches failed",
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        for result in outcome.response.results:
+            candidate = result.model_dump()
+            candidate["_workspace_id"] = outcome.target.workspace_id
+            candidate["_workspace_name"] = outcome.target.workspace_name
+            candidates.append(candidate)
+    candidates = _dedupe_candidates(candidates)
+    candidates.sort(key=lambda candidate: float(candidate.get("score", 0.0)), reverse=True)
+    if len(candidates) > config.max_global_rerank_candidates:
+        candidates = candidates[: config.max_global_rerank_candidates]
+        candidate_pool_truncated = True
+    candidate_count = len(candidates)
+
+    rerank_time_ms = 0.0
+    rerank_status: Literal["success", "disabled", "degraded"]
+    ranking_mode: Literal[
+        "global_rerank", "global_retrieval_score", "workspace_rerank"
+    ]
+    final_candidates: list[dict[str, Any]]
+    if body.use_rerank and candidates:
+        rerank_started_at = time.perf_counter()
+        try:
+            reranked = Reranker().rerank(
+                body.query,
+                candidates,
+                top_k=body.top_k,
+                original_score_weight=0.0,
+            )
+            if any(item.get("reranked_score") is not None for item in reranked):
+                final_candidates = reranked
+                rerank_status = "success"
+                ranking_mode = "global_rerank"
+            else:
+                final_candidates = candidates[: body.top_k]
+                rerank_status = "degraded"
+                ranking_mode = "global_retrieval_score"
+        except Exception as exc:
+            logger.warning(
+                "multi_workspace_search.rerank_degraded exception_type=%s",
+                type(exc).__name__,
+            )
+            final_candidates = candidates[: body.top_k]
+            rerank_status = "degraded"
+            ranking_mode = "global_retrieval_score"
+        rerank_time_ms = (time.perf_counter() - rerank_started_at) * 1000
+    elif body.use_rerank:
+        final_candidates = []
+        rerank_status = "success"
+        ranking_mode = "global_rerank"
+    else:
+        final_candidates = candidates[: body.top_k]
+        rerank_status = "disabled"
+        ranking_mode = "global_retrieval_score"
+
+    results = [_multi_workspace_result(candidate) for candidate in final_candidates]
+    return MultiWorkspaceSearchResponse(
+        results=results,
+        total=len(results),
+        query_time_ms=(time.perf_counter() - started_at) * 1000,
+        workspace_count=len(outcomes),
+        l1_llm_applied=_merge_l1_applied(
+            [outcome.response.l1_llm_applied for outcome in outcomes]
+        ),
+        l1_llm_skip_reason=_merge_l1_skip_reason(
+            [outcome.response.l1_llm_skip_reason for outcome in outcomes]
+        ),
+        skipped_workspaces=skipped,
+        rerank_scope_applied="global",
+        rerank_status=rerank_status,
+        ranking_mode=ranking_mode,
+        candidate_count=candidate_count,
+        candidate_pool_truncated=candidate_pool_truncated,
+        requested_workspace_count=len(workspace_names),
+        failed_workspace_count=failed_workspace_count,
+        rerank_time_ms=rerank_time_ms,
+    )
 
 
 def resolve_preview_target(
@@ -542,12 +873,19 @@ async def service_multi_workspace_semantic_search(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="workspace_names is required for multi_space search",
         )
+    if body.rerank_scope == "global":
+        return await _execute_global_multi_workspace_search(
+            body=body,
+            ctx=ctx,
+            db=db,
+            workspace_names=workspace_names,
+        )
 
+    legacy_started_at = time.perf_counter()
     results: list[MultiWorkspaceSearchResult] = []
     skipped: list[SkippedWorkspace] = []
     l1_applied_values: list[Optional[bool]] = []
     l1_skip_reasons: list[Optional[str]] = []
-    query_time_ms = 0.0
     workspace_count = 0
 
     try:
@@ -594,7 +932,6 @@ async def service_multi_workspace_semantic_search(
                 workspace_access_prevalidated=True,
             )
             workspace_count += 1
-            query_time_ms += resp.query_time_ms
             l1_applied_values.append(resp.l1_llm_applied)
             l1_skip_reasons.append(resp.l1_llm_skip_reason)
             for hit in resp.results:
@@ -618,11 +955,16 @@ async def service_multi_workspace_semantic_search(
     return MultiWorkspaceSearchResponse(
         results=results,
         total=len(results),
-        query_time_ms=query_time_ms,
+        query_time_ms=(time.perf_counter() - legacy_started_at) * 1000,
         workspace_count=workspace_count,
         l1_llm_applied=_merge_l1_applied(l1_applied_values),
         l1_llm_skip_reason=_merge_l1_skip_reason(l1_skip_reasons),
         skipped_workspaces=skipped,
+        rerank_scope_applied="workspace",
+        rerank_status="success" if body.use_rerank else "disabled",
+        ranking_mode="workspace_rerank",
+        candidate_count=len(results),
+        requested_workspace_count=len(workspace_names),
     )
 
 
