@@ -1,7 +1,8 @@
 """Tests for reranker with hierarchical and position boosting"""
 
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
 
 from openrag.retrieval.reranker import Reranker
 
@@ -79,6 +80,29 @@ class TestReranker:
         assert [item["chunk_id"] for item in reranked] == ["rrf-first", "dense-first"]
         assert reranked[0]["reranked_score"] == pytest.approx(0.7)
         assert reranked[1]["reranked_score"] == pytest.approx(0.3)
+
+    def test_rerank_can_ignore_workspace_local_retrieval_scores(self):
+        reranker = Reranker(hierarchical_boost=0.0, position_boost=0.0)
+        reranker._model = Mock()
+        reranker._model.predict.return_value = [0.0, 1.0]
+        results = [
+            {"chunk_id": "retrieval-first", "text": "a", "score": 0.9},
+            {"chunk_id": "model-first", "text": "b", "score": 0.1},
+        ]
+
+        reranked = reranker.rerank(
+            "query",
+            results,
+            top_k=2,
+            original_score_weight=0.0,
+        )
+
+        assert [item["chunk_id"] for item in reranked] == [
+            "model-first",
+            "retrieval-first",
+        ]
+        assert reranked[0]["reranked_score"] == pytest.approx(1.0)
+        assert reranked[1]["reranked_score"] == pytest.approx(0.0)
 
     def test_rerank_is_identity_when_model_is_unavailable(self):
         """Unavailable reranking must preserve the RRF order and scores."""

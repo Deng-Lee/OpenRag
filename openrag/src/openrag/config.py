@@ -260,6 +260,61 @@ class IndexQualityConfig(BaseSettings):
     model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 
 
+class MultiWorkspaceSearchConfig(BaseSettings):
+    """Bounded recall and candidate-pool limits for multi-workspace search."""
+
+    max_workspaces: int = Field(
+        default=20,
+        ge=1,
+        le=20,
+        validation_alias="MULTI_WORKSPACE_SEARCH_MAX_WORKSPACES",
+    )
+    recall_concurrency: int = Field(
+        default=10,
+        ge=1,
+        le=20,
+        validation_alias="MULTI_WORKSPACE_SEARCH_RECALL_CONCURRENCY",
+    )
+    candidate_multiplier: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        validation_alias="MULTI_WORKSPACE_SEARCH_CANDIDATE_MULTIPLIER",
+    )
+    min_candidates_per_workspace: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        validation_alias="MULTI_WORKSPACE_SEARCH_MIN_CANDIDATES_PER_WORKSPACE",
+    )
+    max_candidates_per_workspace: int = Field(
+        default=100,
+        ge=1,
+        le=100,
+        validation_alias="MULTI_WORKSPACE_SEARCH_MAX_CANDIDATES_PER_WORKSPACE",
+    )
+    max_global_rerank_candidates: int = Field(
+        default=1000,
+        ge=1,
+        le=2000,
+        validation_alias="MULTI_WORKSPACE_SEARCH_MAX_GLOBAL_RERANK_CANDIDATES",
+    )
+
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
+
+    @model_validator(mode="after")
+    def validate_candidate_limits(self) -> "MultiWorkspaceSearchConfig":
+        if self.min_candidates_per_workspace > self.max_candidates_per_workspace:
+            raise ValueError(
+                "min_candidates_per_workspace must not exceed max_candidates_per_workspace"
+            )
+        if self.max_global_rerank_candidates < self.max_workspaces:
+            raise ValueError(
+                "max_global_rerank_candidates must cover at least one candidate per workspace"
+            )
+        return self
+
+
 class Config(BaseSettings):
     """全局配置"""
 
@@ -276,6 +331,9 @@ class Config(BaseSettings):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     preview: PreviewConfig = Field(default_factory=PreviewConfig)
     index_quality: IndexQualityConfig = Field(default_factory=IndexQualityConfig)
+    multi_workspace_search: MultiWorkspaceSearchConfig = Field(
+        default_factory=MultiWorkspaceSearchConfig
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

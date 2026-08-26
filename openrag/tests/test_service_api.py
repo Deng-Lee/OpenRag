@@ -1,5 +1,7 @@
 """Integration tests for /service/v1 routes (service token auth)."""
 
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,18 +11,26 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import openrag.models  # noqa: F401 — register all mappers on Base.metadata
 import openrag.config as config_module
+import openrag.models  # noqa: F401 — register all mappers on Base.metadata
 from openrag.api.deps import get_db
 from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
 from openrag.api.service_api import _resolve_scope_paths
-from openrag.models import Base, DocumentChunk, File, ServiceToken, ServiceTokenWorkspace, User, Workspace
+from openrag.models import (
+    Base,
+    DocumentChunk,
+    File,
+    ServiceToken,
+    ServiceTokenWorkspace,
+    User,
+    Workspace,
+)
 from openrag.models.file import ProcessingStatus
 from openrag.models.task import Task, TaskStatus
 from openrag.security import hash_password
-from openrag.services.file_ingest import ensure_directory_path
 from openrag.services.file_deletion import FileStorageCleanupError
+from openrag.services.file_ingest import ensure_directory_path
 from openrag.services.preview_token_service import decode_preview_token
 from openrag.storage.minio_storage import MinioStorage
 
@@ -1099,6 +1109,310 @@ def test_service_multi_workspace_search_route_not_captured_by_single_workspace_r
     assert r.status_code == 200
     mock_search.assert_called_once()
     assert mock_search.call_args[0][2].workspace_id == workspace.id
+
+
+def test_service_multi_workspace_search_rejects_more_than_twenty_workspaces(
+    client: TestClient,
+    service_token_headers,
+) -> None:
+    response = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [f"workspace-{index}" for index in range(21)],
+            "query": "hello",
+            "rerank_scope": "global",
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 422
+
+
+@patch("openrag.api.service_api.Reranker")
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_global_rerank_merges_candidates_once(
+    mock_search: MagicMock,
+    mock_reranker_class: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+) -> None:
+    other = Workspace(name="SvcApiGlobalB", slug="svc-api-global-b", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    token = ServiceToken(secret="sk-global", name="global", created_by_user_id=owner.id)
+    db.add(token)
+    db.commit()
+    db.refresh(token)
+    db.add_all(
+        [
+            ServiceTokenWorkspace(token_id=token.id, workspace_id=workspace.id, permission="read"),
+            ServiceTokenWorkspace(token_id=token.id, workspace_id=other.id, permission="read"),
+        ]
+    )
+    db.commit()
+
+    def search_workspace(_db, _owner_id, request, **_kwargs):
+        assert request.use_rerank is False
+        assert request.top_k == 10
+        if request.workspace_id == workspace.id:
+            return SearchResponse(
+                results=[
+                    SearchResult(text="a1", score=0.9, file_id=1, chunk_id="a1"),
+                    SearchResult(text="a2", score=0.7, file_id=2, chunk_id="a2"),
+                ],
+                total=2,
+                query_time_ms=8.0,
+            )
+        return SearchResponse(
+            results=[SearchResult(text="b1", score=0.8, file_id=3, chunk_id="b1")],
+            total=1,
+            query_time_ms=6.0,
+        )
+
+    mock_search.side_effect = search_workspace
+
+    def rerank(_query, candidates, *, top_k, original_score_weight):
+        assert len(candidates) == 3
+        assert top_k == 2
+        assert original_score_weight == 0.0
+        by_text = {candidate["text"]: candidate for candidate in candidates}
+        ranked = []
+        for text, score in (("b1", 0.99), ("a2", 0.95)):
+            item = dict(by_text[text])
+            item["reranked_score"] = score
+            ranked.append(item)
+        return ranked
+
+    mock_reranker_class.return_value.rerank.side_effect = rerank
+
+    response = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [workspace.name, other.name],
+            "query": "hello",
+            "top_k": 2,
+            "use_rerank": True,
+            "rerank_scope": "global",
+        },
+        headers={"X-OpenRag-Token": "sk-global"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert [item["text"] for item in data["results"]] == ["b1", "a2"]
+    assert [item["workspace_name"] for item in data["results"]] == [
+        other.name,
+        workspace.name,
+    ]
+    assert data["results"][0]["retrieval_score"] == pytest.approx(0.8)
+    assert data["results"][0]["rerank_score"] == pytest.approx(0.99)
+    assert data["rerank_scope_applied"] == "global"
+    assert data["rerank_status"] == "success"
+    assert data["ranking_mode"] == "global_rerank"
+    assert data["candidate_count"] == 3
+    assert data["requested_workspace_count"] == 2
+    assert data["workspace_count"] == 2
+    assert data["failed_workspace_count"] == 0
+    mock_reranker_class.return_value.rerank.assert_called_once()
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_global_recall_limits_concurrency_to_ten(
+    mock_search: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+) -> None:
+    workspaces = [
+        Workspace(name=f"SvcApiConcurrent{index}", slug=f"svc-api-concurrent-{index}", owner_id=owner.id)
+        for index in range(20)
+    ]
+    db.add_all(workspaces)
+    db.commit()
+    for item in workspaces:
+        db.refresh(item)
+    token = ServiceToken(secret="sk-concurrent", name="concurrent", created_by_user_id=owner.id)
+    db.add(token)
+    db.commit()
+    db.refresh(token)
+    db.add_all(
+        [
+            ServiceTokenWorkspace(token_id=token.id, workspace_id=item.id, permission="read")
+            for item in workspaces
+        ]
+    )
+    db.commit()
+
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def search_workspace(_db, _owner_id, request, **_kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.02)
+            return SearchResponse(
+                results=[
+                    SearchResult(
+                        text=f"workspace-{request.workspace_id}",
+                        score=0.5,
+                        file_id=request.workspace_id,
+                        chunk_id=f"chunk-{request.workspace_id}",
+                    )
+                ],
+                total=1,
+                query_time_ms=20.0,
+            )
+        finally:
+            with state_lock:
+                active -= 1
+
+    mock_search.side_effect = search_workspace
+
+    response = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [item.name for item in workspaces],
+            "query": "hello",
+            "top_k": 20,
+            "use_rerank": False,
+            "rerank_scope": "global",
+        },
+        headers={"X-OpenRag-Token": "sk-concurrent"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_count"] == 20
+    assert 1 < max_active <= 10
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_global_recall_preserves_partial_results(
+    mock_search: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+) -> None:
+    other = Workspace(name="SvcApiPartialB", slug="svc-api-partial-b", owner_id=owner.id)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    token = ServiceToken(secret="sk-partial", name="partial", created_by_user_id=owner.id)
+    db.add(token)
+    db.commit()
+    db.refresh(token)
+    db.add_all(
+        [
+            ServiceTokenWorkspace(token_id=token.id, workspace_id=workspace.id, permission="read"),
+            ServiceTokenWorkspace(token_id=token.id, workspace_id=other.id, permission="read"),
+        ]
+    )
+    db.commit()
+
+    def search_workspace(_db, _owner_id, request, **_kwargs):
+        if request.workspace_id == other.id:
+            raise RuntimeError("provider unavailable")
+        return SearchResponse(
+            results=[SearchResult(text="usable", score=0.8, file_id=1, chunk_id="usable")],
+            total=1,
+            query_time_ms=1.0,
+        )
+
+    mock_search.side_effect = search_workspace
+
+    response = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [workspace.name, other.name],
+            "query": "hello",
+            "use_rerank": False,
+            "rerank_scope": "global",
+        },
+        headers={"X-OpenRag-Token": "sk-partial"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert [item["text"] for item in data["results"]] == ["usable"]
+    assert data["workspace_count"] == 1
+    assert data["failed_workspace_count"] == 1
+    assert data["skipped_workspaces"] == [
+        {
+            "workspace_name": other.name,
+            "reason": "search_failed",
+            "message": "Workspace search failed",
+        }
+    ]
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_global_recall_returns_503_when_all_searches_fail(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    mock_search.side_effect = RuntimeError("provider unavailable")
+
+    response = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [workspace.name],
+            "query": "hello",
+            "use_rerank": True,
+            "rerank_scope": "global",
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "All workspace searches failed"
+
+
+@patch("openrag.api.service_api.Reranker")
+@patch("openrag.api.service_api._execute_search")
+def test_service_multi_workspace_global_rerank_failure_degrades_explicitly(
+    mock_search: MagicMock,
+    mock_reranker_class: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+) -> None:
+    mock_search.return_value = SearchResponse(
+        results=[
+            SearchResult(text="first", score=0.9, file_id=1, chunk_id="first"),
+            SearchResult(text="second", score=0.8, file_id=2, chunk_id="second"),
+        ],
+        total=2,
+        query_time_ms=1.0,
+    )
+    mock_reranker_class.return_value.rerank.side_effect = RuntimeError("reranker unavailable")
+
+    response = client.post(
+        "/service/v1/workspaces/multi_space/search",
+        json={
+            "workspace_names": [workspace.name],
+            "query": "hello",
+            "top_k": 1,
+            "use_rerank": True,
+            "rerank_scope": "global",
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert [item["text"] for item in data["results"]] == ["first"]
+    assert data["rerank_scope_applied"] == "global"
+    assert data["rerank_status"] == "degraded"
+    assert data["ranking_mode"] == "global_retrieval_score"
 
 
 def test_service_create_preview_link_ok_returns_url_and_actual_ttl(

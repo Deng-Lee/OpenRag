@@ -330,6 +330,7 @@ class Reranker:
         results: list[dict],
         top_k: int = 10,
         trace_service: Optional[TraceService] = None,
+        original_score_weight: float = 0.4,
     ) -> list[dict]:
         """
         Rerank results using cross-encoder and hierarchical/position boosts.
@@ -338,12 +339,17 @@ class Reranker:
             query: Search query
             results: List of search results from RetrievalService
             top_k: Number of top results to return
+            original_score_weight: Weight of normalized retrieval scores. Global
+                multi-workspace reranking sets this to zero because raw scores from
+                different workspaces are not guaranteed to share one scale.
 
         Returns:
             Reranked results with updated scores, sorted by reranked_score descending
         """
         if not results:
             return []
+        if not 0.0 <= original_score_weight <= 1.0:
+            raise ValueError("original_score_weight must be between 0 and 1")
 
         trace_service = trace_service or _NullTraceService()
         trace_service.start_span(
@@ -411,8 +417,8 @@ class Reranker:
 
             # Combine model relevance with the normalized retrieval score.
             base_score = (
-                cross_encoder_score * 0.6
-                + normalized_retrieval_scores[i] * 0.4
+                cross_encoder_score * (1.0 - original_score_weight)
+                + normalized_retrieval_scores[i] * original_score_weight
             )
 
             # Apply hierarchical boost
