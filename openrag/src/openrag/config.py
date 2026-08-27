@@ -7,7 +7,7 @@ from typing import Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -367,6 +367,13 @@ class SearchGrantConfig(BaseSettings):
     )
 
     model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
+
+    @field_validator("instance_id", mode="before")
+    @classmethod
+    def normalize_empty_instance_id(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @model_validator(mode="after")
     def validate_enabled_configuration(self) -> "SearchGrantConfig":

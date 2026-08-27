@@ -15,6 +15,18 @@ def test_search_grant_config_defaults_disabled():
     assert config.max_grants_per_search == 20
 
 
+def test_root_config_accepts_compose_empty_instance_id_when_grants_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SEARCH_GRANT_ENABLED", "false")
+    monkeypatch.setenv("OPENRAG_INSTANCE_ID", "")
+
+    config = Config()
+
+    assert config.search_grant.enabled is False
+    assert config.search_grant.instance_id is None
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
