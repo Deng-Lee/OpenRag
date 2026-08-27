@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -16,7 +17,8 @@ import openrag.models  # noqa: F401 — register all mappers on Base.metadata
 from openrag.api.deps import get_db
 from openrag.api.main import app
 from openrag.api.search_api import SearchResponse, SearchResult
-from openrag.api.service_api import _resolve_scope_paths
+from openrag.api.service_api import FederatedSearchRequest, _resolve_scope_paths
+from openrag.config import Config, SearchGrantConfig
 from openrag.models import (
     Base,
     DocumentChunk,
@@ -32,6 +34,11 @@ from openrag.security import hash_password
 from openrag.services.file_deletion import FileStorageCleanupError
 from openrag.services.file_ingest import ensure_directory_path
 from openrag.services.preview_token_service import decode_preview_token
+from openrag.services.search_grant_service import (
+    create_search_grant,
+    decode_search_grant,
+    hash_search_query,
+)
 from openrag.storage.minio_storage import MinioStorage
 
 TEST_DATABASE_URL = "sqlite:///:memory:"
@@ -154,6 +161,42 @@ def client(db: Session):
         app.dependency_overrides[get_db] = prev
     else:
         app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def search_grant_config(monkeypatch: pytest.MonkeyPatch) -> SearchGrantConfig:
+    grant_config = SearchGrantConfig(
+        enabled=True,
+        instance_id="openrag-test",
+        signing_key=SecretStr("search-grant-test-secret-32-chars"),
+        ttl_seconds=60,
+        clock_skew_seconds=0,
+    )
+    monkeypatch.setattr(config_module, "_config", Config(search_grant=grant_config))
+    return grant_config
+
+
+def _create_test_search_grant(
+    config: SearchGrantConfig,
+    workspace: Workspace,
+    *,
+    scope_ref: str,
+    allowed_paths: list[str] | None,
+    request_id: str = "request-1",
+    query: str = "policy",
+    max_top_k: int = 10,
+) -> str:
+    grant, _ = create_search_grant(
+        workspace_id=workspace.id,
+        workspace_name=workspace.name,
+        allowed_paths=allowed_paths,
+        scope_ref=scope_ref,
+        request_id=request_id,
+        query_hash=hash_search_query(query),
+        max_top_k=max_top_k,
+        config=config,
+    )
+    return grant
 
 
 def _root(db: Session, ws: Workspace, owner: User) -> None:
@@ -1413,6 +1456,589 @@ def test_service_multi_workspace_global_rerank_failure_degrades_explicitly(
     assert data["rerank_scope_applied"] == "global"
     assert data["rerank_status"] == "degraded"
     assert data["ranking_mode"] == "global_retrieval_score"
+
+
+def test_search_grant_endpoint_is_disabled_by_default(
+    client: TestClient,
+    service_token_headers,
+) -> None:
+    response = client.post(
+        "/service/v1/search-grants",
+        json={
+            "request_id": "request-1",
+            "query_hash": hash_search_query("policy"),
+            "max_top_k": 10,
+            "scopes": [
+                {
+                    "scope_ref": "kb-a",
+                    "workspace_name": "SvcApiWS",
+                    "allowed_paths": None,
+                }
+            ],
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "search_grants_disabled"
+
+
+def test_issue_search_grants_preserves_null_and_empty_scope_semantics(
+    caplog: pytest.LogCaptureFixture,
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    caplog.set_level("INFO", logger="openrag.api.service_api")
+    response = client.post(
+        "/service/v1/search-grants",
+        json={
+            "request_id": "request-1",
+            "query_hash": hash_search_query("policy"),
+            "max_top_k": 10,
+            "scopes": [
+                {
+                    "scope_ref": "kb-root",
+                    "workspace_name": workspace.name,
+                    "allowed_paths": None,
+                },
+                {
+                    "scope_ref": "kb-empty",
+                    "workspace_name": workspace.name,
+                    "allowed_paths": [],
+                },
+            ],
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["instance_id"] == "openrag-test"
+    assert data["failures"] == []
+    claims = {
+        item["scope_ref"]: decode_search_grant(
+            item["grant"],
+            config=search_grant_config,
+        )
+        for item in data["grants"]
+    }
+    assert claims["kb-root"].allowed_paths is None
+    assert claims["kb-empty"].allowed_paths == ()
+    assert all(item["grant"] not in caplog.text for item in data["grants"])
+    assert "sk-integration-test" not in caplog.text
+    assert "policy" not in caplog.text
+
+
+def test_federated_request_repr_redacts_grants() -> None:
+    token = "sensitive-search-grant"
+    request = FederatedSearchRequest(
+        request_id="request-1",
+        query="policy",
+        grants=[token],
+    )
+
+    assert token not in repr(request)
+
+
+def test_issue_search_grants_returns_partial_stable_failures(
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+    service_token_headers,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    unauthorized = Workspace(
+        name="GrantUnauthorized",
+        slug="grant-unauthorized",
+        owner_id=owner.id,
+    )
+    db.add(unauthorized)
+    db.commit()
+
+    response = client.post(
+        "/service/v1/search-grants",
+        json={
+            "request_id": "request-1",
+            "query_hash": hash_search_query("policy"),
+            "max_top_k": 10,
+            "scopes": [
+                {
+                    "scope_ref": "kb-ok",
+                    "workspace_name": workspace.name,
+                    "allowed_paths": ["/users/u/kb-a"],
+                },
+                {
+                    "scope_ref": "kb-denied",
+                    "workspace_name": unauthorized.name,
+                    "allowed_paths": None,
+                },
+                {
+                    "scope_ref": "kb-missing",
+                    "workspace_name": "MissingWorkspace",
+                    "allowed_paths": None,
+                },
+                {
+                    "scope_ref": "kb-invalid-path",
+                    "workspace_name": workspace.name,
+                    "allowed_paths": ["/users/u/../other"],
+                },
+            ],
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert [item["scope_ref"] for item in data["grants"]] == ["kb-ok"]
+    assert {item["scope_ref"]: item["code"] for item in data["failures"]} == {
+        "kb-denied": "workspace_permission_denied",
+        "kb-missing": "workspace_not_found",
+        "kb-invalid-path": "invalid_scope_path",
+    }
+
+
+def test_issue_search_grants_rejects_duplicate_scope_ref(
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    response = client.post(
+        "/service/v1/search-grants",
+        json={
+            "request_id": "request-1",
+            "query_hash": hash_search_query("policy"),
+            "max_top_k": 10,
+            "scopes": [
+                {"scope_ref": "kb-a", "workspace_name": workspace.name},
+                {"scope_ref": "kb-a", "workspace_name": workspace.name},
+            ],
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "duplicate_scope_ref"
+
+
+@patch("openrag.api.service_api.Reranker")
+@patch("openrag.api.service_api._execute_search")
+def test_federated_search_mixes_root_and_path_targets_with_one_global_rerank(
+    mock_search: MagicMock,
+    mock_reranker_class: MagicMock,
+    client: TestClient,
+    db: Session,
+    owner: User,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    personal = Workspace(
+        name="GrantPersonal",
+        slug="grant-personal",
+        owner_id=owner.id,
+    )
+    db.add(personal)
+    db.commit()
+    db.refresh(personal)
+    grants = [
+        _create_test_search_grant(
+            search_grant_config,
+            workspace,
+            scope_ref="kb-enterprise",
+            allowed_paths=None,
+        ),
+        _create_test_search_grant(
+            search_grant_config,
+            personal,
+            scope_ref="kb-personal",
+            allowed_paths=["/users/u/kb-personal"],
+        ),
+    ]
+
+    def search_workspace(_db, _owner_id, request, **_kwargs):
+        assert request.use_rerank is False
+        if request.workspace_id == workspace.id:
+            assert request.paths is None
+            return SearchResponse(
+                results=[
+                    SearchResult(
+                        text="enterprise",
+                        score=0.8,
+                        file_id=1,
+                        chunk_id="enterprise-1",
+                        uri="/enterprise.md",
+                    )
+                ],
+                total=1,
+                query_time_ms=1.0,
+            )
+        assert request.paths == ["/users/u/kb-personal"]
+        return SearchResponse(
+            results=[
+                SearchResult(
+                    text="personal",
+                    score=0.9,
+                    file_id=2,
+                    chunk_id="personal-1",
+                    uri="/users/u/kb-personal/personal.md",
+                )
+            ],
+            total=1,
+            query_time_ms=1.0,
+        )
+
+    mock_search.side_effect = search_workspace
+
+    def rerank(_query, candidates, *, top_k, original_score_weight):
+        assert len(candidates) == 2
+        assert top_k == 2
+        assert original_score_weight == 0.0
+        ranked = []
+        for candidate in reversed(candidates):
+            item = dict(candidate)
+            item["reranked_score"] = 0.99 if item["text"] == "enterprise" else 0.95
+            ranked.append(item)
+        return ranked
+
+    mock_reranker_class.return_value.rerank.side_effect = rerank
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 2,
+            "use_rerank": True,
+            "retrieval_strategy": "auto",
+            "grants": grants,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert {item["scope_ref"] for item in data["results"]} == {
+        "kb-enterprise",
+        "kb-personal",
+    }
+    assert {item["workspace_name"] for item in data["results"]} == {
+        workspace.name,
+        personal.name,
+    }
+    assert data["scope_outcomes"] == [
+        {
+            "scope_ref": "kb-enterprise",
+            "status": "succeeded",
+            "code": None,
+            "message": None,
+        },
+        {
+            "scope_ref": "kb-personal",
+            "status": "succeeded",
+            "code": None,
+            "message": None,
+        },
+    ]
+    assert data["rerank_scope_applied"] == "global"
+    assert data["ranking_mode"] == "global_rerank"
+    assert mock_search.call_count == 2
+    mock_reranker_class.return_value.rerank.assert_called_once()
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_federated_search_merges_same_workspace_paths_and_uses_longest_scope_prefix(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    grants = [
+        _create_test_search_grant(
+            search_grant_config,
+            workspace,
+            scope_ref="kb-parent",
+            allowed_paths=["/users/u"],
+        ),
+        _create_test_search_grant(
+            search_grant_config,
+            workspace,
+            scope_ref="kb-child",
+            allowed_paths=["/users/u/kb-child"],
+        ),
+    ]
+
+    def search_workspace(_db, _owner_id, request, **_kwargs):
+        assert request.paths == ["/users/u"]
+        return SearchResponse(
+            results=[
+                SearchResult(
+                    text="child",
+                    score=0.9,
+                    file_id=1,
+                    chunk_id="child-1",
+                    uri="/users/u/kb-child/doc.md",
+                ),
+                SearchResult(
+                    text="parent",
+                    score=0.8,
+                    file_id=2,
+                    chunk_id="parent-1",
+                    uri="/users/u/other/doc.md",
+                ),
+            ],
+            total=2,
+            query_time_ms=1.0,
+        )
+
+    mock_search.side_effect = search_workspace
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 10,
+            "use_rerank": False,
+            "grants": grants,
+        },
+    )
+
+    assert response.status_code == 200
+    assert mock_search.call_count == 1
+    assert {
+        item["text"]: item["scope_ref"] for item in response.json()["results"]
+    } == {"child": "kb-child", "parent": "kb-parent"}
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_federated_search_keeps_valid_scope_when_another_grant_is_tampered(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    valid = _create_test_search_grant(
+        search_grant_config,
+        workspace,
+        scope_ref="kb-valid",
+        allowed_paths=None,
+    )
+    tampered_source = _create_test_search_grant(
+        search_grant_config,
+        workspace,
+        scope_ref="kb-tampered",
+        allowed_paths=["/tampered"],
+    )
+    header, payload, signature = tampered_source.split(".")
+    tampered_signature = ("a" if signature[0] != "a" else "b") + signature[1:]
+    tampered = ".".join((header, payload, tampered_signature))
+    mock_search.return_value = SearchResponse(
+        results=[
+            SearchResult(
+                text="valid",
+                score=0.9,
+                file_id=1,
+                chunk_id="valid-1",
+                uri="/valid.md",
+            )
+        ],
+        total=1,
+        query_time_ms=1.0,
+    )
+
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 10,
+            "use_rerank": False,
+            "grants": [valid, tampered],
+        },
+    )
+
+    assert response.status_code == 200
+    assert [item["scope_ref"] for item in response.json()["results"]] == [
+        "kb-valid"
+    ]
+    assert {
+        item["scope_ref"]: (item["status"], item["code"])
+        for item in response.json()["scope_outcomes"]
+    } == {
+        "kb-valid": ("succeeded", None),
+        "kb-tampered": ("failed", "grant_invalid"),
+    }
+
+
+def test_federated_search_rejects_ambiguous_root_and_path_scopes(
+    client: TestClient,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    grants = [
+        _create_test_search_grant(
+            search_grant_config,
+            workspace,
+            scope_ref="kb-root",
+            allowed_paths=None,
+        ),
+        _create_test_search_grant(
+            search_grant_config,
+            workspace,
+            scope_ref="kb-path",
+            allowed_paths=["/path"],
+        ),
+    ]
+
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 10,
+            "grants": grants,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "scope_overlap_conflict"
+    outcomes = response.json()["detail"]["scope_outcomes"]
+    assert {item["code"] for item in outcomes} == {"scope_overlap_conflict"}
+
+
+def test_federated_search_returns_stable_context_mismatch_error(
+    client: TestClient,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    grant = _create_test_search_grant(
+        search_grant_config,
+        workspace,
+        scope_ref="kb-root",
+        allowed_paths=None,
+    )
+
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "different-query",
+            "top_k": 10,
+            "grants": [grant],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "grant_context_mismatch"
+    assert response.json()["detail"]["scope_outcomes"][0]["scope_ref"] == "kb-root"
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_federated_search_returns_scope_outcomes_when_all_recalls_fail(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    grant = _create_test_search_grant(
+        search_grant_config,
+        workspace,
+        scope_ref="kb-root",
+        allowed_paths=None,
+    )
+    mock_search.side_effect = RuntimeError("provider unavailable")
+
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 10,
+            "grants": [grant],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "search_failed"
+    assert response.json()["detail"]["scope_outcomes"] == [
+        {
+            "scope_ref": "kb-root",
+            "status": "failed",
+            "code": "search_failed",
+            "message": "Workspace search failed",
+        }
+    ]
+
+
+@patch("openrag.api.service_api._execute_search")
+def test_federated_search_drops_result_outside_granted_path(
+    mock_search: MagicMock,
+    client: TestClient,
+    workspace: Workspace,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    grant = _create_test_search_grant(
+        search_grant_config,
+        workspace,
+        scope_ref="kb-path",
+        allowed_paths=["/allowed"],
+    )
+    mock_search.return_value = SearchResponse(
+        results=[
+            SearchResult(
+                text="unsafe",
+                score=0.9,
+                file_id=1,
+                chunk_id="unsafe-1",
+                uri="/other/secret.md",
+            )
+        ],
+        total=1,
+        query_time_ms=1.0,
+    )
+
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 10,
+            "use_rerank": False,
+            "grants": [grant],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+    assert response.json()["scope_outcomes"][0]["status"] == "succeeded"
+
+
+def test_federated_search_rejects_long_lived_service_token_header(
+    client: TestClient,
+    workspace: Workspace,
+    service_token_headers,
+    search_grant_config: SearchGrantConfig,
+) -> None:
+    grant = _create_test_search_grant(
+        search_grant_config,
+        workspace,
+        scope_ref="kb-root",
+        allowed_paths=None,
+    )
+
+    response = client.post(
+        "/service/v1/federated/search",
+        json={
+            "request_id": "request-1",
+            "query": "policy",
+            "top_k": 10,
+            "grants": [grant],
+        },
+        headers=service_token_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "service_token_not_allowed"
 
 
 def test_service_create_preview_link_ok_returns_url_and_actual_ttl(

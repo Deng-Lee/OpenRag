@@ -300,6 +300,24 @@ python scripts/reindex_es_content_exact_v2.py --workspace-id <ID> `
 4. Use HTTPS with reverse proxy (nginx/traefik)
 5. Regularly update Docker images
 
+### Federated search grants
+
+Grant-authorized federated search is disabled by default. To enable it, set a stable
+`OPENRAG_INSTANCE_ID`, set `SEARCH_GRANT_ENABLED=true`, and generate a dedicated
+`SEARCH_GRANT_SIGNING_KEY` that is shared by every API worker for this instance. Do
+not reuse `SECRET_KEY`, log the signing key or issued grants, or use the same instance
+identity/key pair on different OpenRAG deployments. Keep host clocks synchronized;
+the default grant lifetime is 60 seconds with 5 seconds of clock skew.
+Apply an ingress rate limit to both `/service/v1/search-grants` and
+`/service/v1/federated/search`; request-level scope, grant, path, candidate, and
+`top_k` limits are enforced by the API itself.
+
+For rotation, move the current key to `SEARCH_GRANT_PREVIOUS_SIGNING_KEY`, install a
+new `SEARCH_GRANT_SIGNING_KEY` on every API worker, wait at least one configured Grant
+TTL, then clear the previous key. Signing always uses only the current key. To roll
+back the capability, set `SEARCH_GRANT_ENABLED=false`; no database migration or data
+rollback is needed.
+
 ### Performance
 
 1. Allocate sufficient resources:

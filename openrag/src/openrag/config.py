@@ -315,6 +315,92 @@ class MultiWorkspaceSearchConfig(BaseSettings):
         return self
 
 
+class SearchGrantConfig(BaseSettings):
+    """Short-lived grant configuration for federated service search."""
+
+    enabled: bool = Field(
+        default=False,
+        validation_alias="SEARCH_GRANT_ENABLED",
+    )
+    instance_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        validation_alias="OPENRAG_INSTANCE_ID",
+    )
+    signing_key: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias="SEARCH_GRANT_SIGNING_KEY",
+    )
+    previous_signing_key: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias="SEARCH_GRANT_PREVIOUS_SIGNING_KEY",
+    )
+    algorithm: Literal["HS256"] = Field(
+        default="HS256",
+        validation_alias="SEARCH_GRANT_ALGORITHM",
+    )
+    ttl_seconds: int = Field(
+        default=60,
+        ge=5,
+        le=300,
+        validation_alias="SEARCH_GRANT_TTL_SECONDS",
+    )
+    clock_skew_seconds: int = Field(
+        default=5,
+        ge=0,
+        le=30,
+        validation_alias="SEARCH_GRANT_CLOCK_SKEW_SECONDS",
+    )
+    max_scopes_per_issue: int = Field(
+        default=20,
+        ge=1,
+        le=20,
+        validation_alias="SEARCH_GRANT_MAX_SCOPES_PER_ISSUE",
+    )
+    max_grants_per_search: int = Field(
+        default=20,
+        ge=1,
+        le=20,
+        validation_alias="SEARCH_GRANT_MAX_GRANTS_PER_SEARCH",
+    )
+
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
+
+    @model_validator(mode="after")
+    def validate_enabled_configuration(self) -> "SearchGrantConfig":
+        if not self.enabled:
+            return self
+        if not self.instance_id or not self.instance_id.strip():
+            raise ValueError(
+                "SEARCH_GRANT_ENABLED=true requires OPENRAG_INSTANCE_ID"
+            )
+        if self.signing_key is None or len(
+            self.signing_key.get_secret_value().strip()
+        ) < 32:
+            raise ValueError(
+                "SEARCH_GRANT_ENABLED=true requires SEARCH_GRANT_SIGNING_KEY with at least 32 characters"
+            )
+        previous_key = (
+            self.previous_signing_key.get_secret_value().strip()
+            if self.previous_signing_key is not None
+            else ""
+        )
+        if not previous_key:
+            self.previous_signing_key = None
+        elif len(previous_key) < 32:
+            raise ValueError(
+                "SEARCH_GRANT_PREVIOUS_SIGNING_KEY must contain at least 32 characters"
+            )
+        elif previous_key == self.signing_key.get_secret_value().strip():
+            raise ValueError(
+                "SEARCH_GRANT_PREVIOUS_SIGNING_KEY must differ from SEARCH_GRANT_SIGNING_KEY"
+            )
+        self.instance_id = self.instance_id.strip()
+        return self
+
+
 class Config(BaseSettings):
     """全局配置"""
 
@@ -334,6 +420,7 @@ class Config(BaseSettings):
     multi_workspace_search: MultiWorkspaceSearchConfig = Field(
         default_factory=MultiWorkspaceSearchConfig
     )
+    search_grant: SearchGrantConfig = Field(default_factory=SearchGrantConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",
