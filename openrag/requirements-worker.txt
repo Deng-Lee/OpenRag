@@ -22,6 +22,7 @@ scikit-learn>=1.3.0
 # Keep NumPy 1.x for legacy x86_64 CPUs that do not expose x86-64-v2.
 numpy==1.26.4
 pandas>=2.0.0
+python-calamine==0.8.2
 
 # Offline RAGFlow model helpers
 huggingface-hub>=0.19.0
