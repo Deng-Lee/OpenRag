@@ -14,6 +14,10 @@ def resolve_chunk_method(file_path: str, parser_type: str) -> str:
     """
     ptype = (parser_type or "").lower()
     ext = Path(file_path).suffix.lower()
+    if ptype in {"xls", "xlsx"} or (
+        ptype == "auto" and ext in {".xls", ".xlsx"}
+    ):
+        return "excel_table_token_v1"
     if ptype in {"ppt", "pptx"} or (ptype == "auto" and ext in {".ppt", ".pptx"}):
         return "presentation"
     if ptype in {"pdf", "deepdoc"} or (ptype == "auto" and ext == ".pdf"):

@@ -1,12 +1,27 @@
 """Excel parser adapter with smart chunking strategies."""
 
 import os
+from datetime import date, datetime, time
 from io import BytesIO
 from typing import Optional
 
 from openrag.parsers.adapters.base_adapter import RAGFlowParserAdapter
 from openrag.parsers.base import DocumentBlock
 from openrag.chunking.excel_config import ExcelChunkingConfig
+
+
+def _create_ragflow_excel_parser():
+    """Load the vendored Excel parser without importing the full RAGFlow package."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    module_path = Path(__file__).parent.parent / "ragflow" / "parser" / "excel_parser.py"
+    spec = importlib.util.spec_from_file_location("excel_parser_module", module_path)
+    excel_module = importlib.util.module_from_spec(spec)
+    sys.modules["excel_parser_module"] = excel_module
+    spec.loader.exec_module(excel_module)
+    return excel_module.RAGFlowExcelParser()
 
 
 class ExcelParserAdapter(RAGFlowParserAdapter):
@@ -27,19 +42,7 @@ class ExcelParserAdapter(RAGFlowParserAdapter):
             config: Excel 切片配置，如果为 None 使用默认配置
         """
         super().__init__()
-        # 直接导入模块，避免触发 ragflow.parser.__init__ 中的其他导入
-        import importlib.util
-        import sys
-        from pathlib import Path
-
-        # 动态导入 excel_parser 模块
-        module_path = Path(__file__).parent.parent / "ragflow" / "parser" / "excel_parser.py"
-        spec = importlib.util.spec_from_file_location("excel_parser_module", module_path)
-        excel_module = importlib.util.module_from_spec(spec)
-        sys.modules["excel_parser_module"] = excel_module
-        spec.loader.exec_module(excel_module)
-
-        self.ragflow_parser = excel_module.RAGFlowExcelParser()
+        self.ragflow_parser = _create_ragflow_excel_parser()
         self.config = config or ExcelChunkingConfig()
 
     def parse(self, file_path: str) -> list[DocumentBlock]:
@@ -203,5 +206,122 @@ class ExcelParserAdapter(RAGFlowParserAdapter):
                 metadata=metadata
             )
             blocks.append(block)
+
+        return blocks
+
+
+class StructuredExcelParserAdapter(RAGFlowParserAdapter):
+    """Parse Excel workbooks into stable row/column blocks for token chunking."""
+
+    supported_extensions = ('.xlsx', '.xls')
+    parser_version = "excel-structured-v2"
+
+    def __init__(self):
+        super().__init__()
+        self.ragflow_parser = _create_ragflow_excel_parser()
+
+    @staticmethod
+    def _is_empty(value) -> bool:
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    @staticmethod
+    def _normalize_value(value) -> Optional[str]:
+        if StructuredExcelParserAdapter._is_empty(value):
+            return None
+        if isinstance(value, (datetime, date, time)):
+            return value.isoformat()
+        return str(value)
+
+    def parse(self, file_path: str) -> list[DocumentBlock]:
+        """Return one structured ``DocumentBlock`` for every non-empty sheet."""
+        with open(file_path, 'rb') as source:
+            workbook = self.ragflow_parser._load_excel_to_workbook(
+                BytesIO(source.read())
+            )
+
+        blocks: list[DocumentBlock] = []
+        cursor = 0
+        for sheet_index, sheet_name in enumerate(workbook.sheetnames):
+            worksheet = workbook[sheet_name]
+            rows = self.ragflow_parser._get_rows_limited(worksheet)
+            populated_rows = [
+                (row_index, row)
+                for row_index, row in enumerate(rows, 1)
+                if any(not self._is_empty(cell.value) for cell in row)
+            ]
+            if not populated_rows:
+                continue
+
+            last_column = max(
+                column_index
+                for _, row in populated_rows
+                for column_index, cell in enumerate(row, 1)
+                if not self._is_empty(cell.value)
+            )
+            header_row_index, header_row = populated_rows[0]
+            header = []
+            for column_index in range(1, last_column + 1):
+                value = self._normalize_value(header_row[column_index - 1].value)
+                header.append(
+                    {
+                        "column_index": column_index,
+                        "name": value or f"Column_{column_index}",
+                    }
+                )
+
+            data_rows = []
+            for row_index, row in populated_rows[1:]:
+                values = [
+                    self._normalize_value(row[column_index - 1].value)
+                    for column_index in range(1, last_column + 1)
+                ]
+                if any(value is not None for value in values):
+                    data_rows.append({"row_index": row_index, "values": values})
+            preview_lines = [
+                f"Sheet: {sheet_name}",
+                " | ".join(item["name"] for item in header),
+            ]
+            preview_lines.extend(
+                " | ".join(value or "" for value in row["values"])
+                for row in data_rows
+            )
+            text = "\n".join(preview_lines)
+            blocks.append(
+                DocumentBlock(
+                    text=text,
+                    page=sheet_index + 1,
+                    offset=cursor,
+                    block_type="table",
+                    level=0,
+                    block_id=f"xlsx:{sheet_index}:table",
+                    char_start=cursor,
+                    char_end=cursor + len(text),
+                    table_data={
+                        "schema_version": "excel-table-v1",
+                        "sheet_name": sheet_name,
+                        "sheet_index": sheet_index,
+                        "header_row_index": header_row_index,
+                        "header": header,
+                        "rows": data_rows,
+                    },
+                    layout_type="table",
+                    metadata={
+                        "source_format": "excel",
+                        "sheet_name": sheet_name,
+                        "sheet_index": sheet_index,
+                        "row_start": (
+                            data_rows[0]["row_index"]
+                            if data_rows else header_row_index
+                        ),
+                        "row_end": (
+                            data_rows[-1]["row_index"]
+                            if data_rows else header_row_index
+                        ),
+                        "total_rows": len(data_rows),
+                        "strategy": "excel_table_token_v1",
+                    },
+                )
+            )
+            cursor += len(text) + 2
 
         return blocks

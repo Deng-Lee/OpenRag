@@ -8,6 +8,7 @@ import uuid
 from openrag.parsers.base import DocumentBlock
 from openrag.chunking.chunk_models import Chunk
 from openrag.chunking.document_type import DEFAULT_DOCUMENT_TYPE, normalize_document_type
+from openrag.chunking.excel_table_chunker import split_excel_blocks
 from openrag.parsers.char_spans import paragraph_absolute_spans
 from openrag.chunking.ragflow_core.semantic import (
     chunk_semantic_ragflow,
@@ -87,6 +88,9 @@ class ChunkEngine:
             raise ValueError(
                 f"chunk_overlap ({chunk_overlap}) must be less than chunk_size ({chunk_size})"
             )
+
+        if chunk_method == "excel_table_token_v1":
+            return split_excel_blocks(text_blocks, chunk_size=chunk_size)
 
         if self.strategy == ChunkStrategy.PARAGRAPH:
             return self._chunk_by_paragraph(text_blocks, min_chunk_tokens)

@@ -7,7 +7,10 @@ import os
 from openpyxl import Workbook
 
 from openrag.chunking.excel_config import ExcelChunkingConfig
-from openrag.parsers.adapters.excel_adapter import ExcelParserAdapter
+from openrag.parsers.adapters.excel_adapter import (
+    ExcelParserAdapter,
+    StructuredExcelParserAdapter,
+)
 from openrag.parsers.factory import ParserFactory
 
 
@@ -93,42 +96,40 @@ class TestExcelChunkingIntegration:
         assert len(blocks) == 7
         assert all(b.metadata["strategy"] == "row_by_row" for b in blocks)
 
-    def test_factory_with_config(self, temp_dir):
-        """测试工厂类传递配置"""
+    def test_factory_with_config_does_not_change_structured_excel(self, temp_dir):
+        """Legacy row thresholds must not change structured Excel parsing."""
         file_path = os.path.join(temp_dir, "test.xlsx")
         self.create_excel_file(file_path, {"Sheet1": 8})  # 8行数据
 
-        # 使用默认配置（阈值10）
         factory = ParserFactory()
         parser1 = factory.get_parser(file_path)
         blocks1 = parser1.parse(file_path)
-        assert all(b.metadata["strategy"] == "row_by_row" for b in blocks1)
+        assert isinstance(parser1, StructuredExcelParserAdapter)
+        assert blocks1[0].metadata["strategy"] == "excel_table_token_v1"
 
-        # 设置自定义配置（阈值5）
         config = ExcelChunkingConfig(small_table_threshold=5, large_table_threshold=15)
         factory.set_excel_config(config)
         parser2 = factory.get_parser(file_path)
         blocks2 = parser2.parse(file_path)
 
-        # 8行数据 > 5 且 <= 15，应该使用 Markdown
+        assert isinstance(parser2, StructuredExcelParserAdapter)
         assert len(blocks2) == 1
-        assert blocks2[0].metadata["strategy"] == "full_markdown"
+        assert blocks2[0].table_data == blocks1[0].table_data
 
-    def test_factory_kwargs_config(self, temp_dir):
-        """测试工厂类通过 kwargs 传递配置"""
+    def test_factory_kwargs_config_is_csv_only(self, temp_dir):
+        """Excel parser kwargs must not revive row-count-based XLSX output."""
         file_path = os.path.join(temp_dir, "test.xlsx")
         self.create_excel_file(file_path, {"Sheet1": 8})
 
         factory = ParserFactory()
         config = ExcelChunkingConfig(small_table_threshold=5, large_table_threshold=15)
 
-        # 通过 kwargs 传递配置
         parser = factory.get_parser(file_path, excel_config=config)
         blocks = parser.parse(file_path)
 
-        # 8行数据应该使用 Markdown
+        assert isinstance(parser, StructuredExcelParserAdapter)
         assert len(blocks) == 1
-        assert blocks[0].metadata["strategy"] == "full_markdown"
+        assert blocks[0].metadata["strategy"] == "excel_table_token_v1"
 
     def test_metadata_row_range(self, temp_dir):
         """测试元数据中的行范围"""

@@ -8,7 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook
 
-from openrag.parsers.adapters.excel_adapter import ExcelParserAdapter
+from openrag.parsers.adapters.excel_adapter import StructuredExcelParserAdapter
 
 
 _SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -41,7 +41,7 @@ class ExcelEmptyFillFallbackTest(unittest.TestCase):
             workbook.save(path)
             _append_empty_fill(path)
 
-            blocks = ExcelParserAdapter().parse(path)
+            blocks = StructuredExcelParserAdapter().parse(path)
 
             self.assertTrue(any("Treasury" in block.text for block in blocks))
 

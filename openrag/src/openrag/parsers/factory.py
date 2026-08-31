@@ -18,8 +18,8 @@ class ParserFactory:
             '.pdf': 'openrag.parsers.adapters.paddleocr_pdf_adapter.PaddleOCRPDFParserAdapter',
             '.docx': 'openrag.parsers.adapters.docx_adapter.DocxParserAdapter',
             '.doc': 'openrag.parsers.adapters.docx_adapter.DocxParserAdapter',
-            '.xlsx': 'openrag.parsers.adapters.excel_adapter.ExcelParserAdapter',
-            '.xls': 'openrag.parsers.adapters.excel_adapter.ExcelParserAdapter',
+            '.xlsx': 'openrag.parsers.adapters.excel_adapter.StructuredExcelParserAdapter',
+            '.xls': 'openrag.parsers.adapters.excel_adapter.StructuredExcelParserAdapter',
             '.csv': 'openrag.parsers.adapters.excel_adapter.ExcelParserAdapter',
             '.pptx': 'openrag.parsers.adapters.ppt_adapter.PptParserAdapter',
             '.ppt': 'openrag.parsers.adapters.ppt_adapter.PptParserAdapter',
@@ -72,10 +72,8 @@ class ParserFactory:
             config: ExcelChunkingConfig 实例
         """
         self._excel_config = config
-        # 清除已缓存的 Excel 解析器，以便使用新配置重新创建
-        for ext in ['.xlsx', '.xls', '.csv']:
-            if ext in self._parsers:
-                del self._parsers[ext]
+        # Row-count thresholds are retained only for the legacy CSV path.
+        self._parsers.pop('.csv', None)
 
     def get_parser(self, file_path: str, **kwargs) -> DocumentParser:
         """获取解析器（懒加载）
@@ -109,8 +107,9 @@ class ParserFactory:
         module = importlib.import_module(module_path)
         parser_class = getattr(module, class_name)
 
-        # Excel 解析器支持传入配置
-        if ext in ['.xlsx', '.xls', '.csv']:
+        # Legacy row-count configuration remains CSV-only. Excel now emits
+        # structured rows and defers final sizing to ExcelTableChunker.
+        if ext == '.csv':
             config = kwargs.get('excel_config') or self._excel_config
             return parser_class(config=config)
 

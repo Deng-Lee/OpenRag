@@ -44,7 +44,10 @@ class DocumentHierarchyBuilder:
         if not chunks:
             return HierarchyResult(l0="", l1="", l2=[])
 
-        l1_md = self._build_overview_markdown(chunks)
+        if self._is_excel_chunks(chunks):
+            l1_md = self._build_excel_overview_markdown(chunks)
+        else:
+            l1_md = self._build_overview_markdown(chunks)
         l1_md = truncate_to_tokens(clean_text(l1_md), self.l1_max_tokens)
         l0 = self._abstract_from_overview(l1_md)
 
@@ -104,6 +107,47 @@ class DocumentHierarchyBuilder:
                 prev = truncate_to_tokens(t, 120)
                 lines.append(f"- `chunks/{i:04d}.md`: {prev}\n")
 
+        return "".join(lines)
+
+    @staticmethod
+    def _is_excel_chunks(chunks: List) -> bool:
+        return bool(chunks) and all(
+            isinstance(getattr(chunk, "metadata", None), dict)
+            and chunk.metadata.get("source_format") == "excel"
+            and chunk.metadata.get("sheet_name")
+            for chunk in chunks
+        )
+
+    def _build_excel_overview_markdown(self, chunks: List) -> str:
+        """Build compact Sheet-level navigation for structured Excel chunks."""
+        sheets: dict[tuple[int, str], list[tuple[int, object]]] = {}
+        for chunk_index, chunk in enumerate(chunks):
+            metadata = chunk.metadata
+            key = (
+                int(metadata.get("sheet_index", 0)),
+                str(metadata["sheet_name"]),
+            )
+            sheets.setdefault(key, []).append((chunk_index, chunk))
+
+        lines = [
+            "# Excel workbook overview\n\n",
+            f"Sheets: {len(sheets)}; L2 chunks: {len(chunks)}.\n\n",
+            "## Sheets\n\n",
+        ]
+        for (_, sheet_name), entries in sorted(sheets.items()):
+            first_chunk_index = entries[0][0]
+            last_chunk_index = entries[-1][0]
+            metadata_items = [entry[1].metadata for entry in entries]
+            row_start = min(item["row_start"] for item in metadata_items)
+            row_end = max(item["row_end"] for item in metadata_items)
+            column_start = min(item["column_start"] for item in metadata_items)
+            column_end = max(item["column_end"] for item in metadata_items)
+            lines.append(
+                f"- **{sheet_name}** — rows {row_start}-{row_end}; "
+                f"columns {column_start}-{column_end}; L2: "
+                f"`chunks/{first_chunk_index:04d}.md`–"
+                f"`chunks/{last_chunk_index:04d}.md`\n"
+            )
         return "".join(lines)
 
     def _generate_l1_sections(self, chunks: List) -> List[Section]:
