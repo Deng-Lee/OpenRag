@@ -109,9 +109,10 @@ try {
   Write-Host "[4/9] 生成源码包"
   Invoke-Native powershell "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" $PackageScript "-Version" $Version "-RepoRoot" $RepoRoot "-SkipImageBuild" "-SkipImageSave"
 
-  Write-Host "[5/9] 构建并校验应用镜像: $($Services -join ', ')"
-  $buildArgs = @("compose", "-p", "openrag", "--env-file", "docker/.env", "-f", "docker/docker-compose.prod.yml", "build") + $Services
-  Invoke-Native docker @buildArgs
+  Write-Host "[5/9] 串行构建并校验应用镜像: $($Services -join ', ')"
+  foreach ($service in $Services) {
+    Invoke-Native docker "compose" "-p" "openrag" "--env-file" "docker/.env" "-f" "docker/docker-compose.prod.yml" "build" $service
+  }
   $imageByService = @{
     "api" = "openrag-api"
     "web" = "openrag-web"

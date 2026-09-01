@@ -21,7 +21,7 @@ RUN proxy="${BUILD_PROXY}" \
 
 # Copy requirements and install Python dependencies
 COPY openrag/requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir --retries 10 --timeout 300 --user -r requirements.txt
 
 # Production stage
 FROM python:3.11-slim
@@ -60,7 +60,7 @@ COPY openrag/alembic.ini .
 COPY openrag/alembic/ ./alembic/
 
 # Install the package
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --retries 10 --timeout 300 -e .
 
 # 构建期加载应用（与 run_api → uvicorn 一致），缺依赖在此失败，避免推到集群才发现
 RUN python -c "import openrag.api.main; print('openrag.api.main import OK')"
