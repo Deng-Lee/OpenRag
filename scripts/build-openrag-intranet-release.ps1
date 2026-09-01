@@ -236,10 +236,10 @@ try {
     runtime_env_included = $false
     changed_files = @($changedFiles)
     safety = [ordered]@{
-      server_build = false
-      server_pull = false
-      preserve_shared_env = true
-      preserve_data_override = true
+      server_build = $false
+      server_pull = $false
+      preserve_shared_env = $true
+      preserve_data_override = $true
       automatic_app_rollback = (-not [bool]$RequiresMigration)
     }
   }
