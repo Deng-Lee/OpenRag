@@ -111,6 +111,10 @@ try {
 
   Write-Host "[5/9] 串行构建并校验应用镜像: $($Services -join ', ')"
   foreach ($service in $Services) {
+    if ($service -eq "task-worker") {
+      Write-Host "预构建 task-worker builder 阶段，避免系统依赖与 LibreOffice 并行下载压垮代理"
+      Invoke-Native docker "build" "--target" "builder" "--file" "docker/Dockerfile.worker" "--tag" "openrag-task-worker-builder-cache:$Version" "."
+    }
     Invoke-Native docker "compose" "-p" "openrag" "--env-file" "docker/.env" "-f" "docker/docker-compose.prod.yml" "build" $service
   }
   $imageByService = @{
